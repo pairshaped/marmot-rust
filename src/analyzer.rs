@@ -69,13 +69,31 @@ impl Schema {
             .get(&table.to_ascii_lowercase())
             .and_then(|columns| columns.get(&column.to_ascii_lowercase()))
     }
+
+    fn column_names_in_table_order(&self, table: &str) -> Vec<String> {
+        let Some(columns) = self.tables.get(&table.to_ascii_lowercase()) else {
+            return vec![];
+        };
+        let mut columns = columns
+            .iter()
+            .map(|(name, column)| (name, column.ordinal))
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|(_, ordinal)| *ordinal);
+        columns
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
 }
 
 #[derive(Debug)]
 struct SchemaColumn {
     declared_type: String,
     nullable: bool,
+    notnull: bool,
     primary_key: bool,
+    rowid_alias: bool,
+    ordinal: i64,
 }
 
 fn load_schema(conn: &Connection) -> Result<Schema> {
@@ -103,30 +121,49 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
         let mut stmt = conn
             .prepare(
                 r#"
-                select name, type, "notnull", pk
+                select cid, name, type, "notnull", pk
                 from pragma_table_xinfo(?1)
                 where hidden = 0
                 "#,
             )
             .map_err(|source| Error::InspectDatabase { source })?;
-        let columns = stmt
+        let mut column_rows = stmt
             .query_map([table_name.as_str()], |row| {
-                let name: String = row.get(0)?;
-                let declared_type: String = row.get(1)?;
-                let notnull: i64 = row.get(2)?;
-                let primary_key: i64 = row.get(3)?;
+                let ordinal: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let declared_type: String = row.get(2)?;
+                let notnull: i64 = row.get(3)?;
+                let primary_key: i64 = row.get(4)?;
                 Ok((
                     name.to_ascii_lowercase(),
                     SchemaColumn {
                         declared_type,
-                        nullable: notnull == 0 && primary_key == 0,
+                        nullable: false,
+                        notnull: notnull != 0,
                         primary_key: primary_key != 0,
+                        rowid_alias: false,
+                        ordinal,
                     },
                 ))
             })
             .map_err(|source| Error::InspectDatabase { source })?
-            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|source| Error::InspectDatabase { source })?;
+
+        let without_rowid = table_without_rowid(conn, &table_name)?;
+        let primary_key_count = column_rows
+            .iter()
+            .filter(|(_, column)| column.primary_key)
+            .count();
+        for (_, column) in &mut column_rows {
+            column.rowid_alias = !without_rowid
+                && primary_key_count == 1
+                && column.primary_key
+                && column.declared_type.eq_ignore_ascii_case("INTEGER");
+            column.nullable =
+                !column.notnull && !column.rowid_alias && !(without_rowid && column.primary_key);
+        }
+        let columns = column_rows.into_iter().collect::<BTreeMap<_, _>>();
 
         schema
             .tables
@@ -134,6 +171,16 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
     }
 
     Ok(schema)
+}
+
+fn table_without_rowid(conn: &Connection, table_name: &str) -> Result<bool> {
+    conn.query_row(
+        "select wr from pragma_table_list where name = ?1",
+        [table_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|without_rowid| without_rowid != 0)
+    .map_err(|source| Error::InspectDatabase { source })
 }
 
 fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
@@ -257,20 +304,23 @@ fn insert_parameter_inferences(
     let Some(table) = tokens.get(into_index + 1).and_then(table_name_from_token) else {
         return inferences;
     };
-    let Some(Token::OpenParen) = tokens.get(into_index + 2) else {
-        return inferences;
-    };
 
-    let (column_tokens, after_columns) = collect_balanced_parens(tokens, into_index + 2);
-    let columns = split_top_level_commas(column_tokens)
-        .into_iter()
-        .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
-        .collect::<Vec<_>>();
+    let (columns, after_target) = if matches!(tokens.get(into_index + 2), Some(Token::OpenParen)) {
+        let (column_tokens, after_columns) = collect_balanced_parens(tokens, into_index + 2);
+        let columns = split_top_level_commas(column_tokens)
+            .into_iter()
+            .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        (columns, after_columns)
+    } else {
+        (schema.column_names_in_table_order(table), into_index + 2)
+    };
 
     let Some(values_index) = tokens
         .iter()
         .enumerate()
-        .skip(after_columns)
+        .skip(after_target)
         .find_map(|(index, token)| token_is_word(token, "VALUES").then_some(index))
     else {
         return inferences;
@@ -279,28 +329,51 @@ fn insert_parameter_inferences(
         return inferences;
     };
 
-    let (value_tokens, _) = collect_balanced_parens(tokens, values_index + 1);
-    let values = split_top_level_commas(value_tokens);
     let mut anon_index = 0usize;
 
-    for (value, column) in values.into_iter().zip(columns) {
-        for token in value {
-            let Some(key) = parameter_key(token, &mut anon_index) else {
-                continue;
-            };
-            if let Some(schema_column) = schema.column(table, column) {
-                inferences.insert(
-                    key,
-                    ParameterInference {
-                        column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
-                        nullable: schema_column.nullable || schema_column.primary_key,
-                    },
-                );
+    for value_tokens in values_rows(tokens, values_index + 1) {
+        let values = split_top_level_commas(value_tokens);
+        for (value, column) in values.into_iter().zip(&columns) {
+            for token in value {
+                let Some(key) = parameter_key(token, &mut anon_index) else {
+                    continue;
+                };
+                if let Some(schema_column) = schema.column(table, column) {
+                    inferences.insert(
+                        key,
+                        ParameterInference {
+                            column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                            nullable: schema_column.nullable || schema_column.rowid_alias,
+                        },
+                    );
+                }
             }
         }
     }
 
     inferences
+}
+
+fn values_rows(tokens: &[Token], mut index: usize) -> Vec<&[Token]> {
+    let mut rows = Vec::new();
+    while index < tokens.len() {
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            index += 1;
+            continue;
+        }
+        if !matches!(tokens.get(index), Some(Token::OpenParen)) {
+            break;
+        }
+
+        let (row, after_row) = collect_balanced_parens(tokens, index);
+        rows.push(row);
+        index = after_row;
+
+        if !matches!(tokens.get(index), Some(Token::Comma)) {
+            break;
+        }
+    }
+    rows
 }
 
 fn insert_or_replace_into_index(tokens: &[Token]) -> Option<usize> {
@@ -2229,6 +2302,285 @@ mod tests {
                 ("order_id", ValueType::I64, false),
                 ("description", ValueType::String, false),
                 ("amount", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_insert_values_without_column_list_from_schema_order() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                age integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_user.sql"),
+            "insert into users values (?, ?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::String, false),
+                ("param_3", ValueType::I64, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_without_column_list_skips_generated_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table metrics (
+                id integer primary key,
+                value integer not null,
+                doubled integer generated always as (value * 2) virtual
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("metrics/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_metric.sql"),
+            "insert into metrics values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_insert_values_parameters_across_multiple_rows() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table line_items (
+                quantity integer not null,
+                label text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("line_items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_line_items.sql"),
+            "insert into line_items values (1, ?), (?, 'second')",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::String, false),
+                ("param_2", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_without_rowid_primary_key_is_not_nullable_on_write() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text
+            ) without rowid;
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_user.sql"),
+            "insert into users values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, false),
+                ("param_2", ValueType::String, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_composite_primary_key_columns_are_nullable_on_write() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table memberships (
+                user_id integer,
+                org_id integer,
+                primary key (user_id, org_id)
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("memberships/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_membership.sql"),
+            "insert into memberships values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::I64, true),
             ]
         );
     }
