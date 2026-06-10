@@ -27,7 +27,7 @@ query model
 
 ## Current Status
 
-This is a scaffold, not a replacement for Gleam Marmot yet.
+This is an active Rust port, not a complete replacement for Gleam Marmot yet.
 
 It currently:
 
@@ -35,10 +35,11 @@ It currently:
 - derives query names from filenames
 - derives generated module names from the owner directory
 - extracts named parameters like `@org_id`
-- prepares each statement with SQLite and records result column names
-- emits direct `rusqlite` functions using `prepare_cached`
+- prepares each statement with SQLite and records result columns
+- infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
+- emits typed direct `rusqlite` functions using `prepare_cached`
 
-It does not yet port Marmot's real type/nullability inference. Generated row fields are currently `rusqlite::types::Value`, with a small integer heuristic for common scalar query shapes.
+The remaining work is deeper SQL coverage and polish around project configuration, diagnostics, and edge-case inference.
 
 ## Usage
 

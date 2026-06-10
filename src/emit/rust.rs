@@ -405,6 +405,23 @@ mod tests {
     }
 
     #[test]
+    fn render_query_preserves_sql_quotes_and_raw_string_terminators() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/sql/find.sql"),
+            module_name: "users_sql".to_string(),
+            name: "find".to_string(),
+            return_type: ReturnType::Execute,
+            sql: "select 'it''s fine', \"quoted\", r#\"raw\"#".to_string(),
+            parameters: vec![],
+            columns: vec![],
+        };
+
+        let output = render_query(&query, true);
+
+        assert!(output.contains("r##\"select 'it''s fine', \"quoted\", r#\"raw\"#\"##"));
+    }
+
+    #[test]
     fn render_module_emits_shared_row_type_once() {
         let columns = vec![
             Column {
