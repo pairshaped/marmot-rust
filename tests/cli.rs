@@ -261,6 +261,101 @@ output = "{}"
 }
 
 #[test]
+fn generate_command_appends_named_database_to_global_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/primary.sqlite"), "primary_name");
+
+    let sql_dir = dir.path().join("src/database_sql/primary");
+    fs::create_dir_all(&sql_dir).unwrap();
+    fs::write(
+        sql_dir.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+sql_dir = "src/database_sql"
+output = "src/generated/database_sql"
+
+[[tools.marmot.databases]]
+name = "primary"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database-name")
+        .arg("primary")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path()
+            .join("src/generated/database_sql/primary/sql.rs")
+            .exists()
+    );
+}
+
+#[test]
+fn generate_command_does_not_double_named_database_global_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/curling.sqlite"), "curling_name");
+
+    let sql_dir = dir.path().join("src/sql/curling");
+    fs::create_dir_all(&sql_dir).unwrap();
+    fs::write(
+        sql_dir.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+sql_dir = "src/sql/curling"
+output = "src/generated/sql/curling"
+
+[[tools.marmot.databases]]
+name = "curling"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database-name")
+        .arg("curling")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/curling/sql.rs").exists());
+    assert!(
+        !dir.path()
+            .join("src/generated/sql/curling/curling/sql.rs")
+            .exists()
+    );
+}
+
+#[test]
 fn generate_command_runs_all_named_database_configs() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("db")).unwrap();
