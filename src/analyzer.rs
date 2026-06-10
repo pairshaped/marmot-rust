@@ -1936,6 +1936,68 @@ mod tests {
     }
 
     #[test]
+    fn infers_insert_parameters_when_literals_are_interleaved_with_values() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table entries (
+                order_id integer not null,
+                kind text not null,
+                item_id integer,
+                description text not null,
+                amount integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("entries/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_entry.sql"),
+            "
+            insert into entries (order_id, kind, item_id, description, amount)
+            values (@order_id, 'adjustment', null, @description, @amount)
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("order_id", ValueType::I64, false),
+                ("description", ValueType::String, false),
+                ("amount", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
     fn infers_insert_or_replace_parameter_types_and_primary_key_nullability() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -2301,6 +2363,62 @@ mod tests {
                 column_type: ValueType::String,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_parameters_from_in_literal_list() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                status text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "select id from users where status in (?, ?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::String, false),
+                ("param_2", ValueType::String, false),
+                ("param_3", ValueType::String, false),
+            ]
         );
     }
 
