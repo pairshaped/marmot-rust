@@ -367,7 +367,7 @@ fn insert_parameter_inferences(
         .skip(after_target)
         .find_map(|(index, token)| token_is_word(token, "VALUES").then_some(index))
     else {
-        return inferences;
+        return insert_select_parameter_inferences(tokens, schema, table, &columns, after_target);
     };
     let Some(Token::OpenParen) = tokens.get(values_index + 1) else {
         return inferences;
@@ -396,6 +396,84 @@ fn insert_parameter_inferences(
     }
 
     inferences
+}
+
+fn insert_select_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table: &str,
+    columns: &[String],
+    after_target: usize,
+) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let Some(select_index) = top_level_keyword_from(tokens, "SELECT", after_target) else {
+        return inferences;
+    };
+    let select_list_end =
+        top_level_keyword_from(tokens, "FROM", select_index + 1).unwrap_or(tokens.len());
+    let parameter_keys = parameter_keys_by_index(tokens);
+
+    for ((start, end), column) in
+        split_top_level_comma_ranges(tokens, select_index + 1, select_list_end)
+            .into_iter()
+            .zip(columns)
+    {
+        let Some(schema_column) = schema.column(table, column) else {
+            continue;
+        };
+        for token_index in start..end {
+            let Some(key) = parameter_keys.get(&token_index) else {
+                continue;
+            };
+            inferences.insert(
+                key.clone(),
+                ParameterInference {
+                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    nullable: schema_column.nullable || schema_column.rowid_alias,
+                },
+            );
+        }
+    }
+
+    inferences
+}
+
+fn top_level_keyword_from(tokens: &[Token], keyword: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case(keyword) => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_comma_ranges(tokens: &[Token], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 0usize;
+    let mut expression_start = start;
+
+    for (index, token) in tokens.iter().enumerate().take(end).skip(start) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                ranges.push((expression_start, index));
+                expression_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if expression_start < end {
+        ranges.push((expression_start, end));
+    }
+    ranges
 }
 
 fn insert_target_columns(
@@ -2636,6 +2714,72 @@ mod tests {
                 ("order_id", ValueType::I64, false),
                 ("description", ValueType::String, false),
                 ("amount", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_insert_select_parameters_from_target_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table item_features (
+                id integer primary key,
+                item_id integer not null,
+                field_key text not null,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("features/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("copy_features.sql"),
+            "
+            insert into item_features (item_id, field_key, created_at)
+            select @item_id, lf.field_key, @created_at
+            from item_features lf
+            where lf.item_id = @source_item_id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "item_id".to_string(),
+                    sql_names: vec!["@item_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "created_at".to_string(),
+                    sql_names: vec!["@created_at".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "source_item_id".to_string(),
+                    sql_names: vec!["@source_item_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
             ]
         );
     }
