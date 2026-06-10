@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use marmot::{
@@ -225,7 +225,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
     let target = args.target;
     let check = args.check;
 
-    Ok(targets
+    let configs = targets
         .into_iter()
         .map(|database_target| Config {
             database: database_target.database,
@@ -238,7 +238,13 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
             target,
             check,
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    for config in &configs {
+        validate_output_under_source_root(&config.source_root, &config.output)?;
+    }
+
+    Ok(configs)
 }
 
 #[derive(Debug)]
@@ -388,4 +394,43 @@ fn join_namespace(base: PathBuf, name: &str) -> PathBuf {
     } else {
         base.join(name)
     }
+}
+
+fn validate_output_under_source_root(source_root: &Path, output: &Path) -> Result<(), ConfigError> {
+    let source_root = normalize_for_comparison(source_root);
+    let output = normalize_for_comparison(output);
+    if output.starts_with(&source_root) {
+        Ok(())
+    } else {
+        Err(ConfigError::OutputOutsideSourceRoot {
+            output,
+            source_root,
+        })
+    }
+}
+
+fn normalize_for_comparison(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    normalize_path(&absolute)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }

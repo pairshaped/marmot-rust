@@ -69,6 +69,12 @@ pub enum ConfigError {
 
     #[error("missing or empty name in [[tools.marmot.databases]]")]
     MalformedDatabaseArrayEntry,
+
+    #[error("output path must be under source root: output {output}, source root {source_root}")]
+    OutputOutsideSourceRoot {
+        output: PathBuf,
+        source_root: PathBuf,
+    },
 }
 
 impl FileConfig {
