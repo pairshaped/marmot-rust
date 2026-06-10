@@ -6149,6 +6149,124 @@ mod tests {
     }
 
     #[test]
+    fn infers_parameter_inside_not_exists_subquery() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table participants (
+                id integer primary key,
+                name text not null
+            );
+            create table line_items (
+                participant_id integer not null,
+                status text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("participants/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("without_status.sql"),
+            "
+            select p.id, p.name
+            from participants p
+            where not exists (
+                select 1
+                from line_items li
+                where li.participant_id = p.id
+                  and li.status = @status
+            )
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "status".to_string(),
+                sql_names: vec!["@status".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn deduplicates_named_parameters_reused_in_order_by_case() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table payments (
+                id integer primary key,
+                created_at integer not null,
+                deposited_on integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("payments/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_payments.sql"),
+            "
+            select id, created_at, deposited_on
+            from payments
+            where (@by_date = 'created_at' and created_at >= @from_ts)
+               or (@by_date = 'deposited_on' and deposited_on is not null and deposited_on >= @from_ts)
+            order by case when @by_date = 'deposited_on' then deposited_on end desc, created_at desc
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "by_date".to_string(),
+                    sql_names: vec!["@by_date".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "from_ts".to_string(),
+                    sql_names: vec!["@from_ts".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn infers_case_result_parameter_from_compared_column() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
