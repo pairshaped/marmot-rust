@@ -678,6 +678,13 @@ fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
     let mut refs = BTreeMap::new();
     let mut index = 0usize;
 
+    if let Some(into_index) = insert_or_replace_into_index(tokens) {
+        if let Some(table) = tokens.get(into_index + 1).and_then(table_name_from_token) {
+            let table = table.to_ascii_lowercase();
+            refs.insert(table.clone(), table);
+        }
+    }
+
     while index < tokens.len() {
         if token_is_word(&tokens[index], "UPDATE") {
             if let Some(table) = tokens.get(index + 1).and_then(table_name_from_token) {
@@ -1952,6 +1959,73 @@ mod tests {
             [
                 ("param", ValueType::I64, true),
                 ("param_2", ValueType::String, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_upsert_do_update_parameter_types_from_insert_table() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null,
+                version integer not null default 0
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("upsert_thing.sql"),
+            "
+            insert into t (id, val, version)
+            values (?, ?, ?)
+            on conflict(id) do update
+            set val = ?, version = ?
+            where version < ?
+            returning id, val, version
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::String, false),
+                ("param_3", ValueType::I64, false),
+                ("param_4", ValueType::String, false),
+                ("param_5", ValueType::I64, false),
+                ("param_6", ValueType::I64, false),
             ]
         );
     }
