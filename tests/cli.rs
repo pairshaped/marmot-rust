@@ -694,6 +694,48 @@ migrations_dir = "db/migrations/analytics"
 }
 
 #[test]
+fn migrate_command_uses_named_database_default_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db/migrations/primary")).unwrap();
+    fs::write(
+        dir.path()
+            .join("db/migrations/primary/001_create_users.sql"),
+        "create table users (id integer primary key)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[[tools.marmot.databases]]
+name = "primary"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("migrate")
+        .arg("--database-name")
+        .arg("primary")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "migrate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Applied 001_create_users\n"
+    );
+
+    let conn = Connection::open(dir.path().join("db/primary.sqlite")).unwrap();
+    assert!(table_names(&conn).contains(&"users".to_string()));
+}
+
+#[test]
 fn generate_command_rejects_unknown_database_name() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
