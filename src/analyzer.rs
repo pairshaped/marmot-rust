@@ -176,6 +176,7 @@ fn result_columns(
     let mut columns = Vec::new();
     let metadata = stmt.columns_with_metadata();
     let nullable_tables = left_join_nullable_tables(sql);
+    let expression_inferences = select_expression_inferences(sql);
 
     for index in 0..stmt.column_count() {
         let name = metadata
@@ -197,8 +198,10 @@ fn result_columns(
             .get(index)
             .and_then(|column| Some((column.table_name()?, column.origin_name()?)))
             .and_then(|(table, column)| schema.column(table, column));
+        let expression_inference = expression_inferences.get(&name.to_ascii_lowercase());
         let column_type = schema_column
             .map(|column| ValueType::from_sqlite_type(&column.declared_type))
+            .or_else(|| expression_inference.map(|inference| inference.column_type.clone()))
             .unwrap_or_else(|| infer_column_type(&name));
         let nullable = metadata
             .get(index)
@@ -206,6 +209,7 @@ fn result_columns(
             .filter(|table| nullable_tables.contains(&table.to_ascii_lowercase()))
             .map(|_| true)
             .or_else(|| schema_column.map(|column| column.nullable))
+            .or_else(|| expression_inference.map(|inference| inference.nullable))
             .unwrap_or_else(|| infer_expression_nullability(&name));
         columns.push(Column {
             name,
@@ -269,15 +273,151 @@ fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
     nullable_tables
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpressionInference {
+    column_type: ValueType,
+    nullable: bool,
+}
+
+fn select_expression_inferences(sql: &str) -> BTreeMap<String, ExpressionInference> {
+    let tokens = tokenize(sql);
+    let Some(select_list) = top_level_select_list(&tokens) else {
+        return BTreeMap::new();
+    };
+    let mut inferences = BTreeMap::new();
+
+    for expression in split_top_level_commas(select_list) {
+        let Some(alias) = expression_alias(expression) else {
+            continue;
+        };
+        let expression = expression_without_alias(expression);
+        if let Some(inference) = infer_expression_tokens(expression) {
+            inferences.insert(alias.to_ascii_lowercase(), inference);
+        }
+    }
+
+    inferences
+}
+
+fn top_level_select_list(tokens: &[Token]) -> Option<&[Token]> {
+    let mut depth = 0usize;
+    let mut select_start = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("SELECT") => {
+                select_start = Some(index + 1);
+            }
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                if let Some(start) = select_start {
+                    return Some(&tokens[start..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    select_start.map(|start| &tokens[start..])
+}
+
+fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut expressions = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                expressions.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < tokens.len() {
+        expressions.push(&tokens[start..]);
+    }
+
+    expressions
+}
+
+fn expression_alias(tokens: &[Token]) -> Option<String> {
+    let mut depth = 0usize;
+    let mut alias = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
+                alias = tokens.get(index + 1).and_then(identifier_from_token);
+            }
+            _ => {}
+        }
+    }
+
+    alias.map(str::to_string)
+}
+
+fn expression_without_alias(tokens: &[Token]) -> &[Token] {
+    let mut depth = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
+                return &tokens[..index];
+            }
+            _ => {}
+        }
+    }
+
+    tokens
+}
+
+fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
+    let function_name = match (tokens.first(), tokens.get(1)) {
+        (Some(Token::Word(name)), Some(Token::OpenParen)) => name,
+        _ => return None,
+    };
+    let function_name = function_name.to_ascii_lowercase();
+
+    match function_name.as_str() {
+        "row_number" | "rank" | "dense_rank" | "ntile" => Some(ExpressionInference {
+            column_type: ValueType::I64,
+            nullable: false,
+        }),
+        "count" => Some(ExpressionInference {
+            column_type: ValueType::I64,
+            nullable: false,
+        }),
+        "sum" | "avg" => Some(ExpressionInference {
+            column_type: ValueType::F64,
+            nullable: true,
+        }),
+        _ => None,
+    }
+}
+
 fn token_is_word(token: &Token, expected: &str) -> bool {
     matches!(token, Token::Word(text) if text.eq_ignore_ascii_case(expected))
 }
 
-fn table_name_from_token(token: &Token) -> Option<&str> {
+fn identifier_from_token(token: &Token) -> Option<&str> {
     match token {
         Token::Word(name) | Token::QuotedId(name) => Some(name.as_str()),
         _ => None,
     }
+}
+
+fn table_name_from_token(token: &Token) -> Option<&str> {
+    identifier_from_token(token)
 }
 
 fn infer_column_type(name: &str) -> ValueType {
@@ -286,10 +426,12 @@ fn infer_column_type(name: &str) -> ValueType {
         || normalized.ends_with("_id")
         || normalized == "counter"
         || normalized.contains("count(")
-        || normalized.contains("sum(")
         || normalized.contains("coalesce(")
     {
         return ValueType::I64;
+    }
+    if normalized.contains("sum(") || normalized.contains("avg(") {
+        return ValueType::F64;
     }
     ValueType::Value
 }
@@ -368,6 +510,7 @@ mod tests {
         assert_eq!(infer_column_type("id"), ValueType::I64);
         assert_eq!(infer_column_type("count(*)"), ValueType::I64);
         assert_eq!(infer_column_type("coalesce(sum(id), 0)"), ValueType::I64);
+        assert_eq!(infer_column_type("sum(id)"), ValueType::F64);
         assert_eq!(infer_column_type("name"), ValueType::Value);
     }
 
@@ -782,5 +925,169 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("a_val", false), ("b_val", false), ("c_val", true)]);
+    }
+
+    #[test]
+    fn row_number_window_function_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer primary key,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("ranked_items.sql"),
+            "
+            select id, row_number() over (order by created_at) as position
+            from items
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("id", ValueType::I64, false),
+                ("position", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_window_function_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer primary key,
+                score integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("ranked_items.sql"),
+            "
+            select id, rank() over (order by score desc) as rk
+            from items
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [("id", ValueType::I64, false), ("rk", ValueType::I64, false)]
+        );
+    }
+
+    #[test]
+    fn sum_returns_f64_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table payments (
+                amount real not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("payments/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("sum_payments.sql"),
+            "
+            select sum(amount) as total
+            from payments
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("total", ValueType::F64, true)]);
     }
 }
