@@ -61,4 +61,6 @@ SQLx's SQLite code should be consulted for hard inference cases, especially:
 - using `EXPLAIN` output when declared column metadata is missing
 - representing query metadata for offline checks
 
-Emitter tests should mostly be snapshot tests from known query models. Analyzer tests should use real SQLite schemas and real SQL files.
+Emitter tests should mostly cover known query models, plus generated-code runtime tests for the Rust target. Those runtime tests should generate a small crate, compile it, and run the generated functions against SQLite so parameter binding, row decoding, scalar helpers, returning rows, and execute counts are verified through the emitted public API.
+
+Analyzer tests should use real SQLite schemas and real SQL files.

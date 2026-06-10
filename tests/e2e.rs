@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::Command;
 
 use marmot::{Config, Target, analyze_project, emit_project};
 use rusqlite::Connection;
@@ -62,4 +63,228 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     assert!(items_output.contains("pub struct ListItemsRow"));
     assert!(items_output.contains("pub fn list_items(conn: &Connection, owner_id: i64)"));
     assert!(items_output.contains("\"@owner_id\": owner_id"));
+}
+
+#[test]
+fn generated_rust_functions_round_trip_against_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    create_runtime_schema(&conn);
+    drop(conn);
+
+    let source_root = dir.path().join("fixture/src");
+    let sql_dir = source_root.join("app/sql");
+    fs::create_dir_all(&sql_dir).unwrap();
+    fs::write(
+        sql_dir.join("create_user.sql"),
+        "insert into users (name, active, avatar, score, nickname) \
+         values (@name, @active, @avatar, @score, @nickname) \
+         returning id, name, active, avatar, score, nickname",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("list_active_users.sql"),
+        "select id, name, active, avatar, score, nickname \
+         from users where active = @active order by id",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("count_users.sql"),
+        "select count(*) from users",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("rename_user.sql"),
+        "update users set nickname = @nickname where id = @id returning id, nickname",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("delete_user.sql"),
+        "delete from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("create_user_positional.sql"),
+        "insert into users (name, active, avatar, score, nickname) \
+         values (?, ?, ?, ?, ?) \
+         returning id, name, active, avatar, score, nickname",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("set_score_positional.sql"),
+        "update users set score = ? where id = ?",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("find_name_numbered.sql"),
+        "select name from users where id = ?1 and active = ?2",
+    )
+    .unwrap();
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("runtime/src/generated/sql"),
+        target: Target::Rust,
+        check: false,
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+    write_runtime_crate(dir.path());
+
+    let output = Command::new("cargo")
+        .arg("test")
+        .current_dir(dir.path().join("runtime"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generated crate tests failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_runtime_schema(conn: &Connection) {
+    conn.execute_batch(
+        "
+        create table users (
+            id integer primary key,
+            name text not null,
+            active boolean not null,
+            avatar blob not null,
+            score real not null,
+            nickname text
+        );
+        ",
+    )
+    .unwrap();
+}
+
+fn write_runtime_crate(root: &std::path::Path) {
+    let runtime = root.join("runtime");
+    fs::create_dir_all(runtime.join("src/generated")).unwrap();
+    fs::write(
+        runtime.join("Cargo.toml"),
+        r#"
+[package]
+name = "marmot-generated-runtime-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
+"#,
+    )
+    .unwrap();
+    fs::write(runtime.join("src/generated/mod.rs"), "pub mod sql;\n").unwrap();
+    fs::write(
+        runtime.join("src/lib.rs"),
+        r#"
+pub mod generated;
+
+#[cfg(test)]
+mod tests {
+    use super::generated::sql::app_sql;
+    use rusqlite::Connection;
+
+    #[test]
+    fn generated_functions_round_trip_common_sqlite_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                active boolean not null,
+                avatar blob not null,
+                score real not null,
+                nickname text
+            );
+            ",
+        )
+        .unwrap();
+
+        let created = app_sql::create_user(
+            &conn,
+            "alice",
+            true,
+            [1_u8, 2, 3],
+            9.5,
+            Some("ally"),
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, 1);
+        assert_eq!(created[0].name, "alice");
+        assert!(created[0].active);
+        assert_eq!(created[0].avatar, vec![1, 2, 3]);
+        assert_eq!(created[0].score, 9.5);
+        assert_eq!(created[0].nickname.as_deref(), Some("ally"));
+
+        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 1);
+
+        let active = app_sql::list_active_users(&conn, true).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "alice");
+
+        let renamed = app_sql::rename_user(&conn, None, 1).unwrap();
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].id, 1);
+        assert_eq!(renamed[0].nickname, None);
+
+        assert_eq!(app_sql::delete_user(&conn, 1).unwrap(), 1);
+        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn generated_functions_bind_positional_and_numbered_parameters() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                active boolean not null,
+                avatar blob not null,
+                score real not null,
+                nickname text
+            );
+            ",
+        )
+        .unwrap();
+
+        let created = app_sql::create_user_positional(
+            &conn,
+            "bob",
+            true,
+            [4_u8, 5, 6],
+            1.25,
+            None,
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, 1);
+        assert_eq!(created[0].name, "bob");
+        assert_eq!(created[0].avatar, vec![4, 5, 6]);
+        assert_eq!(created[0].nickname, None);
+
+        assert_eq!(app_sql::set_score_positional(&conn, 2.5, 1).unwrap(), 1);
+        let active = app_sql::list_active_users(&conn, true).unwrap();
+        assert_eq!(active[0].score, 2.5);
+
+        assert_eq!(
+            app_sql::find_name_numbered_one(&conn, 1, true).unwrap(),
+            "bob"
+        );
+    }
+}
+"#,
+    )
+    .unwrap();
 }
