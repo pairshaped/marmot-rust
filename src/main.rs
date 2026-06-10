@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use marmot::{Config, Target, analyze_project, emit_project, migrations, seeds};
+use marmot::{Config, Target, analyze_project, emit_project, migrations, reset, seeds};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +19,7 @@ enum Command {
     Generate(Args),
     Migrate(MigrateArgs),
     Seed(SeedArgs),
+    Reset(ResetArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -60,6 +61,18 @@ struct SeedArgs {
     seeds_dir: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+struct ResetArgs {
+    #[arg(long)]
+    database: PathBuf,
+
+    #[arg(long, default_value = migrations::MIGRATION_DIR)]
+    migrations_dir: PathBuf,
+
+    #[arg(long, default_value = seeds::SEED_DIR)]
+    seeds_dir: PathBuf,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
@@ -88,6 +101,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Seed(args) => {
             let applied = seeds::seed_from(args.database, args.seeds_dir)?;
             print_applied("Ran", &applied);
+        }
+        Command::Reset(args) => {
+            let (applied_migrations, applied_seeds) =
+                reset::reset_from(args.database, args.migrations_dir, args.seeds_dir)?;
+            print_applied("Applied", &applied_migrations);
+            print_applied("Ran", &applied_seeds);
         }
     }
     Ok(())

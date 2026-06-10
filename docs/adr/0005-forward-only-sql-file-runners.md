@@ -35,6 +35,8 @@ Migrations run in filename order. Each migration runs in a transaction. After a 
 
 Seeds run in filename order every time. Marmot does not create a seed tracking table.
 
+Reset deletes the configured SQLite database file and companion SQLite files (`-wal`, `-shm`, and `-journal`), then runs migrations and seeds. Reset rejects a database path that is a directory.
+
 The SQL-file runner is shared internally so migrations and seeds use the same ordering, filename validation, file reading, and transaction behavior.
 
 ## Consequences
