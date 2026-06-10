@@ -5,7 +5,7 @@ use heck::ToSnakeCase;
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::discovery::discover_sql_files;
+use crate::discovery::discover_sql_files_with_sql_dir;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
@@ -18,7 +18,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
         source,
     })?;
     let schema = load_schema(&conn)?;
-    let files = discover_sql_files(&config.source_root)?;
+    let files = discover_sql_files_with_sql_dir(&config.source_root, config.sql_dir.as_deref())?;
     let mut queries = Vec::with_capacity(files.len());
 
     for file in files {
@@ -2434,6 +2434,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2495,6 +2496,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2552,6 +2554,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2601,6 +2604,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2677,6 +2681,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2739,6 +2744,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2784,6 +2790,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2830,6 +2837,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2885,6 +2893,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2947,6 +2956,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3010,6 +3020,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3070,6 +3081,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3127,6 +3139,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3182,6 +3195,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3237,6 +3251,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3293,6 +3308,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3348,6 +3364,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3393,6 +3410,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3427,6 +3445,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3463,6 +3482,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3528,6 +3548,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3590,6 +3611,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3632,6 +3654,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3695,6 +3718,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3759,6 +3783,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3837,6 +3862,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3901,6 +3927,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3969,6 +3996,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4016,6 +4044,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4064,6 +4093,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4117,6 +4147,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4155,6 +4186,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4193,6 +4225,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4246,6 +4279,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4302,6 +4336,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4340,6 +4375,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4395,6 +4431,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4446,6 +4483,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4492,6 +4530,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4556,6 +4595,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4594,6 +4634,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4640,6 +4681,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4697,6 +4739,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4758,6 +4801,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4796,6 +4840,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4827,6 +4872,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4852,6 +4898,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4881,6 +4928,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4913,6 +4961,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4948,6 +4997,7 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4996,6 +5046,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5048,6 +5099,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5100,6 +5152,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5141,6 +5194,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5188,6 +5242,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5235,6 +5290,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5276,6 +5332,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5327,6 +5384,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5386,6 +5444,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5449,6 +5508,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5497,6 +5557,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5555,6 +5616,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5609,6 +5671,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5658,6 +5721,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5704,6 +5768,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5745,6 +5810,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5783,6 +5849,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5830,6 +5897,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5884,6 +5952,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5943,6 +6012,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6005,6 +6075,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6082,6 +6153,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6147,6 +6219,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6206,6 +6279,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6261,6 +6335,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6306,6 +6381,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6351,6 +6427,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6389,6 +6466,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6436,6 +6514,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6490,6 +6569,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6561,6 +6641,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6642,6 +6723,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6699,6 +6781,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6749,6 +6832,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6802,6 +6886,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6857,6 +6942,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6913,6 +6999,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6975,6 +7062,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7033,6 +7121,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7085,6 +7174,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7145,6 +7235,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7183,6 +7274,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7246,6 +7338,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7331,6 +7424,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7389,6 +7483,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7428,6 +7523,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7467,6 +7563,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7505,6 +7602,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7543,6 +7641,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7581,6 +7680,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7619,6 +7719,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7665,6 +7766,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7703,6 +7805,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7749,6 +7852,7 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
+            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,

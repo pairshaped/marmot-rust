@@ -27,6 +27,9 @@ struct Args {
     #[arg(long, default_value = "src")]
     source_root: PathBuf,
 
+    #[arg(long)]
+    sql_dir: Option<PathBuf>,
+
     #[arg(long, default_value = "src/generated/sql")]
     output: PathBuf,
 
@@ -66,6 +69,7 @@ fn config(args: Args) -> Config {
     Config {
         database: args.database,
         source_root: args.source_root,
+        sql_dir: args.sql_dir,
         output: args.output,
         target: args.target,
         check: args.check,

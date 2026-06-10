@@ -32,6 +32,7 @@ This is an active Rust port, not a complete replacement for Gleam Marmot yet.
 It currently:
 
 - finds `src/**/sql/*.sql`
+- supports a configured SQL root with `--sql-dir`
 - derives query names from filenames
 - derives generated module names from the owner directory
 - extracts named parameters like `@org_id`
@@ -55,6 +56,16 @@ Generate Rust files:
 cargo run -- generate \
   --database path/to/app.db \
   --source-root path/to/src \
+  --output path/to/src/generated/sql
+```
+
+Generate from a configured SQL root:
+
+```sh
+cargo run -- generate \
+  --database path/to/app.db \
+  --source-root path/to/src \
+  --sql-dir path/to/src/sql \
   --output path/to/src/generated/sql
 ```
 

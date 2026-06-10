@@ -44,6 +44,7 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let config = Config {
         database,
         source_root,
+        sql_dir: None,
         output: dir.path().join("src/generated/sql"),
         target: Target::Rust,
         check: false,
@@ -63,6 +64,64 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     assert!(items_output.contains("pub struct ListItemsRow"));
     assert!(items_output.contains("pub fn list_items(conn: &Connection, owner_id: i64)"));
     assert!(items_output.contains("\"@owner_id\": owner_id"));
+}
+
+#[test]
+fn analyzes_and_emits_from_configured_sql_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table settings (
+            name text primary key,
+            value text not null
+        );
+        create table likes (
+            id integer primary key,
+            user_id integer not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let sql_dir = source_root.join("sql");
+    let likes_sql = sql_dir.join("likes");
+    fs::create_dir_all(&likes_sql).unwrap();
+    fs::write(
+        sql_dir.join("get_settings.sql"),
+        "select name, value from settings order by name",
+    )
+    .unwrap();
+    fs::write(
+        likes_sql.join("get_likes.sql"),
+        "select id from likes where user_id = @user_id",
+    )
+    .unwrap();
+
+    let config = Config {
+        database,
+        source_root,
+        sql_dir: Some(sql_dir),
+        output: dir.path().join("src/generated/sql"),
+        target: Target::Rust,
+        check: false,
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
+    assert_eq!(mod_rs, "pub mod likes_sql;\npub mod sql;\n");
+
+    let settings_output = fs::read_to_string(config.output.join("sql.rs")).unwrap();
+    assert!(settings_output.contains("pub struct GetSettingsRow"));
+    assert!(settings_output.contains("pub fn get_settings(conn: &Connection)"));
+
+    let likes_output = fs::read_to_string(config.output.join("likes_sql.rs")).unwrap();
+    assert!(likes_output.contains("pub fn get_likes(conn: &Connection, user_id: i64)"));
 }
 
 #[test]
@@ -147,6 +206,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     let config = Config {
         database,
         source_root,
+        sql_dir: None,
         output: dir.path().join("runtime/src/generated/sql"),
         target: Target::Rust,
         check: false,

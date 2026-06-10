@@ -739,6 +739,7 @@ mod tests {
         let check_config = Config {
             database: dir.path().join("app.sqlite3"),
             source_root: dir.path().join("src"),
+            sql_dir: None,
             output: output.clone(),
             target: crate::config::Target::Rust,
             check: true,

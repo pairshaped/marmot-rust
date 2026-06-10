@@ -9,6 +9,7 @@ pub enum Target {
 pub struct Config {
     pub database: PathBuf,
     pub source_root: PathBuf,
+    pub sql_dir: Option<PathBuf>,
     pub output: PathBuf,
     pub target: Target,
     pub check: bool,

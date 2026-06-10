@@ -25,6 +25,21 @@ The primary reason for this project is that ergonomics. Runtime speed matters, b
 
 Marmot will discover SQL files by walking source roots and finding directories named `sql`.
 
+Applications may configure a specific SQL root when colocating under each domain directory is not the right shape:
+
+```text
+src/sql/get_settings.sql
+src/sql/articles/get_articles.sql
+src/sql/likes/get_likes.sql
+```
+
+When a SQL root is configured, Marmot recursively discovers `.sql` files under that root. Files directly under the configured root belong to the generated `sql` module. Files under child directories use the child directory name as the module stem:
+
+```text
+src/sql/get_settings.sql -> sql::get_settings
+src/sql/articles/get_articles.sql -> articles_sql::get_articles
+```
+
 Each `*.sql` file defines one query. The filename becomes the generated function name.
 
 The owning directory becomes the generated module name:
