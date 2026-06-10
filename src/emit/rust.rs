@@ -601,6 +601,97 @@ mod tests {
     }
 
     #[test]
+    fn render_query_uses_common_rust_types_for_fields_and_params() {
+        let row_query = Query {
+            source_path: PathBuf::from("src/files/sql/list.sql"),
+            module_name: "files_sql".to_string(),
+            name: "list".to_string(),
+            return_type: ReturnType::Rows { row_type: None },
+            sql: "select active, price, avatar, metadata, deleted from files".to_string(),
+            parameters: vec![],
+            columns: vec![
+                Column {
+                    name: "active".to_string(),
+                    field_name: "active".to_string(),
+                    column_type: ValueType::Bool,
+                    nullable: false,
+                },
+                Column {
+                    name: "price".to_string(),
+                    field_name: "price".to_string(),
+                    column_type: ValueType::F64,
+                    nullable: false,
+                },
+                Column {
+                    name: "avatar".to_string(),
+                    field_name: "avatar".to_string(),
+                    column_type: ValueType::Bytes,
+                    nullable: false,
+                },
+                Column {
+                    name: "metadata".to_string(),
+                    field_name: "metadata".to_string(),
+                    column_type: ValueType::Value,
+                    nullable: false,
+                },
+                Column {
+                    name: "deleted".to_string(),
+                    field_name: "deleted".to_string(),
+                    column_type: ValueType::Bool,
+                    nullable: true,
+                },
+            ],
+        };
+        let execute_query = Query {
+            source_path: PathBuf::from("src/files/sql/update.sql"),
+            module_name: "files_sql".to_string(),
+            name: "update".to_string(),
+            return_type: ReturnType::Execute,
+            sql: "update files set active = ?, price = ?, avatar = ?, maybe_avatar = ?".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "active".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::Bool,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "price".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::F64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "avatar".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::Bytes,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "maybe_avatar".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::Bytes,
+                    nullable: true,
+                },
+            ],
+            columns: vec![],
+        };
+
+        let row_output = render_query(&row_query, true);
+        let execute_output = render_query(&execute_query, true);
+
+        assert!(row_output.contains("pub active: bool"));
+        assert!(row_output.contains("pub price: f64"));
+        assert!(row_output.contains("pub avatar: Vec<u8>"));
+        assert!(row_output.contains("pub metadata: rusqlite::types::Value"));
+        assert!(row_output.contains("pub deleted: Option<bool>"));
+        assert!(execute_output.contains(
+            "pub fn update(conn: &Connection, active: bool, price: f64, avatar: impl AsRef<[u8]>, maybe_avatar: Option<&[u8]>)"
+        ));
+        assert!(execute_output.contains("params![active, price, avatar.as_ref(), maybe_avatar]"));
+    }
+
+    #[test]
     fn render_query_preserves_sql_quotes_and_raw_string_terminators() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
