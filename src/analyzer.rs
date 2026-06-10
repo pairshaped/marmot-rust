@@ -2793,6 +2793,116 @@ mod tests {
     }
 
     #[test]
+    fn natural_join_result_columns_use_origin_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table a (id integer primary key, val_a text not null);
+            create table b (id integer primary key, val_b text not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select a.id, a.val_a from a natural join b",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "val_a".to_string(),
+                    field_name: "val_a".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn join_using_result_columns_use_origin_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                org_id integer not null,
+                total integer not null
+            );
+            create table line_items (
+                id integer primary key,
+                org_id integer not null,
+                product text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_orders.sql"),
+            "select o.total, l.product from orders o join line_items l using (org_id)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "total".to_string(),
+                    field_name: "total".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "product".to_string(),
+                    field_name: "product".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn left_join_strength_reduced_by_where_keeps_result_column_non_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
