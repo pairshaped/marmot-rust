@@ -38,6 +38,12 @@ pub enum Error {
         source: walkdir::Error,
     },
 
+    #[error("missing SQL directory: {path}")]
+    MissingSqlDirectory { path: PathBuf },
+
+    #[error("SQL path is not a directory: {path}")]
+    SqlPathNotDirectory { path: PathBuf },
+
     #[error("could not open sqlite database {path}: {source}")]
     OpenDatabase {
         path: PathBuf,

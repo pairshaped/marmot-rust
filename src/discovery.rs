@@ -67,6 +67,8 @@ fn discover_colocated_sql_files(source_root: &Path) -> Result<Vec<SqlFile>> {
 }
 
 fn discover_configured_sql_files(sql_dir: &Path) -> Result<Vec<SqlFile>> {
+    validate_configured_sql_dir(sql_dir)?;
+
     let mut files = Vec::new();
 
     for entry in WalkDir::new(sql_dir).sort_by_file_name() {
@@ -102,6 +104,24 @@ fn discover_configured_sql_files(sql_dir: &Path) -> Result<Vec<SqlFile>> {
     }
 
     Ok(files)
+}
+
+fn validate_configured_sql_dir(sql_dir: &Path) -> Result<()> {
+    match std::fs::metadata(sql_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Error::SqlPathNotDirectory {
+            path: sql_dir.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::MissingSqlDirectory {
+                path: sql_dir.to_path_buf(),
+            })
+        }
+        Err(source) => Err(Error::ReadFile {
+            path: sql_dir.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn configured_sql_module_name(sql_dir: &Path, path: &Path) -> String {

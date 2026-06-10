@@ -324,6 +324,76 @@ fn generate_command_check_passes_after_generation_and_fails_after_changes() {
 }
 
 #[test]
+fn generate_command_rejects_missing_configured_sql_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "missing_sql_dir");
+    fs::write(
+        dir.path().join("marmot.toml"),
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "src"
+sql_dir = "src/sql"
+output = "src/generated/sql"
+"#,
+            database.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing SQL directory"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generate_command_rejects_configured_sql_dir_that_is_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "bad_sql_dir");
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/sql"), "not a directory").unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "src"
+sql_dir = "src/sql"
+output = "src/generated/sql"
+"#,
+            database.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("SQL path is not a directory"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generate_command_uses_named_database_config() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("db/app.db");
