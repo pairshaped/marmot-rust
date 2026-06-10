@@ -228,6 +228,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     for (key, inference) in comparison_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
+    for (key, inference) in between_parameter_inferences(&tokens, schema, &table_refs) {
+        inferences.insert(key, inference);
+    }
     for (key, inference) in limit_parameter_inferences(&tokens) {
         inferences.insert(key, inference);
     }
@@ -361,6 +364,55 @@ fn limit_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInf
     inferences
 }
 
+fn between_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let mut anon_index = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        let key = parameter_key(token, &mut anon_index);
+        let Some(key) = key else {
+            continue;
+        };
+
+        let Some(column_ref) = between_column_for_parameter(tokens, index) else {
+            continue;
+        };
+        let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
+            continue;
+        };
+
+        inferences.insert(
+            key,
+            ParameterInference {
+                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                nullable: false,
+            },
+        );
+    }
+
+    inferences
+}
+
+fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<ColumnRef> {
+    for between_index in (0..param_index).rev() {
+        if !token_is_word(&tokens[between_index], "BETWEEN") {
+            continue;
+        }
+        let column_end = if between_index >= 2 && token_is_word(&tokens[between_index - 1], "NOT") {
+            between_index - 2
+        } else {
+            between_index.checked_sub(1)?
+        };
+        return column_ref_ending_at(tokens, column_end);
+    }
+
+    None
+}
+
 fn parameter_key(token: &Token, anon_index: &mut usize) -> Option<String> {
     match token {
         Token::ParamNamed { prefix, name } => Some(format!("{prefix}{name}")),
@@ -395,6 +447,15 @@ fn comparison_operator_before(tokens: &[Token], param_index: usize) -> Option<us
     if comparison_operator(previous) {
         return param_index.checked_sub(2);
     }
+    if token_is_word(previous, "LIKE") {
+        if tokens
+            .get(param_index.checked_sub(2)?)
+            .is_some_and(|token| token_is_word(token, "NOT"))
+        {
+            return param_index.checked_sub(3);
+        }
+        return param_index.checked_sub(2);
+    }
     if token_is_word(previous, "NOT")
         && tokens
             .get(param_index.checked_sub(2)?)
@@ -412,6 +473,16 @@ fn comparison_operator_after(tokens: &[Token], param_index: usize) -> Option<usi
     let next = tokens.get(param_index + 1)?;
     if comparison_operator(next) {
         return Some(param_index + 2);
+    }
+    if token_is_word(next, "LIKE") {
+        return Some(param_index + 2);
+    }
+    if token_is_word(next, "NOT")
+        && tokens
+            .get(param_index + 2)
+            .is_some_and(|token| token_is_word(token, "LIKE"))
+    {
+        return Some(param_index + 3);
     }
     if token_is_word(next, "IS") {
         if tokens
@@ -1490,6 +1561,106 @@ mod tests {
             [
                 ("limit", ValueType::I64, false),
                 ("offset", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_like_parameter_type_from_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id, name from users where name like ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_not_between_parameter_types_from_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_events.sql"),
+            "select id from events where created_at not between @start and @end",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("start", ValueType::I64, false),
+                ("end", ValueType::I64, false),
             ]
         );
     }

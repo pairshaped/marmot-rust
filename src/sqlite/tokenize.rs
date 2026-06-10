@@ -580,13 +580,31 @@ fn consume_number(chars: &[char], index: usize) -> (String, usize) {
 fn question_is_nullable_override(previous: Option<&Token>, next: Option<char>) -> bool {
     let previous_is_column_name = matches!(
         previous,
-        Some(Token::Word(word)) if !word.eq_ignore_ascii_case("LIMIT") && !word.eq_ignore_ascii_case("OFFSET")
+        Some(Token::Word(word)) if !word_is_sql_operator_context(word)
     );
     previous_is_column_name && is_boundary(next)
 }
 
 fn exclamation_is_null_override(previous: Option<&Token>, next: Option<char>) -> bool {
     matches!(previous, Some(Token::Word(_))) && is_boundary(next)
+}
+
+fn word_is_sql_operator_context(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "AND"
+            | "BETWEEN"
+            | "ELSE"
+            | "IN"
+            | "IS"
+            | "LIKE"
+            | "LIMIT"
+            | "NOT"
+            | "OFFSET"
+            | "OR"
+            | "THEN"
+            | "WHEN"
+    )
 }
 
 fn is_boundary(c: Option<char>) -> bool {
@@ -785,6 +803,15 @@ mod tests {
                 Token::Word("WHERE".to_string()),
                 Token::Word("id".to_string()),
                 Token::Ne,
+                Token::ParamAnon,
+            ]
+        );
+        assert_eq!(
+            tokenize("WHERE name LIKE ?"),
+            vec![
+                Token::Word("WHERE".to_string()),
+                Token::Word("name".to_string()),
+                Token::Word("LIKE".to_string()),
                 Token::ParamAnon,
             ]
         );
