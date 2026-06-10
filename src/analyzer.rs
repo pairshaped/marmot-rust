@@ -3608,6 +3608,275 @@ mod tests {
     }
 
     #[test]
+    fn infers_upsert_do_nothing_returning_from_insert_table() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_thing.sql"),
+            "
+            insert into t (id, val)
+            values (?, ?)
+            on conflict(id) do nothing
+            returning id, val
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            project.queries[0].return_type,
+            ReturnType::Rows { row_type: None }
+        ));
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "val".to_string(),
+                    field_name: "val".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_upsert_do_nothing_without_returning_as_execute() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_thing.sql"),
+            "
+            insert into t (id, val)
+            values (?, ?)
+            on conflict(id) do nothing
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            project.queries[0].return_type,
+            ReturnType::Execute
+        ));
+        assert!(project.queries[0].columns.is_empty());
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_named_upsert_do_update_parameters() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null,
+                counter integer not null default 1
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("upsert_thing.sql"),
+            "
+            insert into t (id, val, counter)
+            values (@id, @val, @counter)
+            on conflict(id) do update
+            set val = @val, counter = @counter
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "val".to_string(),
+                    sql_names: vec!["@val".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "counter".to_string(),
+                    sql_names: vec!["@counter".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn analyzes_upsert_insert_select_returning_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null
+            );
+            create table src (
+                id integer primary key,
+                val text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("copy_things.sql"),
+            "
+            insert into t (id, val)
+            select id, val from src where true
+            on conflict(id) do update set val = excluded.val
+            returning id, val
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert!(project.queries[0].parameters.is_empty());
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "val".to_string(),
+                    field_name: "val".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn infers_limit_and_offset_parameters_as_i64() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
