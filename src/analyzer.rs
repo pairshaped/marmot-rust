@@ -544,18 +544,10 @@ fn infer_case_branch(tokens: &[Token]) -> CaseBranch {
             column_type: None,
             nullable: true,
         },
-        Some(Token::Word(word)) if word.eq_ignore_ascii_case("CASE") => {
-            match infer_case_expression(tokens) {
-                Some(inference) => CaseBranch {
-                    column_type: inference.column_type,
-                    nullable: inference.inferred_nullable.unwrap_or(true),
-                },
-                None => CaseBranch {
-                    column_type: None,
-                    nullable: true,
-                },
-            }
-        }
+        Some(Token::Word(word)) if word.eq_ignore_ascii_case("CASE") => CaseBranch {
+            column_type: Some(ValueType::String),
+            nullable: true,
+        },
         _ => CaseBranch {
             column_type: None,
             nullable: true,
@@ -1562,6 +1554,90 @@ mod tests {
                 field_name: "mixed".to_string(),
                 column_type: ValueType::String,
                 nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_case_falls_back_to_nullable_string() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                a boolean not null,
+                b boolean not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when a then case when b then 1 else 0 end else 2 end as val from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "val".to_string(),
+                field_name: "val".to_string(),
+                column_type: ValueType::String,
+                nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn simple_case_with_string_literals_returns_string_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, status integer not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case status when 1 then 'active' when 2 then 'inactive' else 'unknown' end as label from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "label".to_string(),
+                field_name: "label".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
             }]
         );
     }
