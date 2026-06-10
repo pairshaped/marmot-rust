@@ -181,6 +181,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     )
     .unwrap();
     fs::write(
+        sql_dir.join("find_name_mixed_positional.sql"),
+        "select name from users where id = ?1 and active = ?",
+    )
+    .unwrap();
+    fs::write(
         sql_dir.join("create_user_returning_star.sql"),
         "insert into users (name, active, avatar, score, nickname) \
          values (@name, @active, @avatar, @score, @nickname) \
@@ -362,6 +367,10 @@ mod tests {
 
         assert_eq!(
             app_sql::find_name_numbered_one(&conn, 1, true).unwrap(),
+            "bob"
+        );
+        assert_eq!(
+            app_sql::find_name_mixed_positional_one(&conn, 1, true).unwrap(),
             "bob"
         );
     }

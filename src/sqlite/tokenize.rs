@@ -760,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn tokenizes_escaped_double_quotes_in_quoted_identifiers() {
+        assert_eq!(
+            tokenize(r#"select "my""col" from t"#),
+            vec![
+                Token::Word("select".to_string()),
+                Token::QuotedId("my\"col".to_string()),
+                Token::Word("from".to_string()),
+                Token::Word("t".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn tokenizes_numbers() {
         assert_eq!(tokenize("42"), vec![Token::Number("42".to_string())]);
         assert_eq!(tokenize("3.14"), vec![Token::Number("3.14".to_string())]);

@@ -158,11 +158,17 @@ fn validate_parameter_styles(queries: &[&Query]) -> Result<()> {
             .parameters
             .iter()
             .any(|param| param.sql_names.is_empty());
-        let has_named_or_numbered = query
+        let has_named = query
             .parameters
             .iter()
-            .any(|param| !param.sql_names.is_empty());
-        if has_anonymous && has_named_or_numbered {
+            .flat_map(|param| &param.sql_names)
+            .any(|sql_name| !sql_name.starts_with('?'));
+        let has_numbered = query
+            .parameters
+            .iter()
+            .flat_map(|param| &param.sql_names)
+            .any(|sql_name| sql_name.starts_with('?'));
+        if has_anonymous && (has_named || (has_numbered && !can_render_as_positional(query))) {
             return Err(Error::MixedParameterStyles {
                 path: query.source_path.clone(),
             });
@@ -170,6 +176,58 @@ fn validate_parameter_styles(queries: &[&Query]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn can_render_as_positional(query: &Query) -> bool {
+    if query.parameters.is_empty() {
+        return false;
+    }
+    if query
+        .parameters
+        .iter()
+        .all(|param| param.sql_names.is_empty())
+    {
+        return true;
+    }
+    if query.parameters.iter().any(|param| {
+        param
+            .sql_names
+            .iter()
+            .any(|sql_name| !sql_name.starts_with('?'))
+    }) {
+        return false;
+    }
+
+    let mut slots = query
+        .parameters
+        .iter()
+        .filter_map(parameter_positional_slot)
+        .collect::<Vec<_>>();
+    slots.sort_unstable();
+
+    slots.iter().copied().eq(1..=query.parameters.len())
+}
+
+fn parameter_positional_slot(param: &crate::model::Parameter) -> Option<usize> {
+    param
+        .sql_names
+        .iter()
+        .filter_map(|sql_name| {
+            sql_name
+                .strip_prefix('?')
+                .and_then(|number| number.parse::<usize>().ok())
+        })
+        .min()
+        .or_else(|| anonymous_parameter_slot(&param.name))
+}
+
+fn anonymous_parameter_slot(name: &str) -> Option<usize> {
+    if name == "param" {
+        return Some(1);
+    }
+
+    name.strip_prefix("param_")
+        .and_then(|number| number.parse::<usize>().ok())
 }
 
 fn generated_function_names_for(query: &Query) -> Vec<String> {
@@ -182,18 +240,13 @@ fn generated_function_names_for(query: &Query) -> Vec<String> {
 
 fn render_import_macros(queries: &[&Query]) -> String {
     let uses_named = queries.iter().any(|query| {
-        query
-            .parameters
-            .iter()
-            .any(|param| !param.sql_names.is_empty())
-    });
-    let uses_positional = queries.iter().any(|query| {
-        !query.parameters.is_empty()
+        !can_render_as_positional(query)
             && query
                 .parameters
                 .iter()
-                .all(|param| param.sql_names.is_empty())
+                .any(|param| !param.sql_names.is_empty())
     });
+    let uses_positional = queries.iter().any(|query| can_render_as_positional(query));
     let mut imports = Vec::new();
     if uses_named {
         imports.push("named_params");
@@ -208,7 +261,6 @@ fn render_import_macros(queries: &[&Query]) -> String {
         format!("{}, ", imports.join(", "))
     }
 }
-
 fn validate_shared_row_types(queries: &[&Query]) -> Result<()> {
     let mut shared_rows: BTreeMap<&str, &[Column]> = BTreeMap::new();
     for query in queries {
@@ -323,9 +375,17 @@ fn render_execute(query: &Query, const_name: &str) -> String {
 }
 
 fn render_params(query: &Query) -> String {
-    query
+    let mut params = query.parameters.iter().collect::<Vec<_>>();
+    if query
         .parameters
         .iter()
+        .any(|param| !param.sql_names.is_empty())
+        && can_render_as_positional(query)
+    {
+        params.sort_by_key(|param| parameter_positional_slot(param).unwrap_or(usize::MAX));
+    }
+    params
+        .into_iter()
         .map(|param| format!(", {}: {}", param.name, param.rust_argument_type()))
         .collect()
 }
@@ -335,15 +395,18 @@ fn render_named_params(query: &Query) -> String {
         return "[]".to_string();
     }
 
-    if query
-        .parameters
-        .iter()
-        .all(|param| param.sql_names.is_empty())
-    {
-        let names = query
+    if can_render_as_positional(query) {
+        let mut params = query.parameters.iter().collect::<Vec<_>>();
+        if query
             .parameters
             .iter()
-            .map(param_binding_expr)
+            .any(|param| !param.sql_names.is_empty())
+        {
+            params.sort_by_key(|param| parameter_positional_slot(param).unwrap_or(usize::MAX));
+        }
+        let names = params
+            .iter()
+            .map(|param| param_binding_expr(param))
             .collect::<Vec<_>>()
             .join(", ");
         return format!("params![{names}]");
@@ -463,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn render_numbered_params_uses_sqlite_parameter_names() {
+    fn render_dense_numbered_params_positionally() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
             module_name: "users_sql".to_string(),
@@ -489,7 +552,59 @@ mod tests {
 
         let output = render_query(&query, true);
 
-        assert!(output.contains("named_params! { \"?1\": param, \"?2\": param_2.as_ref() }"));
+        assert!(output.contains("params![param, param_2.as_ref()]"));
+    }
+
+    #[test]
+    fn render_sparse_numbered_params_uses_sqlite_parameter_names() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/sql/find.sql"),
+            module_name: "users_sql".to_string(),
+            name: "find".to_string(),
+            return_type: ReturnType::Execute,
+            sql: "update users set name = ?2".to_string(),
+            parameters: vec![Parameter {
+                name: "param_2".to_string(),
+                sql_names: vec!["?2".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }],
+            columns: vec![],
+        };
+
+        let output = render_query(&query, true);
+
+        assert!(output.contains("named_params! { \"?2\": param_2.as_ref() }"));
+    }
+
+    #[test]
+    fn render_dense_mixed_numbered_and_anonymous_params_positionally() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/sql/find.sql"),
+            module_name: "users_sql".to_string(),
+            name: "find".to_string(),
+            return_type: ReturnType::Execute,
+            sql: "delete from users where id = ?1 and name = ?".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec!["?1".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ],
+            columns: vec![],
+        };
+
+        let output = render_module(vec![&query]).unwrap();
+
+        assert!(output.contains("params![param, param_2.as_ref()]"));
     }
 
     #[test]

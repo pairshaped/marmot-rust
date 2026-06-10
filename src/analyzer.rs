@@ -234,12 +234,16 @@ fn table_without_rowid(conn: &Connection, table_name: &str) -> Result<bool> {
 fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
     let inferences = parameter_inferences(sql, schema);
     let mut params: Vec<Parameter> = Vec::new();
-    let mut anonymous_index = 0usize;
+    let mut slots = ParameterSlots::default();
 
     for token in tokenize(sql) {
         match token {
             Token::ParamNamed { prefix, name } => {
                 let sql_name = format!("{prefix}{name}");
+                slots.key(&Token::ParamNamed {
+                    prefix,
+                    name: name.clone(),
+                });
                 let inference = inferences
                     .get(&sql_name)
                     .cloned()
@@ -247,9 +251,14 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
                 add_named_parameter(&mut params, &name, &sql_name, inference);
             }
             Token::ParamAnon => {
-                anonymous_index += 1;
-                let name = anonymous_parameter_name(anonymous_index);
-                let placeholder = anonymous_placeholder_key(anonymous_index);
+                let Some(placeholder) = slots.key(&Token::ParamAnon) else {
+                    continue;
+                };
+                let slot = placeholder
+                    .strip_prefix('?')
+                    .and_then(|number| number.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let name = anonymous_parameter_name(slot);
                 let inference = inferences
                     .get(&placeholder)
                     .cloned()
@@ -263,7 +272,11 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
             }
             Token::ParamNumbered { number } => {
                 let name = numbered_parameter_name(&number);
-                let placeholder = numbered_placeholder_key(&number);
+                let Some(placeholder) = slots.key(&Token::ParamNumbered {
+                    number: number.clone(),
+                }) else {
+                    continue;
+                };
                 let sql_name = format!("?{number}");
                 let inference = inferences
                     .get(&placeholder)
@@ -271,7 +284,7 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
                     .unwrap_or_else(ParameterInference::default);
                 if let Some(param) = params
                     .iter_mut()
-                    .find(|param| parameter_matches_numbered_index(param, &number))
+                    .find(|param| parameter_matches_positional_index(param, &number))
                 {
                     if !param.sql_names.contains(&sql_name) {
                         param.sql_names.push(sql_name);
@@ -288,6 +301,15 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
             }
             _ => {}
         }
+    }
+
+    if params.iter().all(|param| {
+        param
+            .sql_names
+            .iter()
+            .all(|sql_name| sql_name.starts_with('?'))
+    }) {
+        params.sort_by_key(parameter_positional_slot);
     }
 
     params
@@ -343,13 +365,21 @@ fn parameter_matches_logical_name(param: &Parameter, logical_name: &str) -> bool
         .any(|name| name.to_ascii_lowercase() == logical_name)
 }
 
-fn parameter_matches_numbered_index(param: &Parameter, number: &str) -> bool {
+fn parameter_matches_positional_index(param: &Parameter, number: &str) -> bool {
     let index = numbered_parameter_index(number);
-    param.sql_names.iter().any(|sql_name| {
-        sql_name
-            .strip_prefix('?')
-            .is_some_and(|number| numbered_parameter_index(number) == index)
-    })
+    if param
+        .sql_names
+        .iter()
+        .any(|sql_name| !sql_name.starts_with('?'))
+    {
+        return false;
+    }
+    anonymous_parameter_slot(&param.name) == Some(index)
+        || param.sql_names.iter().any(|sql_name| {
+            sql_name
+                .strip_prefix('?')
+                .is_some_and(|number| numbered_parameter_index(number) == index)
+        })
 }
 
 fn unique_parameter_name(base: &str, params: &[Parameter]) -> String {
@@ -383,12 +413,61 @@ fn numbered_parameter_name(number: &str) -> String {
     anonymous_parameter_name(numbered_parameter_index(number))
 }
 
-fn numbered_placeholder_key(number: &str) -> String {
-    anonymous_placeholder_key(numbered_parameter_index(number))
-}
-
 fn numbered_parameter_index(number: &str) -> usize {
     number.parse::<usize>().unwrap_or(0)
+}
+
+fn parameter_positional_slot(param: &Parameter) -> usize {
+    param
+        .sql_names
+        .iter()
+        .filter_map(|sql_name| {
+            sql_name
+                .strip_prefix('?')
+                .and_then(|number| number.parse::<usize>().ok())
+        })
+        .min()
+        .or_else(|| anonymous_parameter_slot(&param.name))
+        .unwrap_or(usize::MAX)
+}
+
+fn anonymous_parameter_slot(name: &str) -> Option<usize> {
+    if name == "param" {
+        return Some(1);
+    }
+    name.strip_prefix("param_")
+        .and_then(|number| number.parse::<usize>().ok())
+}
+
+#[derive(Debug, Default)]
+struct ParameterSlots {
+    next_index: usize,
+    named_slots: BTreeMap<String, usize>,
+}
+
+impl ParameterSlots {
+    fn key(&mut self, token: &Token) -> Option<String> {
+        match token {
+            Token::ParamNamed { prefix, name } => {
+                let sql_name = format!("{prefix}{name}");
+                if !self.named_slots.contains_key(&sql_name) {
+                    self.next_index += 1;
+                    self.named_slots.insert(sql_name.clone(), self.next_index);
+                }
+                Some(sql_name)
+            }
+            Token::ParamNumbered { number } => {
+                let index = numbered_parameter_index(number);
+                self.next_index = self.next_index.max(index);
+                Some(anonymous_placeholder_key(index))
+            }
+            Token::ParamAnon => {
+                self.next_index += 1;
+                Some(anonymous_placeholder_key(self.next_index))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, ParameterInference> {
@@ -447,13 +526,13 @@ fn insert_parameter_inferences(
         return inferences;
     };
 
-    let mut anon_index = 0usize;
+    let mut slots = ParameterSlots::default();
 
     for value_tokens in values_rows(tokens, values_index + 1) {
         let values = split_top_level_commas(value_tokens);
         for (value, column) in values.into_iter().zip(&columns) {
             for token in value {
-                let Some(key) = parameter_key(token, &mut anon_index) else {
+                let Some(key) = slots.key(token) else {
                     continue;
                 };
                 if let Some(schema_column) = schema.column(table, column) {
@@ -683,9 +762,9 @@ fn cast_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInfe
 
 fn parameter_keys_by_index(tokens: &[Token]) -> BTreeMap<usize, String> {
     let mut keys = BTreeMap::new();
-    let mut anon_index = 0usize;
+    let mut slots = ParameterSlots::default();
     for (index, token) in tokens.iter().enumerate() {
-        if let Some(key) = parameter_key(token, &mut anon_index) {
+        if let Some(key) = slots.key(token) {
             keys.insert(index, key);
         }
     }
@@ -698,10 +777,10 @@ fn comparison_parameter_inferences(
     table_refs: &BTreeMap<String, String>,
 ) -> BTreeMap<String, ParameterInference> {
     let mut inferences = BTreeMap::new();
-    let mut anon_index = 0usize;
+    let mut slots = ParameterSlots::default();
 
     for (index, token) in tokens.iter().enumerate() {
-        let Some(key) = parameter_key(token, &mut anon_index) else {
+        let Some(key) = slots.key(token) else {
             continue;
         };
 
@@ -939,10 +1018,10 @@ fn arithmetic_operator(token: &Token) -> bool {
 
 fn limit_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
     let mut inferences = BTreeMap::new();
-    let mut anon_index = 0usize;
+    let mut slots = ParameterSlots::default();
 
     for (index, token) in tokens.iter().enumerate() {
-        let key = parameter_key(token, &mut anon_index);
+        let key = slots.key(token);
         if !tokens
             .get(index.saturating_sub(1))
             .is_some_and(|token| token_is_word(token, "LIMIT") || token_is_word(token, "OFFSET"))
@@ -969,10 +1048,10 @@ fn between_parameter_inferences(
     table_refs: &BTreeMap<String, String>,
 ) -> BTreeMap<String, ParameterInference> {
     let mut inferences = BTreeMap::new();
-    let mut anon_index = 0usize;
+    let mut slots = ParameterSlots::default();
 
     for (index, token) in tokens.iter().enumerate() {
-        let key = parameter_key(token, &mut anon_index);
+        let key = slots.key(token);
         let Some(key) = key else {
             continue;
         };
@@ -1138,18 +1217,6 @@ fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<
     }
 
     None
-}
-
-fn parameter_key(token: &Token, anon_index: &mut usize) -> Option<String> {
-    match token {
-        Token::ParamNamed { prefix, name } => Some(format!("{prefix}{name}")),
-        Token::ParamNumbered { number } => Some(numbered_placeholder_key(number)),
-        Token::ParamAnon => {
-            *anon_index += 1;
-            Some(anonymous_placeholder_key(*anon_index))
-        }
-        _ => None,
-    }
 }
 
 fn collect_balanced_parens(tokens: &[Token], open_index: usize) -> (&[Token], usize) {
@@ -2372,6 +2439,17 @@ mod tests {
     }
 
     #[test]
+    fn deduplicates_anonymous_and_numbered_parameters_that_share_a_sqlite_slot() {
+        let params = parameters("where id = ? and parent_id = ?1", &Schema::default());
+        let names = params
+            .into_iter()
+            .map(|param| (param.name, param.sql_names))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, [("param".to_string(), vec!["?1".to_string()])]);
+    }
+
+    #[test]
     fn suffixes_numbered_parameter_names_that_collide_with_named_parameters() {
         let params = parameters("where name = @param and id = ?1", &Schema::default());
         let names = params
@@ -2579,6 +2657,63 @@ mod tests {
             [
                 ("param", ValueType::I64, false, vec!["?1".to_string()]),
                 ("param_2", ValueType::String, false, vec!["?2".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_mixed_numbered_and_anonymous_parameters_by_sqlite_slot() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id from users where id = ?1 and name = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                    param.sql_names.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, false, vec!["?1".to_string()]),
+                ("param_2", ValueType::String, false, vec![]),
             ]
         );
     }
@@ -4407,6 +4542,55 @@ mod tests {
                 column_type: ValueType::String,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn quoted_identifier_with_escaped_quotes_resolves_column_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "create table t (\"my\"\"col\" integer primary key, name text not null);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select \"my\"\"col\", name from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "my\"col".to_string(),
+                    field_name: "mycol".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "name".to_string(),
+                    field_name: "name".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
         );
     }
 

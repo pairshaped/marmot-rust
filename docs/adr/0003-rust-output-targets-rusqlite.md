@@ -18,10 +18,14 @@ Generated query functions should use:
 
 - `Connection::prepare_cached`
 - named parameters for source SQL that uses `@name`
+- `params!` for anonymous placeholders and dense positional slots such as `?1, ?2`
+- `named_params!` for sparse numbered slots such as `?2` without `?1`
 - positional column reads by index
 - concrete row structs
 - `execute` for statements without result columns
 - `query_map` or `query_row` for result statements
+
+Parameter inference follows SQLite bind slots. Anonymous `?` placeholders take the next slot after the highest prior slot, numbered `?NNN` placeholders use slot `NNN`, and repeated references to the same positional slot share one generated argument. Dense positional slots bind with `params!`; sparse numbered slots bind by SQLite parameter name so generated functions do not need unused dummy arguments.
 
 The emitter should avoid:
 
