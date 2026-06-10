@@ -1352,6 +1352,22 @@ fn infer_expression_tokens(
             nullable_override: None,
         });
     }
+    if matches!(tokens.first(), Some(Token::StringLit(_))) {
+        return Some(ExpressionInference {
+            column_type: Some(ValueType::String),
+            inferred_nullable: Some(false),
+            nullable_override: None,
+        });
+    }
+    if let Some((table, schema_column)) = infer_column_ref_expression(tokens, context) {
+        return Some(ExpressionInference {
+            column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
+            inferred_nullable: Some(
+                schema_column.nullable || context.nullable_tables.contains(&table),
+            ),
+            nullable_override: None,
+        });
+    }
 
     let function_name = match (tokens.first(), tokens.get(1)) {
         (Some(Token::Word(name)), Some(Token::OpenParen)) => name,
@@ -1588,21 +1604,31 @@ fn infer_column_ref_case_branch(
     tokens: &[Token],
     context: &ExpressionContext<'_>,
 ) -> Option<CaseBranch> {
-    let column_ref = match tokens {
+    let (table, schema_column) = infer_column_ref_expression(tokens, context)?;
+
+    Some(CaseBranch {
+        column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
+        nullable: schema_column.nullable || context.nullable_tables.contains(&table),
+    })
+}
+
+fn infer_column_ref_expression<'a>(
+    tokens: &[Token],
+    context: &ExpressionContext<'a>,
+) -> Option<(String, &'a SchemaColumn)> {
+    let column_ref = column_ref_from_expression(tokens)?;
+    resolve_column_ref_with_table(context.schema, context.table_refs, &column_ref)
+}
+
+fn column_ref_from_expression(tokens: &[Token]) -> Option<ColumnRef> {
+    match tokens {
         [Token::Word(_)] | [Token::QuotedId(_)] => column_ref_starting_at(tokens, 0),
         [Token::Word(_), Token::Dot, Token::Word(_)]
         | [Token::Word(_), Token::Dot, Token::QuotedId(_)]
         | [Token::QuotedId(_), Token::Dot, Token::Word(_)]
         | [Token::QuotedId(_), Token::Dot, Token::QuotedId(_)] => column_ref_starting_at(tokens, 0),
         _ => None,
-    }?;
-    let (table, schema_column) =
-        resolve_column_ref_with_table(context.schema, context.table_refs, &column_ref)?;
-
-    Some(CaseBranch {
-        column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
-        nullable: schema_column.nullable || context.nullable_tables.contains(&table),
-    })
+    }
 }
 
 fn number_value_type(number: &str) -> ValueType {
@@ -2723,6 +2749,97 @@ mod tests {
     }
 
     #[test]
+    fn string_keywords_do_not_disrupt_where_parameter_inference() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                email text not null,
+                status text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select id
+            from users
+            where name != 'foo AND bar'
+              and email != 'yes or no'
+              and status = ?
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn escaped_quote_does_not_hide_following_placeholder() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_thing.sql"),
+            "select id from t where name != 'it''s' and id = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn infers_not_between_parameter_types_from_column() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -3578,6 +3695,100 @@ mod tests {
             [Column {
                 name: "unique_customers".to_string(),
                 field_name: "unique_customers".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn string_literals_do_not_split_select_expressions() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("display_user.sql"),
+            "select coalesce(name, 'unknown, unnamed') as display_name from users where id = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "display_name".to_string(),
+                field_name: "display_name".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn string_literals_do_not_change_parenthesis_depth() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("display_thing.sql"),
+            "select coalesce(name, 'default)value') as display from t where id = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "display".to_string(),
+                field_name: "display".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
                 column_type: ValueType::I64,
                 nullable: false,
             }]
