@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use marmot::{Config, Target, analyze_project, emit_project};
+use marmot::{Config, Target, analyze_project, emit_project, migrations, seeds};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,6 +17,8 @@ struct Cli {
 enum Command {
     Inspect(Args),
     Generate(Args),
+    Migrate(MigrateArgs),
+    Seed(SeedArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -40,6 +42,24 @@ struct Args {
     check: bool,
 }
 
+#[derive(Debug, Parser)]
+struct MigrateArgs {
+    #[arg(long)]
+    database: PathBuf,
+
+    #[arg(long, default_value = migrations::MIGRATION_DIR)]
+    migrations_dir: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct SeedArgs {
+    #[arg(long)]
+    database: PathBuf,
+
+    #[arg(long, default_value = seeds::SEED_DIR)]
+    seeds_dir: PathBuf,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
@@ -61,8 +81,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let project = analyze_project(&config)?;
             emit_project(&config, &project)?;
         }
+        Command::Migrate(args) => {
+            let applied = migrations::migrate_from(args.database, args.migrations_dir)?;
+            print_applied("Applied", &applied);
+        }
+        Command::Seed(args) => {
+            let applied = seeds::seed_from(args.database, args.seeds_dir)?;
+            print_applied("Ran", &applied);
+        }
     }
     Ok(())
+}
+
+fn print_applied(action: &str, applied: &[String]) {
+    for version in applied {
+        println!("{action} {version}");
+    }
 }
 
 fn config(args: Args) -> Config {

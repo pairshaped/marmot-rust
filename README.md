@@ -80,6 +80,22 @@ cargo run -- generate \
   --check
 ```
 
+Run migrations:
+
+```sh
+cargo run -- migrate \
+  --database path/to/app.db \
+  --migrations-dir db/migrations
+```
+
+Run seeds:
+
+```sh
+cargo run -- seed \
+  --database path/to/app.db \
+  --seeds-dir db/seeds
+```
+
 ## Design Notes
 
 The generator should emit boring concrete code. Runtime speed should come from staying close to hand-written `rusqlite`: cached prepared statements, positional row access, concrete row structs, and no dynamic mapper layer.
