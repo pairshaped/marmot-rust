@@ -245,6 +245,7 @@ fn result_columns(
 
 fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
     let tokens = tokenize(sql);
+    let mut aliases = BTreeMap::new();
     let mut nullable_tables = BTreeSet::new();
     let mut index = 0;
 
@@ -271,13 +272,139 @@ fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
         }
 
         if let Some(table_name) = tokens.get(join_index + 1).and_then(table_name_from_token) {
-            nullable_tables.insert(table_name.to_ascii_lowercase());
+            let table_name = table_name.to_ascii_lowercase();
+            nullable_tables.insert(table_name.clone());
+            if let Some(alias) = table_alias_after_join(&tokens, join_index + 2) {
+                aliases.insert(alias.to_ascii_lowercase(), table_name.clone());
+            }
+            aliases.insert(table_name.clone(), table_name);
         }
 
         index = join_index + 1;
     }
 
+    for table in where_null_rejected_tables(&tokens, &aliases) {
+        nullable_tables.remove(&table);
+    }
+
     nullable_tables
+}
+
+fn table_alias_after_join(tokens: &[Token], mut index: usize) -> Option<&str> {
+    if tokens
+        .get(index)
+        .is_some_and(|token| token_is_word(token, "AS"))
+    {
+        index += 1;
+    }
+
+    let token = tokens.get(index)?;
+    let alias = table_name_from_token(token)?;
+    (!join_clause_boundary(alias)).then_some(alias)
+}
+
+fn join_clause_boundary(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "ON" | "USING" | "JOIN" | "LEFT" | "RIGHT" | "INNER" | "CROSS" | "FULL" | "WHERE"
+    )
+}
+
+fn where_null_rejected_tables(
+    tokens: &[Token],
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let Some(where_start) = top_level_keyword(tokens, "WHERE") else {
+        return BTreeSet::new();
+    };
+    let where_end = top_level_clause_end(tokens, where_start + 1);
+    let mut rejected = BTreeSet::new();
+    let mut index = where_start + 1;
+
+    while index < where_end {
+        let Some((qualifier, next_index)) = qualified_column_at(tokens, index) else {
+            index += 1;
+            continue;
+        };
+
+        if null_rejecting_predicate_follows(tokens, next_index, where_end) {
+            if let Some(table) = aliases.get(&qualifier.to_ascii_lowercase()) {
+                rejected.insert(table.clone());
+            }
+        }
+
+        index = next_index;
+    }
+
+    rejected
+}
+
+fn top_level_keyword(tokens: &[Token], keyword: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case(keyword) => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn top_level_clause_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if depth == 0
+                    && matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "GROUP" | "HAVING" | "ORDER" | "LIMIT" | "RETURNING"
+                    ) =>
+            {
+                return index;
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+fn qualified_column_at(tokens: &[Token], index: usize) -> Option<(&str, usize)> {
+    match (
+        tokens.get(index),
+        tokens.get(index + 1),
+        tokens.get(index + 2),
+    ) {
+        (Some(Token::Word(qualifier)), Some(Token::Dot), Some(Token::Word(_)))
+        | (Some(Token::QuotedId(qualifier)), Some(Token::Dot), Some(Token::Word(_)))
+        | (Some(Token::Word(qualifier)), Some(Token::Dot), Some(Token::QuotedId(_)))
+        | (Some(Token::QuotedId(qualifier)), Some(Token::Dot), Some(Token::QuotedId(_))) => {
+            Some((qualifier.as_str(), index + 3))
+        }
+        _ => None,
+    }
+}
+
+fn null_rejecting_predicate_follows(tokens: &[Token], index: usize, end: usize) -> bool {
+    match tokens.get(index) {
+        Some(Token::Eq | Token::Ne | Token::Lt | Token::Gt | Token::Le | Token::Ge) => true,
+        Some(Token::Word(word)) if word.eq_ignore_ascii_case("IS") => {
+            tokens
+                .get(index + 1)
+                .is_some_and(|token| token_is_word(token, "NOT"))
+                && tokens
+                    .get(index + 2)
+                    .is_some_and(|token| token_is_word(token, "NULL"))
+                && index + 2 < end
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1124,6 +1251,61 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("a_val", false), ("b_val", false), ("c_val", true)]);
+    }
+
+    #[test]
+    fn left_join_strength_reduced_by_where_keeps_result_column_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table profiles (
+                id integer primary key,
+                user_id integer not null,
+                bio text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select p.bio
+            from users u
+            left join profiles p on p.user_id = u.id
+            where p.bio = 'x'
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "bio".to_string(),
+                field_name: "bio".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
     }
 
     #[test]
