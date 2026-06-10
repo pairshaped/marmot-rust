@@ -1020,6 +1020,9 @@ fn expression_without_alias(tokens: &[Token]) -> &[Token] {
 }
 
 fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
+    if let Some(inference) = infer_top_level_numeric_binary_expression(tokens) {
+        return Some(inference);
+    }
     if tokens
         .first()
         .is_some_and(|token| token_is_word(token, "CASE"))
@@ -1031,6 +1034,13 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
         .is_some_and(|token| token_is_word(token, "CAST"))
     {
         return infer_cast_expression(tokens);
+    }
+    if let Some(Token::Number(number)) = tokens.first() {
+        return Some(ExpressionInference {
+            column_type: Some(number_value_type(number)),
+            inferred_nullable: Some(false),
+            nullable_override: None,
+        });
     }
 
     let function_name = match (tokens.first(), tokens.get(1)) {
@@ -1055,8 +1065,68 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
             inferred_nullable: Some(true),
             nullable_override: None,
         }),
+        "coalesce" => infer_coalesce_expression(tokens),
         _ => None,
     }
+}
+
+fn infer_top_level_numeric_binary_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Plus | Token::Minus if depth == 0 => {
+                let left = infer_expression_tokens(&tokens[..index])?;
+                let right = infer_expression_tokens(&tokens[index + 1..])?;
+                let column_type = common_numeric_type(left.column_type?, right.column_type?)?;
+                return Some(ExpressionInference {
+                    column_type: Some(column_type),
+                    inferred_nullable: Some(
+                        left.inferred_nullable.unwrap_or(true)
+                            || right.inferred_nullable.unwrap_or(true),
+                    ),
+                    nullable_override: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn common_numeric_type(left: ValueType, right: ValueType) -> Option<ValueType> {
+    match (left, right) {
+        (ValueType::F64, ValueType::I64)
+        | (ValueType::I64, ValueType::F64)
+        | (ValueType::F64, ValueType::F64) => Some(ValueType::F64),
+        (ValueType::I64, ValueType::I64) => Some(ValueType::I64),
+        _ => None,
+    }
+}
+
+fn infer_coalesce_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+    let (inside, _) = collect_balanced_parens(tokens, 1);
+    let mut column_type = None;
+    let mut nullable = true;
+
+    for arg in split_top_level_commas(inside) {
+        let Some(inference) = infer_expression_tokens(arg) else {
+            continue;
+        };
+        if column_type.is_none() {
+            column_type = inference.column_type;
+        }
+        if inference.inferred_nullable == Some(false) {
+            nullable = false;
+        }
+    }
+
+    Some(ExpressionInference {
+        column_type,
+        inferred_nullable: Some(nullable),
+        nullable_override: None,
+    })
 }
 
 fn infer_cast_expression(tokens: &[Token]) -> Option<ExpressionInference> {
@@ -2482,6 +2552,80 @@ mod tests {
                 column_type: ValueType::String,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn coalesce_max_plus_literal_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer primary key,
+                org_id integer not null,
+                item_type text not null,
+                season integer not null,
+                position integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("next_position.sql"),
+            "
+            select coalesce(max(position), 0) + 1 as next_position
+            from items
+            where org_id = @org_id
+              and item_type = @item_type
+              and season is @season
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "next_position".to_string(),
+                field_name: "next_position".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+
+        let params = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            params,
+            [
+                ("org_id", ValueType::I64, false),
+                ("item_type", ValueType::String, false),
+                ("season", ValueType::I64, false),
+            ]
         );
     }
 
