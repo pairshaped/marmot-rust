@@ -211,6 +211,118 @@ output = "{}"
 }
 
 #[test]
+fn generate_command_database_url_overrides_marmot_toml_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_database = dir.path().join("config.sqlite3");
+    let env_database = dir.path().join("env.sqlite3");
+    create_users_database(&config_database, "config_name");
+    create_users_database(&env_database, "env_name");
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    let output_dir = dir.path().join("generated/sql");
+    fs::write(
+        dir.path().join("marmot.toml"),
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "{}"
+output = "{}"
+"#,
+            config_database.display(),
+            source_root.display(),
+            output_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .env("DATABASE_URL", &env_database)
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated = fs::read_to_string(output_dir.join("users_sql.rs")).unwrap();
+    assert!(generated.contains("FIND_USER_SQL"));
+}
+
+#[test]
+fn generate_command_cli_database_overrides_database_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let env_database = dir.path().join("env.sqlite3");
+    let cli_database = dir.path().join("cli.sqlite3");
+    create_users_database(&env_database, "env_name");
+    create_users_database(&cli_database, "cli_name");
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    let output_dir = dir.path().join("generated/sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .env("DATABASE_URL", &env_database)
+        .arg("generate")
+        .arg("--database")
+        .arg(&cli_database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_dir.join("users_sql.rs").exists());
+}
+
+#[test]
+fn generate_command_rejects_cli_database_with_named_database_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.app]
+path = "db/app.db"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database")
+        .arg("tmp/test.db")
+        .arg("--database-name")
+        .arg("app")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--database cannot be used with --database-name"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generate_command_check_reports_missing_generated_files_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
