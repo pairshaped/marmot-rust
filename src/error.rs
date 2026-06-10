@@ -81,6 +81,9 @@ pub enum Error {
 
     #[error("generated file is stale: {path}")]
     StaleGeneratedFile { path: PathBuf },
+
+    #[error("generated output collision: {paths:?}")]
+    GeneratedOutputCollision { paths: Vec<PathBuf> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

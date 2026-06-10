@@ -61,6 +61,8 @@ If a global `sql_dir`, `output`, `migrations_dir`, or `seeds_dir` is configured,
 
 `[tools.marmot].database` cannot be combined with named database references. Use a single top-level database config or named references, not both.
 
+`generate` checks generated output paths across all selected database targets before writing files. If two targets would write the same Rust module or `mod.rs`, generation fails instead of allowing a later target to overwrite an earlier one.
+
 Missing `marmot.toml` is allowed. In that case Marmot uses built-in defaults for source, output, migrations, and seeds, while still requiring a database from `--database`, `DATABASE_URL`, or config.
 
 ## Consequences

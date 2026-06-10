@@ -326,6 +326,66 @@ name = "analytics"
 }
 
 #[test]
+fn generate_command_rejects_named_database_output_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/app.sqlite"), "app_name");
+    let analytics = Connection::open(dir.path().join("db/analytics.sqlite")).unwrap();
+    analytics
+        .execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                title text not null
+            );
+            ",
+        )
+        .unwrap();
+    drop(analytics);
+
+    let app_sql = dir.path().join("src/sql/app");
+    let analytics_sql = dir.path().join("src/sql/analytics");
+    fs::create_dir_all(&app_sql).unwrap();
+    fs::create_dir_all(&analytics_sql).unwrap();
+    fs::write(app_sql.join("find.sql"), "select id, name from users").unwrap();
+    fs::write(
+        analytics_sql.join("find.sql"),
+        "select id, title from events",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.app]
+path = "db/app.sqlite"
+sql_dir = "src/sql/app"
+output = "src/generated/sql"
+
+[tools.marmot.databases.analytics]
+path = "db/analytics.sqlite"
+sql_dir = "src/sql/analytics"
+output = "src/generated/sql"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("generated output collision"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.path().join("src/generated/sql/sql.rs").exists());
+}
+
+#[test]
 fn inspect_command_runs_all_named_database_configs() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("db")).unwrap();

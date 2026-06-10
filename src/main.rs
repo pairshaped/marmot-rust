@@ -1,10 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use marmot::{
-    Config, FileConfig, Target, analyze_project,
+    Config, Error as MarmotError, FileConfig, Target, analyze_project,
     config::{ConfigError, DatabaseReference},
-    emit_project, migrations, reset, seeds,
+    emit_project, migrations,
+    model::Project,
+    reset, seeds,
 };
 
 #[derive(Debug, Parser)]
@@ -119,8 +122,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Generate(args) => {
+            let mut analyzed = Vec::new();
             for config in configs(args, &file_config)? {
                 let project = analyze_project(&config)?;
+                analyzed.push((config, project));
+            }
+            ensure_generated_outputs_do_not_collide(&analyzed)?;
+            for (config, project) in analyzed {
                 emit_project(&config, &project)?;
             }
         }
@@ -172,6 +180,38 @@ fn print_applied(action: &str, applied: &[String]) {
     for version in applied {
         println!("{action} {version}");
     }
+}
+
+fn ensure_generated_outputs_do_not_collide(
+    analyzed: &[(Config, Project)],
+) -> Result<(), MarmotError> {
+    let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
+    for (target_index, (config, project)) in analyzed.iter().enumerate() {
+        for path in generated_output_paths(config, project) {
+            by_path.entry(path).or_default().insert(target_index);
+        }
+    }
+
+    let collisions = by_path
+        .into_iter()
+        .filter_map(|(path, targets)| (targets.len() > 1).then_some(path))
+        .collect::<Vec<_>>();
+
+    if collisions.is_empty() {
+        Ok(())
+    } else {
+        Err(MarmotError::GeneratedOutputCollision { paths: collisions })
+    }
+}
+
+fn generated_output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
+    let mut paths = project
+        .queries
+        .iter()
+        .map(|query| config.output.join(format!("{}.rs", query.module_name)))
+        .collect::<BTreeSet<_>>();
+    paths.insert(config.output.join("mod.rs"));
+    paths
 }
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigError> {
