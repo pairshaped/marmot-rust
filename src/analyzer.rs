@@ -289,13 +289,18 @@ fn add_named_parameter(
     sql_name: &str,
     inference: ParameterInference,
 ) {
+    let logical_name = raw_name.to_ascii_lowercase();
     let name = sanitize_identifier(&raw_name.to_snake_case());
     let sql_name = sql_name.to_string();
-    if let Some(param) = params.iter_mut().find(|param| param.name == name) {
+    if let Some(param) = params
+        .iter_mut()
+        .find(|param| parameter_matches_logical_name(param, &logical_name))
+    {
         if !param.sql_names.contains(&sql_name) {
             param.sql_names.push(sql_name);
         }
     } else {
+        let name = unique_parameter_name(&name, params);
         params.push(Parameter {
             name,
             sql_names: vec![sql_name],
@@ -303,6 +308,29 @@ fn add_named_parameter(
             nullable: inference.nullable,
         });
     }
+}
+
+fn parameter_matches_logical_name(param: &Parameter, logical_name: &str) -> bool {
+    param
+        .sql_names
+        .iter()
+        .filter_map(|sql_name| sql_name.get(1..))
+        .any(|name| name.to_ascii_lowercase() == logical_name)
+}
+
+fn unique_parameter_name(base: &str, params: &[Parameter]) -> String {
+    if !params.iter().any(|param| param.name == base) {
+        return base.to_string();
+    }
+
+    for suffix in 2usize.. {
+        let candidate = format!("{base}_{suffix}");
+        if !params.iter().any(|param| param.name == candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix loop should return")
 }
 
 fn anonymous_parameter_name(index: usize) -> String {
@@ -2640,6 +2668,60 @@ mod tests {
                 column_type: ValueType::String,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn suffixes_colliding_generated_parameter_names() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            r#"
+            create table things (
+                id integer primary key,
+                "type" text not null,
+                type_ text not null
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_by_types.sql"),
+            r#"select id from things where "type" = @type and type_ = @type_"#,
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "type_".to_string(),
+                    sql_names: vec!["@type".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "type__2".to_string(),
+                    sql_names: vec!["@type_".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
         );
     }
 
