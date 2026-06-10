@@ -280,6 +280,7 @@ mod tests {
         assert_eq!(sanitize_identifier("my-col name"), "my_col_name");
         assert_eq!(sanitize_identifier("voila"), "voila");
         assert_eq!(sanitize_identifier("voila!"), "voila");
+        assert_eq!(sanitize_identifier("voilà"), "voil");
     }
 
     #[test]

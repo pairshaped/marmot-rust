@@ -218,4 +218,23 @@ mod tests {
             "-- returns: Foo\nSELECT 1"
         );
     }
+
+    #[test]
+    fn strips_comments_without_confusing_escaped_quotes() {
+        assert_eq!(
+            strip_comments("SELECT 'it''s fine' -- a comment\n"),
+            "SELECT 'it''s fine' \n"
+        );
+        assert_eq!(
+            strip_comments("SELECT 'it''s -- tricky'"),
+            "SELECT 'it''s -- tricky'"
+        );
+    }
+
+    #[test]
+    fn strips_block_comments_without_fusing_tokens() {
+        assert_eq!(strip_comments("SELECT/**/id"), "SELECT id");
+        assert_eq!(strip_comments("SELECT /* a\ncomment */ id"), "SELECT   id");
+        assert_eq!(strip_comments("SELECT /* never ends"), "SELECT ");
+    }
 }
