@@ -239,6 +239,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     for (key, inference) in limit_parameter_inferences(&tokens) {
         inferences.insert(key, inference);
     }
+    for (key, inference) in update_set_parameter_inferences(&tokens, schema, &table_refs) {
+        inferences.insert(key, inference);
+    }
 
     inferences
 }
@@ -495,6 +498,134 @@ fn between_parameter_inferences(
     }
 
     inferences
+}
+
+fn update_set_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let Some(set_start) = top_level_keyword(tokens, "SET").map(|index| index + 1) else {
+        return inferences;
+    };
+    let set_end = update_set_clause_end(tokens, set_start);
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut assignment_start = set_start;
+    let mut depth = 0usize;
+
+    for index in set_start..=set_end {
+        let token = tokens.get(index);
+        match token {
+            Some(Token::OpenParen) => depth += 1,
+            Some(Token::CloseParen) => depth = depth.saturating_sub(1),
+            Some(Token::Comma) if depth == 0 => {
+                infer_update_assignment_parameters(
+                    tokens,
+                    assignment_start,
+                    index,
+                    schema,
+                    table_refs,
+                    &parameter_keys,
+                    &mut inferences,
+                );
+                assignment_start = index + 1;
+            }
+            None if assignment_start < set_end => {
+                infer_update_assignment_parameters(
+                    tokens,
+                    assignment_start,
+                    set_end,
+                    schema,
+                    table_refs,
+                    &parameter_keys,
+                    &mut inferences,
+                );
+            }
+            _ if index == set_end && assignment_start < set_end => {
+                infer_update_assignment_parameters(
+                    tokens,
+                    assignment_start,
+                    set_end,
+                    schema,
+                    table_refs,
+                    &parameter_keys,
+                    &mut inferences,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    inferences
+}
+
+fn update_set_clause_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if depth == 0
+                    && matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "FROM" | "WHERE" | "ORDER" | "LIMIT" | "RETURNING"
+                    ) =>
+            {
+                return index;
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+fn infer_update_assignment_parameters(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+    parameter_keys: &BTreeMap<usize, String>,
+    inferences: &mut BTreeMap<String, ParameterInference>,
+) {
+    let Some(eq_index) = top_level_eq_index(&tokens[start..end]).map(|index| start + index) else {
+        return;
+    };
+    let Some(column_ref) = column_ref_ending_at(tokens, eq_index.saturating_sub(1)) else {
+        return;
+    };
+    let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
+        return;
+    };
+
+    for token_index in eq_index + 1..end {
+        let Some(key) = parameter_keys.get(&token_index) else {
+            continue;
+        };
+        inferences.insert(
+            key.clone(),
+            ParameterInference {
+                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                nullable: schema_column.nullable,
+            },
+        );
+    }
+}
+
+fn top_level_eq_index(tokens: &[Token]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Eq if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<ColumnRef> {
@@ -1824,6 +1955,85 @@ mod tests {
             [
                 ("param", ValueType::String, false),
                 ("param_2", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_with_eq_subquery_infers_set_and_nested_where_parameters() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table waitlist_registrations (
+                id integer primary key,
+                item_id integer not null,
+                account_id integer not null,
+                org_id integer not null,
+                claimed_at integer,
+                updated_at integer not null,
+                approved_at integer,
+                cancelled_at integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("waitlist/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("claim_registration.sql"),
+            "
+            update waitlist_registrations
+            set claimed_at = @claimed_at, updated_at = @updated_at
+            where id = (
+                select wr.id
+                from waitlist_registrations wr
+                where wr.item_id = @item_id
+                  and wr.account_id = @account_id
+                  and wr.org_id = @org_id
+                  and wr.approved_at is not null
+                  and wr.claimed_at is null
+                  and wr.cancelled_at is null
+                order by wr.approved_at asc
+                limit 1
+            )
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("claimed_at", ValueType::I64, true),
+                ("updated_at", ValueType::I64, false),
+                ("item_id", ValueType::I64, false),
+                ("account_id", ValueType::I64, false),
+                ("org_id", ValueType::I64, false),
             ]
         );
     }
