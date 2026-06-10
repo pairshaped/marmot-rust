@@ -175,6 +175,7 @@ fn result_columns(
     let mut duplicate_field_names = BTreeSet::new();
     let mut columns = Vec::new();
     let metadata = stmt.columns_with_metadata();
+    let nullable_tables = left_join_nullable_tables(sql);
 
     for index in 0..stmt.column_count() {
         let name = metadata
@@ -199,8 +200,12 @@ fn result_columns(
         let column_type = schema_column
             .map(|column| ValueType::from_sqlite_type(&column.declared_type))
             .unwrap_or_else(|| infer_column_type(&name));
-        let nullable = schema_column
-            .map(|column| column.nullable)
+        let nullable = metadata
+            .get(index)
+            .and_then(|column| column.table_name())
+            .filter(|table| nullable_tables.contains(&table.to_ascii_lowercase()))
+            .map(|_| true)
+            .or_else(|| schema_column.map(|column| column.nullable))
             .unwrap_or_else(|| infer_expression_nullability(&name));
         columns.push(Column {
             name,
@@ -225,6 +230,54 @@ fn result_columns(
     }
 
     Ok(columns)
+}
+
+fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
+    let tokens = tokenize(sql);
+    let mut nullable_tables = BTreeSet::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        if !token_is_word(&tokens[index], "LEFT") {
+            index += 1;
+            continue;
+        }
+
+        let mut join_index = index + 1;
+        if tokens
+            .get(join_index)
+            .is_some_and(|token| token_is_word(token, "OUTER"))
+        {
+            join_index += 1;
+        }
+
+        if !tokens
+            .get(join_index)
+            .is_some_and(|token| token_is_word(token, "JOIN"))
+        {
+            index += 1;
+            continue;
+        }
+
+        if let Some(table_name) = tokens.get(join_index + 1).and_then(table_name_from_token) {
+            nullable_tables.insert(table_name.to_ascii_lowercase());
+        }
+
+        index = join_index + 1;
+    }
+
+    nullable_tables
+}
+
+fn token_is_word(token: &Token, expected: &str) -> bool {
+    matches!(token, Token::Word(text) if text.eq_ignore_ascii_case(expected))
+}
+
+fn table_name_from_token(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(name) | Token::QuotedId(name) => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 fn infer_column_type(name: &str) -> ValueType {
@@ -531,5 +584,203 @@ mod tests {
             result,
             Err(Error::InvalidReturnsAnnotation { .. })
         ));
+    }
+
+    #[test]
+    fn left_join_marks_right_side_result_columns_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table profiles (
+                id integer primary key,
+                user_id integer not null,
+                bio text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select u.id, u.name, p.bio
+            from users u
+            left join profiles p on p.user_id = u.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("id", false), ("name", false), ("bio", true)]);
+    }
+
+    #[test]
+    fn inner_join_keeps_result_columns_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table profiles (
+                id integer primary key,
+                user_id integer not null,
+                bio text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select u.name, p.bio
+            from users u
+            join profiles p on p.user_id = u.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("name", false), ("bio", false)]);
+    }
+
+    #[test]
+    fn chained_left_joins_mark_each_right_side_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table a (id integer primary key, a_val text not null);
+            create table b (id integer primary key, a_id integer not null, b_val text not null);
+            create table c (id integer primary key, b_id integer not null, c_val text not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "
+            select a.a_val, b.b_val, c.c_val
+            from a
+            left join b on b.a_id = a.id
+            left join c on c.b_id = b.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("a_val", false), ("b_val", true), ("c_val", true)]);
+    }
+
+    #[test]
+    fn mixed_inner_and_left_joins_only_mark_left_join_side_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table a (id integer primary key, a_val text not null);
+            create table b (id integer primary key, a_id integer not null, b_val text not null);
+            create table c (id integer primary key, b_id integer not null, c_val text not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "
+            select a.a_val, b.b_val, c.c_val
+            from a
+            join b on b.a_id = a.id
+            left join c on c.b_id = b.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("a_val", false), ("b_val", false), ("c_val", true)]);
     }
 }
