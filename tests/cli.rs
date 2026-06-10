@@ -323,6 +323,59 @@ path = "db/app.db"
 }
 
 #[test]
+fn generate_command_rejects_malformed_marmot_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot
+database = "dev.sqlite"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not parse config"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generate_command_rejects_named_database_array_without_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[[tools.marmot.databases]]
+path = "db/app.db"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("missing or empty name in [[tools.marmot.databases]]"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generate_command_check_reports_missing_generated_files_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
