@@ -415,9 +415,9 @@ fn comparison_parameter_inferences(
         };
 
         let column_before = comparison_operator_before(tokens, index)
-            .and_then(|column_end| column_ref_ending_at(tokens, column_end));
+            .and_then(|column_end| comparison_column_ref_ending_at(tokens, column_end));
         let column_after = comparison_operator_after(tokens, index)
-            .and_then(|column_start| column_ref_starting_at(tokens, column_start));
+            .and_then(|column_start| comparison_column_ref_starting_at(tokens, column_start));
 
         let Some(column_ref) = column_before.or(column_after) else {
             continue;
@@ -639,6 +639,63 @@ fn column_ref_starting_at(tokens: &[Token], index: usize) -> Option<ColumnRef> {
             column: first.to_string(),
         })
     }
+}
+
+fn comparison_column_ref_ending_at(tokens: &[Token], index: usize) -> Option<ColumnRef> {
+    column_ref_ending_at(tokens, index).or_else(|| aggregate_column_ref_ending_at(tokens, index))
+}
+
+fn comparison_column_ref_starting_at(tokens: &[Token], index: usize) -> Option<ColumnRef> {
+    column_ref_starting_at(tokens, index)
+}
+
+fn aggregate_column_ref_ending_at(tokens: &[Token], close_paren_index: usize) -> Option<ColumnRef> {
+    if !matches!(tokens.get(close_paren_index), Some(Token::CloseParen)) {
+        return None;
+    }
+
+    let open_paren_index = matching_open_paren(tokens, close_paren_index)?;
+    let function_name = identifier_from_token(tokens.get(open_paren_index.checked_sub(1)?)?)?;
+    if !matches!(
+        function_name.to_ascii_uppercase().as_str(),
+        "AVG" | "MAX" | "MIN" | "SUM" | "TOTAL"
+    ) {
+        return None;
+    }
+
+    let inside = &tokens[open_paren_index + 1..close_paren_index];
+    let expressions = split_top_level_commas(inside);
+    let [expression] = expressions.as_slice() else {
+        return None;
+    };
+    match *expression {
+        [Token::Word(_)] | [Token::QuotedId(_)] => column_ref_starting_at(expression, 0),
+        [Token::Word(_), Token::Dot, Token::Word(_)]
+        | [Token::Word(_), Token::Dot, Token::QuotedId(_)]
+        | [Token::QuotedId(_), Token::Dot, Token::Word(_)]
+        | [Token::QuotedId(_), Token::Dot, Token::QuotedId(_)] => {
+            column_ref_starting_at(expression, 0)
+        }
+        _ => None,
+    }
+}
+
+fn matching_open_paren(tokens: &[Token], close_paren_index: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().take(close_paren_index + 1).rev() {
+        match token {
+            Token::CloseParen => depth += 1,
+            Token::OpenParen => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn resolve_column_ref<'a>(
@@ -2200,6 +2257,57 @@ mod tests {
                 ("start", ValueType::I64, false),
                 ("end", ValueType::I64, false),
             ]
+        );
+    }
+
+    #[test]
+    fn infers_having_aggregate_parameter_type_from_aggregate_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                region text not null,
+                amount integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("region_totals.sql"),
+            "
+            select region, sum(amount) as total
+            from orders
+            group by region
+            having sum(amount) > @min_amount
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "min_amount".to_string(),
+                sql_names: vec!["@min_amount".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
         );
     }
 
