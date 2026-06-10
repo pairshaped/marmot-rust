@@ -11,6 +11,8 @@ pub struct SqlFile {
 pub struct Parameter {
     pub name: String,
     pub sql_names: Vec<String>,
+    pub column_type: ValueType,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +102,17 @@ impl ValueType {
 }
 
 impl Column {
+    pub fn rust_type(&self) -> String {
+        let rust_type = self.column_type.rust_type();
+        if self.nullable {
+            format!("Option<{rust_type}>")
+        } else {
+            rust_type.to_string()
+        }
+    }
+}
+
+impl Parameter {
     pub fn rust_type(&self) -> String {
         let rust_type = self.column_type.rust_type();
         if self.nullable {
@@ -209,6 +222,18 @@ mod tests {
         };
 
         assert_eq!(column.rust_type(), "Option<String>");
+    }
+
+    #[test]
+    fn renders_nullable_parameter_rust_types() {
+        let parameter = Parameter {
+            name: "bio".to_string(),
+            sql_names: vec!["@bio".to_string()],
+            column_type: ValueType::String,
+            nullable: true,
+        };
+
+        assert_eq!(parameter.rust_type(), "Option<String>");
     }
 
     #[test]

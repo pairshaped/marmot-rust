@@ -36,7 +36,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
                 reason,
             })?;
         let sqlite_sql = strip_nullability_overrides(&sql);
-        let parameters = named_parameters(&sqlite_sql);
+        let parameters = parameters(&sqlite_sql, &schema);
         let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
         let return_type = if columns.is_empty() {
             ReturnType::Execute
@@ -134,18 +134,64 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
     Ok(schema)
 }
 
-fn named_parameters(sql: &str) -> Vec<Parameter> {
+fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
+    let inferences = parameter_inferences(sql, schema);
     let mut params: Vec<Parameter> = Vec::new();
+    let mut anonymous_index = 0usize;
+
     for token in tokenize(sql) {
-        if let Token::ParamNamed { prefix, name } = token {
-            add_parameter(&mut params, &name, &format!("{prefix}{name}"));
+        match token {
+            Token::ParamNamed { prefix, name } => {
+                let sql_name = format!("{prefix}{name}");
+                let inference = inferences
+                    .get(&sql_name)
+                    .cloned()
+                    .unwrap_or_else(ParameterInference::default);
+                add_named_parameter(&mut params, &name, &sql_name, inference);
+            }
+            Token::ParamAnon => {
+                anonymous_index += 1;
+                let name = anonymous_parameter_name(anonymous_index);
+                let placeholder = anonymous_placeholder_key(anonymous_index);
+                let inference = inferences
+                    .get(&placeholder)
+                    .cloned()
+                    .unwrap_or_else(ParameterInference::default);
+                params.push(Parameter {
+                    name,
+                    sql_names: vec![],
+                    column_type: inference.column_type,
+                    nullable: inference.nullable,
+                });
+            }
+            _ => {}
         }
     }
 
     params
 }
 
-fn add_parameter(params: &mut Vec<Parameter>, raw_name: &str, sql_name: &str) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParameterInference {
+    column_type: ValueType,
+    nullable: bool,
+}
+
+impl Default for ParameterInference {
+    fn default() -> Self {
+        Self {
+            column_type: ValueType::String,
+            nullable: false,
+        }
+    }
+}
+
+fn add_named_parameter(
+    params: &mut Vec<Parameter>,
+    raw_name: &str,
+    sql_name: &str,
+    inference: ParameterInference,
+) {
     let name = raw_name.to_snake_case();
     let sql_name = sql_name.to_string();
     if let Some(param) = params.iter_mut().find(|param| param.name == name) {
@@ -156,8 +202,313 @@ fn add_parameter(params: &mut Vec<Parameter>, raw_name: &str, sql_name: &str) {
         params.push(Parameter {
             name,
             sql_names: vec![sql_name],
+            column_type: inference.column_type,
+            nullable: inference.nullable,
         });
     }
+}
+
+fn anonymous_parameter_name(index: usize) -> String {
+    if index == 1 {
+        "param".to_string()
+    } else {
+        format!("param_{index}")
+    }
+}
+
+fn anonymous_placeholder_key(index: usize) -> String {
+    format!("?{index}")
+}
+
+fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, ParameterInference> {
+    let tokens = tokenize(sql);
+    let mut inferences = insert_parameter_inferences(&tokens, schema);
+    let table_refs = table_references(&tokens);
+
+    for (key, inference) in comparison_parameter_inferences(&tokens, schema, &table_refs) {
+        inferences.insert(key, inference);
+    }
+    for (key, inference) in limit_parameter_inferences(&tokens) {
+        inferences.insert(key, inference);
+    }
+
+    inferences
+}
+
+fn insert_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let Some(insert_index) = top_level_keyword(tokens, "INSERT") else {
+        return inferences;
+    };
+    if !tokens
+        .get(insert_index + 1)
+        .is_some_and(|token| token_is_word(token, "INTO"))
+    {
+        return inferences;
+    }
+    let Some(table) = tokens.get(insert_index + 2).and_then(table_name_from_token) else {
+        return inferences;
+    };
+    let Some(Token::OpenParen) = tokens.get(insert_index + 3) else {
+        return inferences;
+    };
+
+    let (column_tokens, after_columns) = collect_balanced_parens(tokens, insert_index + 3);
+    let columns = split_top_level_commas(column_tokens)
+        .into_iter()
+        .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+        .collect::<Vec<_>>();
+
+    let Some(values_index) = tokens
+        .iter()
+        .enumerate()
+        .skip(after_columns)
+        .find_map(|(index, token)| token_is_word(token, "VALUES").then_some(index))
+    else {
+        return inferences;
+    };
+    let Some(Token::OpenParen) = tokens.get(values_index + 1) else {
+        return inferences;
+    };
+
+    let (value_tokens, _) = collect_balanced_parens(tokens, values_index + 1);
+    let values = split_top_level_commas(value_tokens);
+    let mut anon_index = 0usize;
+
+    for (value, column) in values.into_iter().zip(columns) {
+        for token in value {
+            let Some(key) = parameter_key(token, &mut anon_index) else {
+                continue;
+            };
+            if let Some(schema_column) = schema.column(table, column) {
+                inferences.insert(
+                    key,
+                    ParameterInference {
+                        column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                        nullable: schema_column.nullable,
+                    },
+                );
+            }
+        }
+    }
+
+    inferences
+}
+
+fn comparison_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let mut anon_index = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(key) = parameter_key(token, &mut anon_index) else {
+            continue;
+        };
+
+        let column_before = comparison_operator_before(tokens, index)
+            .and_then(|column_end| column_ref_ending_at(tokens, column_end));
+        let column_after = comparison_operator_after(tokens, index)
+            .and_then(|column_start| column_ref_starting_at(tokens, column_start));
+
+        let Some(column_ref) = column_before.or(column_after) else {
+            continue;
+        };
+        let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
+            continue;
+        };
+
+        inferences.insert(
+            key,
+            ParameterInference {
+                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                nullable: false,
+            },
+        );
+    }
+
+    inferences
+}
+
+fn limit_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
+    let mut inferences = BTreeMap::new();
+    let mut anon_index = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        let key = parameter_key(token, &mut anon_index);
+        if !tokens
+            .get(index.saturating_sub(1))
+            .is_some_and(|token| token_is_word(token, "LIMIT") || token_is_word(token, "OFFSET"))
+        {
+            continue;
+        }
+        if let Some(key) = key {
+            inferences.insert(
+                key,
+                ParameterInference {
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            );
+        }
+    }
+
+    inferences
+}
+
+fn parameter_key(token: &Token, anon_index: &mut usize) -> Option<String> {
+    match token {
+        Token::ParamNamed { prefix, name } => Some(format!("{prefix}{name}")),
+        Token::ParamAnon => {
+            *anon_index += 1;
+            Some(anonymous_placeholder_key(*anon_index))
+        }
+        _ => None,
+    }
+}
+
+fn collect_balanced_parens(tokens: &[Token], open_index: usize) -> (&[Token], usize) {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open_index) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (&tokens[open_index + 1..index], index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (&tokens[open_index + 1..], tokens.len())
+}
+
+fn comparison_operator_before(tokens: &[Token], param_index: usize) -> Option<usize> {
+    let previous = tokens.get(param_index.checked_sub(1)?)?;
+    if comparison_operator(previous) {
+        return param_index.checked_sub(2);
+    }
+    if token_is_word(previous, "NOT")
+        && tokens
+            .get(param_index.checked_sub(2)?)
+            .is_some_and(|token| token_is_word(token, "IS"))
+    {
+        return param_index.checked_sub(3);
+    }
+    if token_is_word(previous, "IS") {
+        return param_index.checked_sub(2);
+    }
+    None
+}
+
+fn comparison_operator_after(tokens: &[Token], param_index: usize) -> Option<usize> {
+    let next = tokens.get(param_index + 1)?;
+    if comparison_operator(next) {
+        return Some(param_index + 2);
+    }
+    if token_is_word(next, "IS") {
+        if tokens
+            .get(param_index + 2)
+            .is_some_and(|token| token_is_word(token, "NOT"))
+        {
+            return Some(param_index + 3);
+        }
+        return Some(param_index + 2);
+    }
+    None
+}
+
+fn comparison_operator(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Eq | Token::Ne | Token::Lt | Token::Gt | Token::Le | Token::Ge
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnRef {
+    qualifier: Option<String>,
+    column: String,
+}
+
+fn column_ref_ending_at(tokens: &[Token], index: usize) -> Option<ColumnRef> {
+    let column = identifier_from_token(tokens.get(index)?)?;
+    if index >= 2 && matches!(tokens.get(index - 1), Some(Token::Dot)) {
+        let qualifier = identifier_from_token(tokens.get(index - 2)?)?;
+        Some(ColumnRef {
+            qualifier: Some(qualifier.to_string()),
+            column: column.to_string(),
+        })
+    } else {
+        Some(ColumnRef {
+            qualifier: None,
+            column: column.to_string(),
+        })
+    }
+}
+
+fn column_ref_starting_at(tokens: &[Token], index: usize) -> Option<ColumnRef> {
+    let first = identifier_from_token(tokens.get(index)?)?;
+    if matches!(tokens.get(index + 1), Some(Token::Dot)) {
+        let column = identifier_from_token(tokens.get(index + 2)?)?;
+        Some(ColumnRef {
+            qualifier: Some(first.to_string()),
+            column: column.to_string(),
+        })
+    } else {
+        Some(ColumnRef {
+            qualifier: None,
+            column: first.to_string(),
+        })
+    }
+}
+
+fn resolve_column_ref<'a>(
+    schema: &'a Schema,
+    table_refs: &BTreeMap<String, String>,
+    column_ref: &ColumnRef,
+) -> Option<&'a SchemaColumn> {
+    if let Some(qualifier) = &column_ref.qualifier {
+        return table_refs
+            .get(&qualifier.to_ascii_lowercase())
+            .and_then(|table| schema.column(table, &column_ref.column));
+    }
+
+    table_refs
+        .values()
+        .filter_map(|table| schema.column(table, &column_ref.column))
+        .next()
+}
+
+fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
+    let mut refs = BTreeMap::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if !(token_is_word(&tokens[index], "FROM") || token_is_word(&tokens[index], "JOIN")) {
+            index += 1;
+            continue;
+        }
+        let Some(table) = tokens.get(index + 1).and_then(table_name_from_token) else {
+            index += 1;
+            continue;
+        };
+        let table = table.to_ascii_lowercase();
+        refs.insert(table.clone(), table.clone());
+        if let Some(alias) = table_alias_after_join(tokens, index + 2) {
+            refs.insert(alias.to_ascii_lowercase(), table);
+        }
+        index += 2;
+    }
+
+    refs
 }
 
 fn result_columns(
@@ -776,7 +1127,10 @@ mod tests {
 
     #[test]
     fn extracts_unique_named_parameters_in_encounter_order() {
-        let params = named_parameters("where org_id = @org_id or parent_id = @org_id and x = @x");
+        let params = parameters(
+            "where org_id = @org_id or parent_id = @org_id and x = @x",
+            &Schema::default(),
+        );
         let names = params
             .into_iter()
             .map(|param| (param.name, param.sql_names))
@@ -792,8 +1146,9 @@ mod tests {
 
     #[test]
     fn extracts_mixed_named_parameter_prefixes_as_one_argument_per_name() {
-        let params = named_parameters(
+        let params = parameters(
             "where user_id = @user_id and created_at >= :since and name like $pattern or id = :user_id",
+            &Schema::default(),
         );
         let names = params
             .into_iter()
@@ -814,7 +1169,7 @@ mod tests {
 
     #[test]
     fn ignores_named_parameter_tokens_inside_strings_identifiers_and_comments() {
-        let params = named_parameters(
+        let params = parameters(
             r#"
             select '@not_param', ":also_not_param", id
             from users
@@ -822,6 +1177,7 @@ mod tests {
               and bio = 'literal :still_not_param'
               and note = /* $block_param */ $note
             "#,
+            &Schema::default(),
         );
         let names = params
             .into_iter()
@@ -829,6 +1185,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["name", "note"]);
+    }
+
+    #[test]
+    fn extracts_anonymous_parameters_in_encounter_order() {
+        let params = parameters("where name = ? and age > ?", &Schema::default());
+        let names = params
+            .into_iter()
+            .map(|param| (param.name, param.sql_names))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                ("param".to_string(), vec![]),
+                ("param_2".to_string(), vec![])
+            ]
+        );
     }
 
     #[test]
@@ -905,6 +1278,218 @@ mod tests {
                 ("active", ValueType::Bool, false),
                 ("price", ValueType::F64, true),
                 ("payload", ValueType::Bytes, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_anonymous_parameter_types_from_where_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                age integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id from users where name = ? and age > ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                    param.sql_names.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::String, false, vec![]),
+                ("param_2", ValueType::I64, false, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_named_parameter_type_from_qualified_alias_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                email text not null
+            );
+            create table orders (
+                id text primary key,
+                user_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_order.sql"),
+            "select u.email from users u join orders o on o.user_id = u.id where o.id = @order_id",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "order_id".to_string(),
+                sql_names: vec!["@order_id".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_insert_parameter_types_and_nullability_from_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key autoincrement,
+                username text not null,
+                bio text,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_user.sql"),
+            "insert into users (username, bio, created_at) values (@username, @bio, @created_at)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("username", ValueType::String, false),
+                ("bio", ValueType::String, true),
+                ("created_at", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_limit_and_offset_parameters_as_i64() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "select id from users limit @limit offset @offset",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("limit", ValueType::I64, false),
+                ("offset", ValueType::I64, false),
             ]
         );
     }
