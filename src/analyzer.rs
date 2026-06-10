@@ -1935,6 +1935,11 @@ fn infer_expression_tokens(
             inferred_nullable: Some(false),
             nullable_override: None,
         }),
+        "exists" => Some(ExpressionInference {
+            column_type: Some(ValueType::I64),
+            inferred_nullable: Some(false),
+            nullable_override: None,
+        }),
         "sum" | "avg" => Some(ExpressionInference {
             column_type: Some(ValueType::F64),
             inferred_nullable: Some(true),
@@ -5664,6 +5669,52 @@ mod tests {
             [Column {
                 name: "unique_customers".to_string(),
                 field_name: "unique_customers".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn exists_subquery_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (id integer primary key);
+            create table events (id integer primary key, user_id integer not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("user_flags.sql"),
+            "
+            select exists(select 1 from events where events.user_id = users.id) as has_events
+            from users
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "has_events".to_string(),
+                field_name: "has_events".to_string(),
                 column_type: ValueType::I64,
                 nullable: false,
             }]
