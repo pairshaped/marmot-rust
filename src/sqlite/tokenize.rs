@@ -32,7 +32,25 @@ pub enum Token {
     Unknown(char),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpannedToken {
+    pub token: Token,
+    pub start: usize,
+    pub end: usize,
+}
+
 pub fn tokenize(sql: &str) -> Vec<Token> {
+    tokenize_spans(sql)
+        .into_iter()
+        .map(|spanned| spanned.token)
+        .collect()
+}
+
+pub fn tokenize_spans(sql: &str) -> Vec<SpannedToken> {
+    let byte_offsets = sql
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     let chars = sql.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -58,151 +76,401 @@ pub fn tokenize(sql: &str) -> Vec<Token> {
                 }
             }
             '\'' => {
+                let start = index;
                 let (text, next) = consume_single_quoted(&chars, index + 1);
-                tokens.push(Token::StringLit(text));
+                push_token(
+                    &mut tokens,
+                    Token::StringLit(text),
+                    start,
+                    next,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index = next;
             }
             '"' => {
+                let start = index;
                 let (text, next) = consume_quoted_identifier(&chars, index + 1, '"');
-                tokens.push(Token::QuotedId(text));
+                push_token(
+                    &mut tokens,
+                    Token::QuotedId(text),
+                    start,
+                    next,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index = next;
             }
             '`' => {
+                let start = index;
                 let (text, next) = consume_quoted_identifier(&chars, index + 1, '`');
-                tokens.push(Token::QuotedId(text));
+                push_token(
+                    &mut tokens,
+                    Token::QuotedId(text),
+                    start,
+                    next,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index = next;
             }
             '|' if chars.get(index + 1) == Some(&'|') => {
-                tokens.push(Token::Concat);
+                push_token(
+                    &mut tokens,
+                    Token::Concat,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '<' if chars.get(index + 1) == Some(&'<') => {
-                tokens.push(Token::ShiftLeft);
+                push_token(
+                    &mut tokens,
+                    Token::ShiftLeft,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '>' if chars.get(index + 1) == Some(&'>') => {
-                tokens.push(Token::ShiftRight);
+                push_token(
+                    &mut tokens,
+                    Token::ShiftRight,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '<' if chars.get(index + 1) == Some(&'=') => {
-                tokens.push(Token::Le);
+                push_token(
+                    &mut tokens,
+                    Token::Le,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '>' if chars.get(index + 1) == Some(&'=') => {
-                tokens.push(Token::Ge);
+                push_token(
+                    &mut tokens,
+                    Token::Ge,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '<' if chars.get(index + 1) == Some(&'>') => {
-                tokens.push(Token::Ne);
+                push_token(
+                    &mut tokens,
+                    Token::Ne,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '!' if chars.get(index + 1) == Some(&'=') => {
-                tokens.push(Token::Ne);
+                push_token(
+                    &mut tokens,
+                    Token::Ne,
+                    index,
+                    index + 2,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 2;
             }
             '<' => {
-                tokens.push(Token::Lt);
+                push_token(
+                    &mut tokens,
+                    Token::Lt,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '>' => {
-                tokens.push(Token::Gt);
+                push_token(
+                    &mut tokens,
+                    Token::Gt,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '=' => {
-                tokens.push(Token::Eq);
+                push_token(
+                    &mut tokens,
+                    Token::Eq,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '+' => {
-                tokens.push(Token::Plus);
+                push_token(
+                    &mut tokens,
+                    Token::Plus,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '-' => {
-                tokens.push(Token::Minus);
+                push_token(
+                    &mut tokens,
+                    Token::Minus,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '*' => {
-                tokens.push(Token::Star);
+                push_token(
+                    &mut tokens,
+                    Token::Star,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '/' => {
-                tokens.push(Token::Slash);
+                push_token(
+                    &mut tokens,
+                    Token::Slash,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '%' => {
-                tokens.push(Token::Percent);
+                push_token(
+                    &mut tokens,
+                    Token::Percent,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '&' => {
-                tokens.push(Token::BitAnd);
+                push_token(
+                    &mut tokens,
+                    Token::BitAnd,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '|' => {
-                tokens.push(Token::BitOr);
+                push_token(
+                    &mut tokens,
+                    Token::BitOr,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '(' => {
-                tokens.push(Token::OpenParen);
+                push_token(
+                    &mut tokens,
+                    Token::OpenParen,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             ')' => {
-                tokens.push(Token::CloseParen);
+                push_token(
+                    &mut tokens,
+                    Token::CloseParen,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             ',' => {
-                tokens.push(Token::Comma);
+                push_token(
+                    &mut tokens,
+                    Token::Comma,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             ';' => {
-                tokens.push(Token::Semicolon);
+                push_token(
+                    &mut tokens,
+                    Token::Semicolon,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '.' => {
-                tokens.push(Token::Dot);
+                push_token(
+                    &mut tokens,
+                    Token::Dot,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '?' => {
-                if question_is_nullable_override(&tokens, chars.get(index + 1).copied()) {
-                    tokens.push(Token::NullableOverride);
-                } else {
-                    tokens.push(Token::ParamAnon);
-                }
+                let previous = tokens.last().map(|spanned| &spanned.token);
+                let token =
+                    if question_is_nullable_override(previous, chars.get(index + 1).copied()) {
+                        Token::NullableOverride
+                    } else {
+                        Token::ParamAnon
+                    };
+                push_token(
+                    &mut tokens,
+                    token,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             '@' | ':' | '$' => {
                 if let Some((name, next)) = consume_named_param(&chars, index + 1) {
-                    tokens.push(Token::ParamNamed { prefix: c, name });
+                    push_token(
+                        &mut tokens,
+                        Token::ParamNamed { prefix: c, name },
+                        index,
+                        next,
+                        &byte_offsets,
+                        sql.len(),
+                    );
                     index = next;
                 } else {
-                    tokens.push(Token::Unknown(c));
+                    push_token(
+                        &mut tokens,
+                        Token::Unknown(c),
+                        index,
+                        index + 1,
+                        &byte_offsets,
+                        sql.len(),
+                    );
                     index += 1;
                 }
             }
             '!' => {
-                if exclamation_is_null_override(&tokens, chars.get(index + 1).copied()) {
-                    tokens.push(Token::NullOverride);
+                let previous = tokens.last().map(|spanned| &spanned.token);
+                let token = if exclamation_is_null_override(previous, chars.get(index + 1).copied())
+                {
+                    Token::NullOverride
                 } else {
-                    tokens.push(Token::Unknown(c));
-                }
+                    Token::Unknown(c)
+                };
+                push_token(
+                    &mut tokens,
+                    token,
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
             c if c.is_ascii_digit() => {
+                let start = index;
                 let (number, next) = consume_number(&chars, index);
-                tokens.push(Token::Number(number));
+                push_token(
+                    &mut tokens,
+                    Token::Number(number),
+                    start,
+                    next,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index = next;
             }
             c if is_word_start(c) => {
+                let start = index;
                 let (word, next) = consume_word(&chars, index);
-                tokens.push(Token::Word(word));
+                push_token(
+                    &mut tokens,
+                    Token::Word(word),
+                    start,
+                    next,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index = next;
             }
             c => {
-                tokens.push(Token::Unknown(c));
+                push_token(
+                    &mut tokens,
+                    Token::Unknown(c),
+                    index,
+                    index + 1,
+                    &byte_offsets,
+                    sql.len(),
+                );
                 index += 1;
             }
         }
     }
 
     tokens
+}
+
+fn push_token(
+    tokens: &mut Vec<SpannedToken>,
+    token: Token,
+    start: usize,
+    end: usize,
+    byte_offsets: &[usize],
+    sql_len: usize,
+) {
+    tokens.push(SpannedToken {
+        token,
+        start: byte_offsets[start],
+        end: byte_offsets.get(end).copied().unwrap_or(sql_len),
+    });
 }
 
 fn consume_single_quoted(chars: &[char], mut index: usize) -> (String, usize) {
@@ -309,16 +577,16 @@ fn consume_number(chars: &[char], index: usize) -> (String, usize) {
     )
 }
 
-fn question_is_nullable_override(tokens: &[Token], next: Option<char>) -> bool {
+fn question_is_nullable_override(previous: Option<&Token>, next: Option<char>) -> bool {
     let previous_is_column_name = matches!(
-        tokens.last(),
+        previous,
         Some(Token::Word(word)) if !word.eq_ignore_ascii_case("LIMIT") && !word.eq_ignore_ascii_case("OFFSET")
     );
     previous_is_column_name && is_boundary(next)
 }
 
-fn exclamation_is_null_override(tokens: &[Token], next: Option<char>) -> bool {
-    matches!(tokens.last(), Some(Token::Word(_))) && is_boundary(next)
+fn exclamation_is_null_override(previous: Option<&Token>, next: Option<char>) -> bool {
+    matches!(previous, Some(Token::Word(_))) && is_boundary(next)
 }
 
 fn is_boundary(c: Option<char>) -> bool {
@@ -520,6 +788,20 @@ mod tests {
                 Token::ParamAnon,
             ]
         );
+    }
+
+    #[test]
+    fn token_spans_are_byte_offsets() {
+        let sql = "SELECT café AS café?";
+        let spans = tokenize_spans(sql);
+        let nullable = spans
+            .iter()
+            .find(|token| token.token == Token::NullableOverride)
+            .unwrap();
+
+        assert_eq!(&sql[nullable.start..nullable.end], "?");
+        let stripped = format!("{}{}", &sql[..nullable.start], &sql[nullable.end..]);
+        assert_eq!(stripped, "SELECT café AS café");
     }
 
     #[test]

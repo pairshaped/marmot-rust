@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
 use crate::sqlite::annotation::parse_returns_annotation;
-use crate::sqlite::tokenize::{Token, tokenize};
+use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
     let conn = Connection::open(&config.database).map_err(|source| Error::OpenDatabase {
@@ -35,8 +35,9 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
                 path: file.path.clone(),
                 reason,
             })?;
-        let parameters = named_parameters(&sql);
-        let columns = result_columns(&conn, &schema, &file.path, &sql)?;
+        let sqlite_sql = strip_nullability_overrides(&sql);
+        let parameters = named_parameters(&sqlite_sql);
+        let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
         let return_type = if columns.is_empty() {
             ReturnType::Execute
         } else {
@@ -48,7 +49,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
             module_name: file.module_name,
             name: file.query_name,
             return_type,
-            sql,
+            sql: sqlite_sql,
             parameters,
             columns,
         });
@@ -164,11 +165,14 @@ fn result_columns(
     schema: &Schema,
     path: &std::path::Path,
     sql: &str,
+    sqlite_sql: &str,
 ) -> Result<Vec<Column>> {
-    let stmt = conn.prepare(sql).map_err(|source| Error::PrepareSql {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let stmt = conn
+        .prepare(sqlite_sql)
+        .map_err(|source| Error::PrepareSql {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let mut seen = BTreeSet::new();
     let mut duplicate_names = BTreeSet::new();
     let mut seen_field_names = BTreeSet::new();
@@ -201,15 +205,18 @@ fn result_columns(
         let expression_inference = expression_inferences.get(&name.to_ascii_lowercase());
         let column_type = schema_column
             .map(|column| ValueType::from_sqlite_type(&column.declared_type))
-            .or_else(|| expression_inference.map(|inference| inference.column_type.clone()))
+            .or_else(|| expression_inference.and_then(|inference| inference.column_type.clone()))
             .unwrap_or_else(|| infer_column_type(&name));
-        let nullable = metadata
+        let table_nullable = metadata
             .get(index)
             .and_then(|column| column.table_name())
             .filter(|table| nullable_tables.contains(&table.to_ascii_lowercase()))
-            .map(|_| true)
+            .map(|_| true);
+        let nullable = expression_inference
+            .and_then(|inference| inference.nullable_override)
+            .or(table_nullable)
             .or_else(|| schema_column.map(|column| column.nullable))
-            .or_else(|| expression_inference.map(|inference| inference.nullable))
+            .or_else(|| expression_inference.and_then(|inference| inference.inferred_nullable))
             .unwrap_or_else(|| infer_expression_nullability(&name));
         columns.push(Column {
             name,
@@ -275,8 +282,15 @@ fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpressionInference {
-    column_type: ValueType,
-    nullable: bool,
+    column_type: Option<ValueType>,
+    inferred_nullable: Option<bool>,
+    nullable_override: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Alias {
+    name: String,
+    nullable_override: Option<bool>,
 }
 
 fn select_expression_inferences(sql: &str) -> BTreeMap<String, ExpressionInference> {
@@ -291,8 +305,15 @@ fn select_expression_inferences(sql: &str) -> BTreeMap<String, ExpressionInferen
             continue;
         };
         let expression = expression_without_alias(expression);
-        if let Some(inference) = infer_expression_tokens(expression) {
-            inferences.insert(alias.to_ascii_lowercase(), inference);
+        let expression_inference = infer_expression_tokens(expression);
+        if expression_inference.is_some() || alias.nullable_override.is_some() {
+            let mut inference = expression_inference.unwrap_or(ExpressionInference {
+                column_type: None,
+                inferred_nullable: None,
+                nullable_override: None,
+            });
+            inference.nullable_override = alias.nullable_override;
+            inferences.insert(alias.name.to_ascii_lowercase(), inference);
         }
     }
 
@@ -346,7 +367,7 @@ fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
     expressions
 }
 
-fn expression_alias(tokens: &[Token]) -> Option<String> {
+fn expression_alias(tokens: &[Token]) -> Option<Alias> {
     let mut depth = 0usize;
     let mut alias = None;
 
@@ -355,13 +376,26 @@ fn expression_alias(tokens: &[Token]) -> Option<String> {
             Token::OpenParen => depth += 1,
             Token::CloseParen => depth = depth.saturating_sub(1),
             Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
-                alias = tokens.get(index + 1).and_then(identifier_from_token);
+                alias = tokens
+                    .get(index + 1)
+                    .and_then(identifier_from_token)
+                    .map(|name| {
+                        let nullable_override = match tokens.get(index + 2) {
+                            Some(Token::NullOverride) => Some(false),
+                            Some(Token::NullableOverride) => Some(true),
+                            _ => None,
+                        };
+                        Alias {
+                            name: name.to_string(),
+                            nullable_override,
+                        }
+                    });
             }
             _ => {}
         }
     }
 
-    alias.map(str::to_string)
+    alias
 }
 
 fn expression_without_alias(tokens: &[Token]) -> &[Token] {
@@ -390,19 +424,42 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
 
     match function_name.as_str() {
         "row_number" | "rank" | "dense_rank" | "ntile" => Some(ExpressionInference {
-            column_type: ValueType::I64,
-            nullable: false,
+            column_type: Some(ValueType::I64),
+            inferred_nullable: Some(false),
+            nullable_override: None,
         }),
         "count" => Some(ExpressionInference {
-            column_type: ValueType::I64,
-            nullable: false,
+            column_type: Some(ValueType::I64),
+            inferred_nullable: Some(false),
+            nullable_override: None,
         }),
         "sum" | "avg" => Some(ExpressionInference {
-            column_type: ValueType::F64,
-            nullable: true,
+            column_type: Some(ValueType::F64),
+            inferred_nullable: Some(true),
+            nullable_override: None,
         }),
         _ => None,
     }
+}
+
+fn strip_nullability_overrides(sql: &str) -> String {
+    let tokens = tokenize_spans(sql);
+    if !tokens.iter().any(is_nullability_override) {
+        return sql.to_string();
+    }
+
+    let mut stripped = String::with_capacity(sql.len());
+    let mut copied_until = 0usize;
+    for token in tokens.iter().filter(|token| is_nullability_override(token)) {
+        stripped.push_str(&sql[copied_until..token.start]);
+        copied_until = token.end;
+    }
+    stripped.push_str(&sql[copied_until..]);
+    stripped
+}
+
+fn is_nullability_override(token: &SpannedToken) -> bool {
+    matches!(token.token, Token::NullOverride | Token::NullableOverride)
 }
 
 fn token_is_word(token: &Token, expected: &str) -> bool {
@@ -1089,5 +1146,83 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("total", ValueType::F64, true)]);
+    }
+
+    #[test]
+    fn alias_bang_forces_result_column_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "select name as name! from users",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "name".to_string(),
+                field_name: "name".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+        assert_eq!(project.queries[0].sql, "select name as name from users");
+    }
+
+    #[test]
+    fn alias_question_forces_result_column_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "select name as name? from users",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "name".to_string(),
+                field_name: "name".to_string(),
+                column_type: ValueType::String,
+                nullable: true,
+            }]
+        );
+        assert_eq!(project.queries[0].sql, "select name as name from users");
     }
 }
