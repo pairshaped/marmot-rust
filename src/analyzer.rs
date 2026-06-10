@@ -2314,6 +2314,44 @@ mod tests {
     }
 
     #[test]
+    fn keeps_like_concat_parameter_as_text() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table accounts (id integer primary key, email text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("accounts/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_accounts.sql"),
+            "select id, email from accounts where lower(email) like @prefix || '%'",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "prefix".to_string(),
+                sql_names: vec!["@prefix".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn keeps_not_in_subquery_from_interfering_with_following_parameter_inference() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -2361,6 +2399,58 @@ mod tests {
                 name: "param".to_string(),
                 sql_names: vec![],
                 column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn order_by_collate_nocase_keeps_where_parameter_inference() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                last_name text not null,
+                first_name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select id, last_name, first_name
+            from users
+            where id > @min_id
+            order by last_name collate nocase, first_name collate nocase
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(project.queries[0].columns.len(), 3);
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "min_id".to_string(),
+                sql_names: vec!["@min_id".to_string()],
+                column_type: ValueType::I64,
                 nullable: false,
             }]
         );
