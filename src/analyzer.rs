@@ -980,7 +980,9 @@ fn select_expression_inferences(
     nullable_tables: &BTreeSet<String>,
 ) -> BTreeMap<String, ExpressionInference> {
     let tokens = tokenize(sql);
-    let Some(select_list) = top_level_select_list(&tokens) else {
+    let Some(expression_list) =
+        top_level_select_list(&tokens).or_else(|| top_level_returning_list(&tokens))
+    else {
         return BTreeMap::new();
     };
     let table_refs = table_references(&tokens);
@@ -991,7 +993,7 @@ fn select_expression_inferences(
     };
     let mut inferences = BTreeMap::new();
 
-    for expression in split_top_level_commas(select_list) {
+    for expression in split_top_level_commas(expression_list) {
         let Some(alias) = expression_alias(expression) else {
             continue;
         };
@@ -1032,6 +1034,29 @@ fn top_level_select_list(tokens: &[Token]) -> Option<&[Token]> {
     }
 
     select_start.map(|start| &tokens[start..])
+}
+
+fn top_level_returning_list(tokens: &[Token]) -> Option<&[Token]> {
+    let mut depth = 0usize;
+    let mut returning_start = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("RETURNING") => {
+                returning_start = Some(index + 1);
+            }
+            Token::Semicolon if depth == 0 => {
+                if let Some(start) = returning_start {
+                    return Some(&tokens[start..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    returning_start.map(|start| &tokens[start..])
 }
 
 #[derive(Debug)]
@@ -2901,6 +2926,53 @@ mod tests {
             [Column {
                 name: "converted".to_string(),
                 field_name: "converted".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn returning_cast_alias_uses_cast_result_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, val text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_thing.sql"),
+            "insert into t (val) values (?) returning cast(id as text) as id_text",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "id_text".to_string(),
+                field_name: "id_text".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
                 column_type: ValueType::String,
                 nullable: false,
             }]
