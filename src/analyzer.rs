@@ -9,6 +9,7 @@ use crate::discovery::discover_sql_files;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
+use crate::sqlite::annotation::parse_returns_annotation;
 use crate::sqlite::tokenize::{Token, tokenize};
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
@@ -29,12 +30,17 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
             path: file.path.clone(),
             reason,
         })?;
+        let row_type =
+            parse_returns_annotation(&sql).map_err(|reason| Error::InvalidReturnsAnnotation {
+                path: file.path.clone(),
+                reason,
+            })?;
         let parameters = named_parameters(&sql);
         let columns = result_columns(&conn, &schema, &file.path, &sql)?;
         let return_type = if columns.is_empty() {
             ReturnType::Execute
         } else {
-            ReturnType::Rows { row_type: None }
+            ReturnType::Rows { row_type }
         };
 
         queries.push(Query {
@@ -457,6 +463,73 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::GeneratedColumnNameCollision { columns, .. }) if columns == ["foo_bar"]
+        ));
+    }
+
+    #[test]
+    fn uses_returns_annotation_as_row_type_name() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table orgs (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orgs/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_org.sql"),
+            "-- returns: OrgRow\nselect id, name from orgs",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].return_type,
+            ReturnType::Rows {
+                row_type: Some("OrgRow".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_returns_annotation() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table orgs (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orgs/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_org.sql"),
+            "-- returns: Org\nselect id from orgs",
+        )
+        .unwrap();
+
+        let result = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidReturnsAnnotation { .. })
         ));
     }
 }

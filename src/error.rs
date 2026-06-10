@@ -14,6 +14,12 @@ pub enum Error {
         reason: crate::sql_text::SqlValidationError,
     },
 
+    #[error("invalid -- returns: annotation in {path}: {reason}")]
+    InvalidReturnsAnnotation {
+        path: PathBuf,
+        reason: crate::sqlite::annotation::ReturnsAnnotationError,
+    },
+
     #[error("could not write {path}: {source}")]
     WriteFile {
         path: PathBuf,
@@ -52,6 +58,9 @@ pub enum Error {
 
     #[error("generated result column names collide in {path}: {columns:?}")]
     GeneratedColumnNameCollision { path: PathBuf, columns: Vec<String> },
+
+    #[error("shared row type {row_type} has mismatched column shapes")]
+    SharedRowTypeMismatch { row_type: String },
 
     #[error("generated file is stale: {path}")]
     StaleGeneratedFile { path: PathBuf },
