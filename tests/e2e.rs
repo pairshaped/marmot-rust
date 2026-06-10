@@ -121,6 +121,18 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         "select name from users where id = ?1 and active = ?2",
     )
     .unwrap();
+    fs::write(
+        sql_dir.join("create_user_returning_star.sql"),
+        "insert into users (name, active, avatar, score, nickname) \
+         values (@name, @active, @avatar, @score, @nickname) \
+         returning *",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("delete_user_returning.sql"),
+        "delete from users where id = @id returning id, name",
+    )
+    .unwrap();
 
     let config = Config {
         database,
@@ -282,6 +294,49 @@ mod tests {
             app_sql::find_name_numbered_one(&conn, 1, true).unwrap(),
             "bob"
         );
+    }
+
+    #[test]
+    fn generated_functions_handle_empty_results_returning_star_and_delete_returning() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                active boolean not null,
+                avatar blob not null,
+                score real not null,
+                nickname text
+            );
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(app_sql::list_active_users(&conn, true).unwrap(), vec![]);
+
+        let created = app_sql::create_user_returning_star(
+            &conn,
+            "carol",
+            false,
+            [7_u8, 8, 9],
+            4.75,
+            Some("c"),
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, 1);
+        assert_eq!(created[0].name, "carol");
+        assert!(!created[0].active);
+        assert_eq!(created[0].avatar, vec![7, 8, 9]);
+        assert_eq!(created[0].score, 4.75);
+        assert_eq!(created[0].nickname.as_deref(), Some("c"));
+
+        let deleted = app_sql::delete_user_returning(&conn, 1).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, 1);
+        assert_eq!(deleted[0].name, "carol");
+        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 0);
     }
 }
 "#,
