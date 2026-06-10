@@ -550,10 +550,11 @@ fn consume_number(chars: &[char], index: usize) -> (String, usize) {
         while chars.get(end).is_some_and(|c| c.is_ascii_hexdigit()) {
             end += 1;
         }
-        return (
-            chars[index..end].iter().collect::<String>().to_lowercase(),
-            end,
-        );
+        let mut number = chars[index..end].iter().collect::<String>();
+        if number.starts_with("0X") {
+            number.replace_range(1..2, "x");
+        }
+        return (number, end);
     }
 
     if matches!(chars.get(end), Some('e' | 'E')) {
@@ -571,10 +572,11 @@ fn consume_number(chars: &[char], index: usize) -> (String, usize) {
         }
     }
 
-    (
-        chars[index..end].iter().collect::<String>().to_lowercase(),
-        end,
-    )
+    let number = chars[index..end]
+        .iter()
+        .map(|c| if *c == 'E' { 'e' } else { *c })
+        .collect::<String>();
+    (number, end)
 }
 
 fn question_is_nullable_override(previous: Option<&Token>, next: Option<char>) -> bool {
@@ -749,6 +751,83 @@ mod tests {
                 Token::Number("0x1f".to_string()),
                 Token::Number("1e-9".to_string()),
                 Token::Number("2e+10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_hex_number_without_lowercasing_digits() {
+        assert_eq!(tokenize("0x1A"), vec![Token::Number("0x1A".to_string())]);
+        assert_eq!(tokenize("0XFF"), vec![Token::Number("0xFF".to_string())]);
+    }
+
+    #[test]
+    fn tokenizes_invalid_numeric_suffixes_as_separate_tokens() {
+        assert_eq!(
+            tokenize("0x 1e"),
+            vec![
+                Token::Number("0".to_string()),
+                Token::Word("x".to_string()),
+                Token::Number("1".to_string()),
+                Token::Word("e".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_unicode_identifiers_and_newlines_in_strings() {
+        assert_eq!(
+            tokenize("SELECT café FROM menu"),
+            vec![
+                Token::Word("SELECT".to_string()),
+                Token::Word("café".to_string()),
+                Token::Word("FROM".to_string()),
+                Token::Word("menu".to_string()),
+            ]
+        );
+        assert_eq!(
+            tokenize("SELECT 'line1\nline2'"),
+            vec![
+                Token::Word("SELECT".to_string()),
+                Token::StringLit("line1\nline2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_common_statement_shapes() {
+        assert_eq!(
+            tokenize("INSERT INTO users (name, email) VALUES (?, ?)"),
+            vec![
+                Token::Word("INSERT".to_string()),
+                Token::Word("INTO".to_string()),
+                Token::Word("users".to_string()),
+                Token::OpenParen,
+                Token::Word("name".to_string()),
+                Token::Comma,
+                Token::Word("email".to_string()),
+                Token::CloseParen,
+                Token::Word("VALUES".to_string()),
+                Token::OpenParen,
+                Token::ParamAnon,
+                Token::Comma,
+                Token::ParamAnon,
+                Token::CloseParen,
+            ]
+        );
+        assert_eq!(
+            tokenize("CASE WHEN x > 0 THEN 1 ELSE 0 END"),
+            vec![
+                Token::Word("CASE".to_string()),
+                Token::Word("WHEN".to_string()),
+                Token::Word("x".to_string()),
+                Token::Gt,
+                Token::Number("0".to_string()),
+                Token::Word("THEN".to_string()),
+                Token::Number("1".to_string()),
+                Token::Word("ELSE".to_string()),
+                Token::Number("0".to_string()),
+                Token::Word("END".to_string()),
             ]
         );
     }
