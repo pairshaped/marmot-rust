@@ -133,6 +133,16 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         "delete from users where id = @id returning id, name",
     )
     .unwrap();
+    fs::write(
+        sql_dir.join("create_keyword_table_row.sql"),
+        "insert into \"returning\" (id, name) values (@id, @name) returning id, name",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("find_keyword_table_row.sql"),
+        "select name from \"returning\" where id = @id",
+    )
+    .unwrap();
 
     let config = Config {
         database,
@@ -163,7 +173,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
 
 fn create_runtime_schema(conn: &Connection) {
     conn.execute_batch(
-        "
+        r#"
         create table users (
             id integer primary key,
             name text not null,
@@ -172,7 +182,11 @@ fn create_runtime_schema(conn: &Connection) {
             score real not null,
             nickname text
         );
-        ",
+        create table "returning" (
+            id integer not null,
+            name text not null
+        );
+        "#,
     )
     .unwrap();
 }
@@ -197,7 +211,7 @@ rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
     fs::write(runtime.join("src/generated/mod.rs"), "pub mod sql;\n").unwrap();
     fs::write(
         runtime.join("src/lib.rs"),
-        r#"
+        r##"
 pub mod generated;
 
 #[cfg(test)]
@@ -205,11 +219,9 @@ mod tests {
     use super::generated::sql::app_sql;
     use rusqlite::Connection;
 
-    #[test]
-    fn generated_functions_round_trip_common_sqlite_types() {
-        let conn = Connection::open_in_memory().unwrap();
+    fn create_schema(conn: &Connection) {
         conn.execute_batch(
-            "
+            r#"
             create table users (
                 id integer primary key,
                 name text not null,
@@ -218,9 +230,19 @@ mod tests {
                 score real not null,
                 nickname text
             );
-            ",
+            create table "returning" (
+                id integer not null,
+                name text not null
+            );
+            "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn generated_functions_round_trip_common_sqlite_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
 
         let created = app_sql::create_user(
             &conn,
@@ -257,19 +279,7 @@ mod tests {
     #[test]
     fn generated_functions_bind_positional_and_numbered_parameters() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            create table users (
-                id integer primary key,
-                name text not null,
-                active boolean not null,
-                avatar blob not null,
-                score real not null,
-                nickname text
-            );
-            ",
-        )
-        .unwrap();
+        create_schema(&conn);
 
         let created = app_sql::create_user_positional(
             &conn,
@@ -299,19 +309,7 @@ mod tests {
     #[test]
     fn generated_functions_handle_empty_results_returning_star_and_delete_returning() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            create table users (
-                id integer primary key,
-                name text not null,
-                active boolean not null,
-                avatar blob not null,
-                score real not null,
-                nickname text
-            );
-            ",
-        )
-        .unwrap();
+        create_schema(&conn);
 
         assert_eq!(app_sql::list_active_users(&conn, true).unwrap(), vec![]);
 
@@ -338,8 +336,23 @@ mod tests {
         assert_eq!(deleted[0].name, "carol");
         assert_eq!(app_sql::count_users_one(&conn).unwrap(), 0);
     }
+
+    #[test]
+    fn generated_functions_handle_quoted_keyword_table_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        let created = app_sql::create_keyword_table_row(&conn, 10, "keyword").unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, 10);
+        assert_eq!(created[0].name, "keyword");
+        assert_eq!(
+            app_sql::find_keyword_table_row_one(&conn, 10).unwrap(),
+            "keyword"
+        );
+    }
 }
-"#,
+"##,
     )
     .unwrap();
 }
