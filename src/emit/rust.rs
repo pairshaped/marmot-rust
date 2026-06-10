@@ -73,6 +73,7 @@ fn ensure_file_current(path: &std::path::Path, content: &str) -> Result<()> {
 }
 
 fn render_module(queries: Vec<&Query>) -> Result<String> {
+    validate_generated_names(&queries)?;
     validate_shared_row_types(&queries)?;
     let import_macros = render_import_macros(&queries);
     let mut output = format!(
@@ -94,6 +95,68 @@ fn render_module(queries: Vec<&Query>) -> Result<String> {
     }
 
     Ok(output)
+}
+
+fn validate_generated_names(queries: &[&Query]) -> Result<()> {
+    let mut generated_function_names = BTreeSet::new();
+    let mut duplicate_query_names = BTreeSet::new();
+    for query in queries {
+        for generated_name in generated_function_names_for(query) {
+            if !generated_function_names.insert(generated_name.clone()) {
+                duplicate_query_names.insert(generated_name);
+            }
+        }
+    }
+    if !duplicate_query_names.is_empty() {
+        return Err(Error::DuplicateQueryNames {
+            names: duplicate_query_names.into_iter().collect(),
+        });
+    }
+
+    let mut shared_row_types: BTreeSet<String> = BTreeSet::new();
+    let mut emitted_row_types: BTreeSet<String> = BTreeSet::new();
+    let mut duplicate_row_types = BTreeSet::new();
+
+    for query in queries {
+        let ReturnType::Rows { row_type } = &query.return_type else {
+            continue;
+        };
+        if query.columns.len() <= 1 {
+            continue;
+        }
+
+        let row_type = match row_type {
+            Some(row_type) => {
+                if shared_row_types.insert(row_type.clone())
+                    && !emitted_row_types.insert(row_type.clone())
+                {
+                    duplicate_row_types.insert(row_type.clone());
+                }
+                continue;
+            }
+            None => format!("{}Row", query.name.to_pascal_case()),
+        };
+
+        if !emitted_row_types.insert(row_type.clone()) {
+            duplicate_row_types.insert(row_type);
+        }
+    }
+
+    if !duplicate_row_types.is_empty() {
+        return Err(Error::DuplicateRowTypeNames {
+            names: duplicate_row_types.into_iter().collect(),
+        });
+    }
+
+    Ok(())
+}
+
+fn generated_function_names_for(query: &Query) -> Vec<String> {
+    let mut names = vec![query.name.clone()];
+    if matches!(query.return_type, ReturnType::Rows { .. }) && query.columns.len() == 1 {
+        names.push(format!("{}_one", query.name));
+    }
+    names
 }
 
 fn render_import_macros(queries: &[&Query]) -> String {
@@ -479,6 +542,137 @@ mod tests {
         assert!(matches!(
             emit(&check_config, &project),
             Err(Error::StaleGeneratedFile { .. })
+        ));
+    }
+
+    #[test]
+    fn render_module_rejects_duplicate_query_names() {
+        let queries = vec![
+            Query {
+                source_path: PathBuf::from("src/users/sql/find-user.sql"),
+                module_name: "users_sql".to_string(),
+                name: "find_user".to_string(),
+                return_type: ReturnType::Rows { row_type: None },
+                sql: "select 1 as value".to_string(),
+                parameters: vec![],
+                columns: vec![Column {
+                    name: "value".to_string(),
+                    field_name: "value".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+            },
+            Query {
+                source_path: PathBuf::from("src/users/sql/find_user.sql"),
+                module_name: "users_sql".to_string(),
+                name: "find_user".to_string(),
+                return_type: ReturnType::Rows { row_type: None },
+                sql: "select 2 as value".to_string(),
+                parameters: vec![],
+                columns: vec![Column {
+                    name: "value".to_string(),
+                    field_name: "value".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+            },
+        ];
+        let query_refs = queries.iter().collect::<Vec<_>>();
+
+        assert!(matches!(
+            render_module(query_refs),
+            Err(Error::DuplicateQueryNames { names }) if names == ["find_user", "find_user_one"]
+        ));
+    }
+
+    #[test]
+    fn render_module_rejects_scalar_helper_name_collisions() {
+        let queries = vec![
+            Query {
+                source_path: PathBuf::from("src/users/sql/find.sql"),
+                module_name: "users_sql".to_string(),
+                name: "find".to_string(),
+                return_type: ReturnType::Rows { row_type: None },
+                sql: "select 1 as value".to_string(),
+                parameters: vec![],
+                columns: vec![Column {
+                    name: "value".to_string(),
+                    field_name: "value".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+            },
+            Query {
+                source_path: PathBuf::from("src/users/sql/find_one.sql"),
+                module_name: "users_sql".to_string(),
+                name: "find_one".to_string(),
+                return_type: ReturnType::Execute,
+                sql: "delete from users where id = ?".to_string(),
+                parameters: vec![Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+                columns: vec![],
+            },
+        ];
+        let query_refs = queries.iter().collect::<Vec<_>>();
+
+        assert!(matches!(
+            render_module(query_refs),
+            Err(Error::DuplicateQueryNames { names }) if names == ["find_one"]
+        ));
+    }
+
+    #[test]
+    fn render_module_rejects_duplicate_row_type_names() {
+        let columns = vec![
+            Column {
+                name: "id".to_string(),
+                field_name: "id".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            },
+            Column {
+                name: "name".to_string(),
+                field_name: "name".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            },
+        ];
+        let queries = vec![
+            Query {
+                source_path: PathBuf::from("src/orgs/sql/list_orgs.sql"),
+                module_name: "orgs_sql".to_string(),
+                name: "list_orgs".to_string(),
+                return_type: ReturnType::Rows {
+                    row_type: Some("OrgRow".to_string()),
+                },
+                sql: "select id, name from orgs".to_string(),
+                parameters: vec![],
+                columns: columns.clone(),
+            },
+            Query {
+                source_path: PathBuf::from("src/orgs/sql/org.sql"),
+                module_name: "orgs_sql".to_string(),
+                name: "org".to_string(),
+                return_type: ReturnType::Rows { row_type: None },
+                sql: "select id, name from orgs where id = ?".to_string(),
+                parameters: vec![Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+                columns,
+            },
+        ];
+        let query_refs = queries.iter().collect::<Vec<_>>();
+
+        assert!(matches!(
+            render_module(query_refs),
+            Err(Error::DuplicateRowTypeNames { names }) if names == ["OrgRow"]
         ));
     }
 

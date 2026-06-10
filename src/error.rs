@@ -70,6 +70,12 @@ pub enum Error {
     #[error("shared row type {row_type} has mismatched column shapes")]
     SharedRowTypeMismatch { row_type: String },
 
+    #[error("duplicate generated query names: {names:?}")]
+    DuplicateQueryNames { names: Vec<String> },
+
+    #[error("duplicate generated row type names: {names:?}")]
+    DuplicateRowTypeNames { names: Vec<String> },
+
     #[error("generated file is stale: {path}")]
     StaleGeneratedFile { path: PathBuf },
 }
