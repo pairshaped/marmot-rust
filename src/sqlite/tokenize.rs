@@ -10,6 +10,7 @@ pub enum Token {
     Semicolon,
     Dot,
     ParamAnon,
+    ParamNumbered { number: String },
     ParamNamed { prefix: char, name: String },
     Eq,
     Ne,
@@ -358,6 +359,19 @@ pub fn tokenize_spans(sql: &str) -> Vec<SpannedToken> {
             }
             '?' => {
                 let previous = tokens.last().map(|spanned| &spanned.token);
+                if chars.get(index + 1).is_some_and(|c| c.is_ascii_digit()) {
+                    let (number, next) = consume_digits(&chars, index + 1);
+                    push_token(
+                        &mut tokens,
+                        Token::ParamNumbered { number },
+                        index,
+                        next,
+                        &byte_offsets,
+                        sql.len(),
+                    );
+                    index = next;
+                    continue;
+                }
                 let token =
                     if question_is_nullable_override(previous, chars.get(index + 1).copied()) {
                         Token::NullableOverride
@@ -577,6 +591,14 @@ fn consume_number(chars: &[char], index: usize) -> (String, usize) {
         .map(|c| if *c == 'E' { 'e' } else { *c })
         .collect::<String>();
     (number, end)
+}
+
+fn consume_digits(chars: &[char], index: usize) -> (String, usize) {
+    let mut end = index;
+    while chars.get(end).is_some_and(|c| c.is_ascii_digit()) {
+        end += 1;
+    }
+    (chars[index..end].iter().collect(), end)
 }
 
 fn question_is_nullable_override(previous: Option<&Token>, next: Option<char>) -> bool {
@@ -861,6 +883,23 @@ mod tests {
                 Token::ParamNamed {
                     prefix: '$',
                     name: "pattern".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            tokenize("WHERE id = ?1 OR parent_id = ?02"),
+            vec![
+                Token::Word("WHERE".to_string()),
+                Token::Word("id".to_string()),
+                Token::Eq,
+                Token::ParamNumbered {
+                    number: "1".to_string(),
+                },
+                Token::Word("OR".to_string()),
+                Token::Word("parent_id".to_string()),
+                Token::Eq,
+                Token::ParamNumbered {
+                    number: "02".to_string(),
                 },
             ]
         );

@@ -261,6 +261,31 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
                     nullable: inference.nullable,
                 });
             }
+            Token::ParamNumbered { number } => {
+                let name = numbered_parameter_name(&number);
+                let placeholder = numbered_placeholder_key(&number);
+                let sql_name = format!("?{number}");
+                let inference = inferences
+                    .get(&placeholder)
+                    .cloned()
+                    .unwrap_or_else(ParameterInference::default);
+                if let Some(param) = params
+                    .iter_mut()
+                    .find(|param| parameter_matches_numbered_index(param, &number))
+                {
+                    if !param.sql_names.contains(&sql_name) {
+                        param.sql_names.push(sql_name);
+                    }
+                } else {
+                    let name = unique_parameter_name(&name, &params);
+                    params.push(Parameter {
+                        name,
+                        sql_names: vec![sql_name],
+                        column_type: inference.column_type,
+                        nullable: inference.nullable,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -318,6 +343,15 @@ fn parameter_matches_logical_name(param: &Parameter, logical_name: &str) -> bool
         .any(|name| name.to_ascii_lowercase() == logical_name)
 }
 
+fn parameter_matches_numbered_index(param: &Parameter, number: &str) -> bool {
+    let index = numbered_parameter_index(number);
+    param.sql_names.iter().any(|sql_name| {
+        sql_name
+            .strip_prefix('?')
+            .is_some_and(|number| numbered_parameter_index(number) == index)
+    })
+}
+
 fn unique_parameter_name(base: &str, params: &[Parameter]) -> String {
     if !params.iter().any(|param| param.name == base) {
         return base.to_string();
@@ -343,6 +377,18 @@ fn anonymous_parameter_name(index: usize) -> String {
 
 fn anonymous_placeholder_key(index: usize) -> String {
     format!("?{index}")
+}
+
+fn numbered_parameter_name(number: &str) -> String {
+    anonymous_parameter_name(numbered_parameter_index(number))
+}
+
+fn numbered_placeholder_key(number: &str) -> String {
+    anonymous_placeholder_key(numbered_parameter_index(number))
+}
+
+fn numbered_parameter_index(number: &str) -> usize {
+    number.parse::<usize>().unwrap_or(0)
 }
 
 fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, ParameterInference> {
@@ -841,7 +887,11 @@ fn case_result_parameter_indexes(
             {
                 in_result = true;
             }
-            Token::ParamAnon | Token::ParamNamed { .. } if in_result => indexes.push(index),
+            Token::ParamAnon | Token::ParamNumbered { .. } | Token::ParamNamed { .. }
+                if in_result =>
+            {
+                indexes.push(index);
+            }
             _ => {}
         }
     }
@@ -1093,6 +1143,7 @@ fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<
 fn parameter_key(token: &Token, anon_index: &mut usize) -> Option<String> {
     match token {
         Token::ParamNamed { prefix, name } => Some(format!("{prefix}{name}")),
+        Token::ParamNumbered { number } => Some(numbered_placeholder_key(number)),
         Token::ParamAnon => {
             *anon_index += 1;
             Some(anonymous_placeholder_key(*anon_index))
@@ -2316,6 +2367,23 @@ mod tests {
     }
 
     #[test]
+    fn suffixes_numbered_parameter_names_that_collide_with_named_parameters() {
+        let params = parameters("where name = @param and id = ?1", &Schema::default());
+        let names = params
+            .into_iter()
+            .map(|param| (param.name, param.sql_names))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                ("param".to_string(), vec!["@param".to_string()]),
+                ("param_2".to_string(), vec!["?1".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
     fn infers_common_integer_columns() {
         assert_eq!(infer_column_type("id"), ValueType::I64);
         assert_eq!(infer_column_type("count(*)"), ValueType::I64);
@@ -2446,6 +2514,63 @@ mod tests {
             [
                 ("param", ValueType::String, false, vec![]),
                 ("param_2", ValueType::I64, false, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_numbered_parameter_types_by_sqlite_index() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                parent_id integer,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id from users where id = ?1 or parent_id = ?1 or name = ?2",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                    param.sql_names.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, false, vec!["?1".to_string()]),
+                ("param_2", ValueType::String, false, vec!["?2".to_string()]),
             ]
         );
     }

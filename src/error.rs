@@ -76,6 +76,9 @@ pub enum Error {
     #[error("duplicate generated row type names: {names:?}")]
     DuplicateRowTypeNames { names: Vec<String> },
 
+    #[error("anonymous parameters cannot be mixed with named or numbered parameters in {path}")]
+    MixedParameterStyles { path: PathBuf },
+
     #[error("generated file is stale: {path}")]
     StaleGeneratedFile { path: PathBuf },
 }
