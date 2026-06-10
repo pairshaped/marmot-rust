@@ -225,6 +225,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     let mut inferences = insert_parameter_inferences(&tokens, schema);
     let table_refs = table_references(&tokens);
 
+    for (key, inference) in cast_parameter_inferences(&tokens) {
+        inferences.insert(key, inference);
+    }
     for (key, inference) in comparison_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
@@ -299,6 +302,58 @@ fn insert_parameter_inferences(
     }
 
     inferences
+}
+
+fn cast_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
+    let keys_by_index = parameter_keys_by_index(tokens);
+    let mut inferences = BTreeMap::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if !token_is_word(&tokens[index], "CAST")
+            || !matches!(tokens.get(index + 1), Some(Token::OpenParen))
+        {
+            index += 1;
+            continue;
+        }
+
+        let (inside, after_cast) = collect_balanced_parens(tokens, index + 1);
+        let Some(as_index) = inside.iter().position(|token| token_is_word(token, "AS")) else {
+            index = after_cast;
+            continue;
+        };
+        let Some(declared_type) = inside.get(as_index + 1).and_then(identifier_from_token) else {
+            index = after_cast;
+            continue;
+        };
+
+        for token_index in index + 2..after_cast.saturating_sub(1) {
+            if let Some(key) = keys_by_index.get(&token_index) {
+                inferences.insert(
+                    key.clone(),
+                    ParameterInference {
+                        column_type: ValueType::from_sqlite_type(declared_type),
+                        nullable: false,
+                    },
+                );
+            }
+        }
+
+        index = after_cast;
+    }
+
+    inferences
+}
+
+fn parameter_keys_by_index(tokens: &[Token]) -> BTreeMap<usize, String> {
+    let mut keys = BTreeMap::new();
+    let mut anon_index = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(key) = parameter_key(token, &mut anon_index) {
+            keys.insert(index, key);
+        }
+    }
+    keys
 }
 
 fn comparison_parameter_inferences(
@@ -1662,6 +1717,44 @@ mod tests {
                 ("start", ValueType::I64, false),
                 ("end", ValueType::I64, false),
             ]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_type_from_cast_target() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table events (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_events.sql"),
+            "select id from events where cast(@season as integer) = 0",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "season".to_string(),
+                sql_names: vec!["@season".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
         );
     }
 
