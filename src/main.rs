@@ -234,11 +234,23 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
         .map(|database_target| Config {
             database: database_target.database,
             source_root: source_root.clone(),
-            sql_dir: sql_dir.clone().or(database_target.sql_dir),
+            sql_dir: sql_dir.clone().or(database_target.sql_dir).or_else(|| {
+                database_target
+                    .name
+                    .as_ref()
+                    .map(|name| source_root.join("sql").join(name))
+            }),
             output: output
                 .clone()
                 .or(database_target.output)
-                .unwrap_or_else(|| PathBuf::from("src/generated/sql")),
+                .unwrap_or_else(|| {
+                    let output = source_root.join("generated/sql");
+                    if let Some(name) = database_target.name {
+                        output.join(name)
+                    } else {
+                        output
+                    }
+                }),
             target,
             check,
         })
@@ -247,6 +259,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
 
 #[derive(Debug)]
 struct DatabaseTarget {
+    name: Option<String>,
     database: PathBuf,
     sql_dir: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -281,6 +294,7 @@ fn database_targets(
 
     if let Some(database) = explicit_database_path(cli_database, file_config) {
         return Ok(vec![DatabaseTarget {
+            name: None,
             database,
             sql_dir: file_config.sql_dir.clone(),
             output: file_config.output.clone(),
@@ -306,6 +320,7 @@ fn simple_database_target(
 ) -> Result<DatabaseTarget, ConfigError> {
     explicit_database_path(cli_database, file_config)
         .map(|database| DatabaseTarget {
+            name: None,
             database,
             sql_dir: file_config.sql_dir.clone(),
             output: file_config.output.clone(),
@@ -331,34 +346,23 @@ fn named_database_target(
     file_config: &FileConfig,
 ) -> DatabaseTarget {
     DatabaseTarget {
+        name: Some(name.to_string()),
         database: reference
             .path
             .clone()
             .unwrap_or_else(|| PathBuf::from("db").join(format!("{name}.sqlite"))),
-        sql_dir: Some(
-            reference
+        sql_dir: reference.sql_dir.clone().or_else(|| {
+            file_config
                 .sql_dir
                 .clone()
-                .or_else(|| {
-                    file_config
-                        .sql_dir
-                        .clone()
-                        .map(|base| join_namespace(base, name))
-                })
-                .unwrap_or_else(|| PathBuf::from("src/sql").join(name)),
-        ),
-        output: Some(
-            reference
+                .map(|base| join_namespace(base, name))
+        }),
+        output: reference.output.clone().or_else(|| {
+            file_config
                 .output
                 .clone()
-                .or_else(|| {
-                    file_config
-                        .output
-                        .clone()
-                        .map(|base| join_namespace(base, name))
-                })
-                .unwrap_or_else(|| PathBuf::from("src/generated/sql").join(name)),
-        ),
+                .map(|base| join_namespace(base, name))
+        }),
         migrations_dir: Some(
             reference
                 .migrations_dir

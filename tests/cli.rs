@@ -363,6 +363,33 @@ fn generate_command_rejects_output_outside_source_root() {
 }
 
 #[test]
+fn generate_command_succeeds_with_no_sql_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
+
+    let source_root = dir.path().join("src");
+    fs::create_dir_all(&source_root).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/mod.rs").exists());
+}
+
+#[test]
 fn generate_command_rejects_cli_database_with_named_database_selection() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

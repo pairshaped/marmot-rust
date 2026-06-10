@@ -57,6 +57,8 @@ migrations_dir db/migrations/NAME
 seeds_dir      db/seeds/NAME
 ```
 
+If `source_root` is changed, default `sql_dir` and `output` are derived from that resolved source root. For example, `source_root = "app/src"` gives `app/src/sql/NAME` and `app/src/generated/sql/NAME` for named database references that omit those paths.
+
 If a global `sql_dir`, `output`, `migrations_dir`, or `seeds_dir` is configured, named references without their own value append the database name to that global path. If the global path already ends with the database name, it is used as-is.
 
 `[tools.marmot].database` cannot be combined with named database references. Use a single top-level database config or named references, not both.
