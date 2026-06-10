@@ -5671,6 +5671,47 @@ mod tests {
     }
 
     #[test]
+    fn cast_subquery_column_as_integer_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, val integer not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("cast_value.sql"),
+            "
+            select cast(sub.val as integer) as v
+            from (select val from t) sub
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "v".to_string(),
+                field_name: "v".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn string_literals_do_not_split_select_expressions() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -5815,6 +5856,64 @@ mod tests {
                 column_type: ValueType::I64,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn select_distinct_multiple_columns_and_order_by_preserve_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tickets (
+                id integer primary key,
+                status text not null,
+                priority integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tickets/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_ticket_states.sql"),
+            "
+            select distinct status, priority
+            from tickets
+            order by status, priority
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "status".to_string(),
+                    field_name: "status".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "priority".to_string(),
+                    field_name: "priority".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
         );
     }
 
@@ -5964,6 +6063,62 @@ mod tests {
                 nullable: false,
             }]
         );
+    }
+
+    #[test]
+    fn intersect_and_except_preserve_result_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t1 (id integer primary key);
+            create table t2 (id integer primary key);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("common_things.sql"),
+            "select id from t1 intersect select id from t2",
+        )
+        .unwrap();
+        fs::write(
+            sql_dir.join("remaining_things.sql"),
+            "select id from t1 except select id from t2",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        for query_name in ["common_things", "remaining_things"] {
+            let query = project
+                .queries
+                .iter()
+                .find(|query| query.name == query_name)
+                .unwrap();
+            assert_eq!(
+                query.columns,
+                [Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+                "{query_name}"
+            );
+        }
     }
 
     #[test]
