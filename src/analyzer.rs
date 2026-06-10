@@ -328,6 +328,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     for (key, inference) in comparison_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
+    for (key, inference) in case_result_parameter_inferences(&tokens, schema, &table_refs) {
+        inferences.insert(key, inference);
+    }
     for (key, inference) in between_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
@@ -551,8 +554,9 @@ fn comparison_parameter_inferences(
             .and_then(|column_end| comparison_column_ref_ending_at(tokens, column_end));
         let column_after = comparison_operator_after(tokens, index)
             .and_then(|column_start| comparison_column_ref_starting_at(tokens, column_start));
+        let arithmetic_column = arithmetic_column_for_parameter(tokens, index);
 
-        let Some(column_ref) = column_before.or(column_after) else {
+        let Some(column_ref) = column_before.or(column_after).or(arithmetic_column) else {
             continue;
         };
         let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
@@ -569,6 +573,153 @@ fn comparison_parameter_inferences(
     }
 
     inferences
+}
+
+fn case_result_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeMap<String, ParameterInference> {
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut inferences = BTreeMap::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if !token_is_word(&tokens[index], "CASE") {
+            index += 1;
+            continue;
+        }
+        let Some(end_index) = matching_case_end(tokens, index) else {
+            index += 1;
+            continue;
+        };
+        let Some(column_ref) = compared_column_for_case(tokens, index, end_index) else {
+            index = end_index + 1;
+            continue;
+        };
+        let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
+            index = end_index + 1;
+            continue;
+        };
+
+        for token_index in case_result_parameter_indexes(tokens, index, end_index) {
+            let Some(key) = parameter_keys.get(&token_index) else {
+                continue;
+            };
+            inferences.insert(
+                key.clone(),
+                ParameterInference {
+                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    nullable: false,
+                },
+            );
+        }
+
+        index = end_index + 1;
+    }
+
+    inferences
+}
+
+fn compared_column_for_case(
+    tokens: &[Token],
+    case_index: usize,
+    end_index: usize,
+) -> Option<ColumnRef> {
+    if tokens.get(end_index + 1).is_some_and(comparison_operator) {
+        return comparison_column_ref_starting_at(tokens, end_index + 2);
+    }
+    if tokens
+        .get(case_index.checked_sub(1)?)
+        .is_some_and(comparison_operator)
+    {
+        return comparison_column_ref_ending_at(tokens, case_index.checked_sub(2)?);
+    }
+    None
+}
+
+fn case_result_parameter_indexes(
+    tokens: &[Token],
+    case_index: usize,
+    end_index: usize,
+) -> Vec<usize> {
+    let mut indexes = Vec::new();
+    let mut in_result = false;
+    let mut paren_depth = 0usize;
+    let mut nested_case_depth = 0usize;
+
+    for index in case_index + 1..end_index {
+        match &tokens[index] {
+            Token::OpenParen => paren_depth += 1,
+            Token::CloseParen => paren_depth = paren_depth.saturating_sub(1),
+            Token::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("CASE") => {
+                nested_case_depth += 1;
+            }
+            Token::Word(word)
+                if paren_depth == 0
+                    && nested_case_depth > 0
+                    && word.eq_ignore_ascii_case("END") =>
+            {
+                nested_case_depth = nested_case_depth.saturating_sub(1);
+            }
+            Token::Word(word)
+                if paren_depth == 0
+                    && nested_case_depth == 0
+                    && word.eq_ignore_ascii_case("WHEN") =>
+            {
+                in_result = false;
+            }
+            Token::Word(word)
+                if paren_depth == 0
+                    && nested_case_depth == 0
+                    && (word.eq_ignore_ascii_case("THEN") || word.eq_ignore_ascii_case("ELSE")) =>
+            {
+                in_result = true;
+            }
+            Token::ParamAnon | Token::ParamNamed { .. } if in_result => indexes.push(index),
+            _ => {}
+        }
+    }
+
+    indexes
+}
+
+fn matching_case_end(tokens: &[Token], case_index: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(case_index) {
+        if token_is_word(token, "CASE") {
+            depth += 1;
+        } else if token_is_word(token, "END") {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+
+    None
+}
+
+fn arithmetic_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<ColumnRef> {
+    if tokens
+        .get(param_index.checked_sub(1)?)
+        .is_some_and(arithmetic_operator)
+    {
+        return column_ref_ending_at(tokens, param_index.checked_sub(2)?);
+    }
+
+    if tokens.get(param_index + 1).is_some_and(arithmetic_operator) {
+        return column_ref_starting_at(tokens, param_index + 2);
+    }
+
+    None
+}
+
+fn arithmetic_operator(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
+    )
 }
 
 fn limit_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
@@ -4902,6 +5053,441 @@ mod tests {
                     nullable: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn infers_update_parameters_inside_column_arithmetic() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table credits (
+                id integer primary key,
+                balance integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("credits/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("add_credit.sql"),
+            "
+            update credits
+            set balance = balance + @delta
+            where id = @id and balance + @min_delta >= 0
+            returning id, balance
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("delta", ValueType::I64, false),
+                ("id", ValueType::I64, false),
+                ("min_delta", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_select_parameter_inside_multiplication_expression() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table line_items (
+                id integer primary key,
+                quantity integer not null,
+                unit_price integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("line_items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("expensive_items.sql"),
+            "select id from line_items where quantity * unit_price >= quantity * @threshold",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "threshold".to_string(),
+                sql_names: vec!["@threshold".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_inside_cte_body() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("count_filtered.sql"),
+            "
+            with filtered as (
+                select id from orders where org_id = @org_id
+            )
+            select count(*) from filtered
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_in_second_union_arm() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                org_id integer not null
+            );
+            create table archived_users (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_all_users.sql"),
+            "
+            select id from users
+            union all
+            select id from archived_users where org_id = @org_id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_in_join_on_clause() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table participants (
+                id integer primary key
+            );
+            create table line_items (
+                id integer primary key,
+                participant_id integer not null,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("participants/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_participants.sql"),
+            "
+            select p.id
+            from participants p
+            join line_items li
+              on li.participant_id = p.id
+             and li.org_id = @org_id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_in_update_from_where_clause() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table participants (
+                id integer primary key,
+                name text not null
+            );
+            create table line_items (
+                id integer primary key,
+                participant_id integer not null,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("participants/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("rename_participants.sql"),
+            "
+            update participants
+            set name = @name
+            from line_items li
+            where li.participant_id = participants.id
+              and li.org_id = @org_id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "name".to_string(),
+                    sql_names: vec!["@name".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "org_id".to_string(),
+                    sql_names: vec!["@org_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_parameter_from_inner_alias_shadowing_outer_alias() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key
+            );
+            create table audit_logs (
+                id integer primary key,
+                actor_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_actor_users.sql"),
+            "
+            select *
+            from users u
+            where exists (
+                select 1 from audit_logs u where u.actor_id = @actor_id
+            )
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "actor_id".to_string(),
+                sql_names: vec!["@actor_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn infers_case_result_parameter_from_compared_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                status_rank integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("ranked_orders.sql"),
+            "
+            select id
+            from orders
+            where case
+                when @rank = 0 then status_rank
+                else @rank
+            end = status_rank
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "rank".to_string(),
+                sql_names: vec!["@rank".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
         );
     }
 
