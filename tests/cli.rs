@@ -211,6 +211,119 @@ output = "{}"
 }
 
 #[test]
+fn generate_command_check_reports_missing_generated_files_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "check_name");
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(
+        users_sql.join("find_user.sql"),
+        "select id, name from users",
+    )
+    .unwrap();
+    let generated = dir.path().join("generated/sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&generated)
+        .arg("--check")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("generated file is stale"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!generated.join("users_sql.rs").exists());
+}
+
+#[test]
+fn generate_command_check_passes_after_generation_and_fails_after_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "check_name");
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(
+        users_sql.join("find_user.sql"),
+        "select id, name from users",
+    )
+    .unwrap();
+    let generated = dir.path().join("generated/sql");
+
+    let generate = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&generated)
+        .output()
+        .unwrap();
+    assert!(
+        generate.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&generate.stdout),
+        String::from_utf8_lossy(&generate.stderr)
+    );
+
+    let check = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&generated)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    fs::write(
+        users_sql.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    let stale_check = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&generated)
+        .arg("--check")
+        .output()
+        .unwrap();
+
+    assert!(!stale_check.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale_check.stderr).contains("generated file is stale"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&stale_check.stderr)
+    );
+}
+
+#[test]
 fn generate_command_uses_named_database_config() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("db/app.db");
