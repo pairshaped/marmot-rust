@@ -1731,6 +1731,7 @@ fn infer_expression_tokens(
             inferred_nullable: Some(true),
             nullable_override: None,
         }),
+        "max" | "min" => infer_min_max_expression(tokens, context),
         "coalesce" => infer_coalesce_expression(tokens, context),
         _ => None,
     }
@@ -1799,6 +1800,20 @@ fn infer_coalesce_expression(
         inferred_nullable: Some(nullable),
         nullable_override: None,
     })
+}
+
+fn infer_min_max_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
+    let (inside, _) = collect_balanced_parens(tokens, 1);
+    let args = split_top_level_commas(inside);
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    let mut inference = infer_expression_tokens(arg, context)?;
+    inference.inferred_nullable = Some(true);
+    Some(inference)
 }
 
 fn infer_cast_expression(tokens: &[Token]) -> Option<ExpressionInference> {
@@ -4731,6 +4746,208 @@ mod tests {
                 name: "param".to_string(),
                 sql_names: vec![],
                 column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn select_distinct_with_where_param_preserves_metadata_and_param_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tickets (
+                id integer primary key,
+                status text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tickets/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_statuses.sql"),
+            "select distinct status from tickets where id > ? order by status",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "status".to_string(),
+                field_name: "status".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn group_by_with_multiple_aggregates_infers_result_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table measurements (
+                id integer primary key,
+                grp text not null,
+                val integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("measurements/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("summarize.sql"),
+            "
+            select
+                grp,
+                count(*) as cnt,
+                avg(val) as avg_val,
+                max(val) as max_val
+            from measurements
+            group by grp
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "grp".to_string(),
+                    field_name: "grp".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "cnt".to_string(),
+                    field_name: "cnt".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "avg_val".to_string(),
+                    field_name: "avg_val".to_string(),
+                    column_type: ValueType::F64,
+                    nullable: true,
+                },
+                Column {
+                    name: "max_val".to_string(),
+                    field_name: "max_val".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compound_query_as_subquery_infers_outer_where_param() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table active_users (
+                id integer primary key,
+                name text not null
+            );
+            create table archived_users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_all.sql"),
+            "
+            select id, name
+            from (
+                select id, name from active_users
+                union
+                select id, name from archived_users
+            )
+            where name = ?
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "name".to_string(),
+                    field_name: "name".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
                 nullable: false,
             }]
         );
