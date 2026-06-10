@@ -618,6 +618,15 @@ fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
     let mut index = 0usize;
 
     while index < tokens.len() {
+        if token_is_word(&tokens[index], "UPDATE") {
+            if let Some(table) = tokens.get(index + 1).and_then(table_name_from_token) {
+                let table = table.to_ascii_lowercase();
+                refs.insert(table.clone(), table);
+            }
+            index += 2;
+            continue;
+        }
+
         if !(token_is_word(&tokens[index], "FROM") || token_is_word(&tokens[index], "JOIN")) {
             index += 1;
             continue;
@@ -1567,6 +1576,54 @@ mod tests {
             [
                 ("param", ValueType::String, false, vec![]),
                 ("param_2", ValueType::I64, false, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_update_set_and_where_parameter_types_without_spaces() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("update_user.sql"),
+            "update users set name=? where id=?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::String, false),
+                ("param_2", ValueType::I64, false),
             ]
         );
     }
