@@ -416,6 +416,13 @@ fn expression_without_alias(tokens: &[Token]) -> &[Token] {
 }
 
 fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
+    if tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "CASE"))
+    {
+        return infer_case_expression(tokens);
+    }
+
     let function_name = match (tokens.first(), tokens.get(1)) {
         (Some(Token::Word(name)), Some(Token::OpenParen)) => name,
         _ => return None,
@@ -439,6 +446,149 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
             nullable_override: None,
         }),
         _ => None,
+    }
+}
+
+fn infer_case_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+    let mut branch_types = Vec::new();
+    let mut nullable = false;
+    let mut has_else = false;
+    let mut index = 1usize;
+
+    while index < tokens.len() {
+        if token_is_word(&tokens[index], "THEN") {
+            let start = index + 1;
+            let end = case_branch_end(tokens, start);
+            let branch = infer_case_branch(&tokens[start..end]);
+            nullable |= branch.nullable;
+            if let Some(column_type) = branch.column_type {
+                branch_types.push(column_type);
+            }
+            index = end;
+        } else if token_is_word(&tokens[index], "ELSE") {
+            has_else = true;
+            let start = index + 1;
+            let end = case_branch_end(tokens, start);
+            let branch = infer_case_branch(&tokens[start..end]);
+            nullable |= branch.nullable;
+            if let Some(column_type) = branch.column_type {
+                branch_types.push(column_type);
+            }
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+
+    if !has_else {
+        nullable = true;
+    }
+
+    let case_type = common_case_branch_type(branch_types)?;
+    nullable |= case_type.mixed;
+    Some(ExpressionInference {
+        column_type: Some(case_type.column_type),
+        inferred_nullable: Some(nullable),
+        nullable_override: None,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaseBranch {
+    column_type: Option<ValueType>,
+    nullable: bool,
+}
+
+fn case_branch_end(tokens: &[Token], start: usize) -> usize {
+    let mut paren_depth = 0usize;
+    let mut nested_case_depth = 0usize;
+
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::OpenParen => paren_depth += 1,
+            Token::CloseParen => paren_depth = paren_depth.saturating_sub(1),
+            Token::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("CASE") => {
+                nested_case_depth += 1;
+            }
+            Token::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("END") => {
+                if nested_case_depth == 0 {
+                    return index;
+                }
+                nested_case_depth -= 1;
+            }
+            Token::Word(word)
+                if paren_depth == 0
+                    && nested_case_depth == 0
+                    && (word.eq_ignore_ascii_case("WHEN") || word.eq_ignore_ascii_case("ELSE")) =>
+            {
+                return index;
+            }
+            _ => {}
+        }
+    }
+
+    tokens.len()
+}
+
+fn infer_case_branch(tokens: &[Token]) -> CaseBranch {
+    match tokens.first() {
+        Some(Token::Number(number)) => CaseBranch {
+            column_type: Some(number_value_type(number)),
+            nullable: false,
+        },
+        Some(Token::StringLit(_)) => CaseBranch {
+            column_type: Some(ValueType::String),
+            nullable: false,
+        },
+        Some(Token::Word(word)) if word.eq_ignore_ascii_case("NULL") => CaseBranch {
+            column_type: None,
+            nullable: true,
+        },
+        Some(Token::Word(word)) if word.eq_ignore_ascii_case("CASE") => {
+            match infer_case_expression(tokens) {
+                Some(inference) => CaseBranch {
+                    column_type: inference.column_type,
+                    nullable: inference.inferred_nullable.unwrap_or(true),
+                },
+                None => CaseBranch {
+                    column_type: None,
+                    nullable: true,
+                },
+            }
+        }
+        _ => CaseBranch {
+            column_type: None,
+            nullable: true,
+        },
+    }
+}
+
+fn number_value_type(number: &str) -> ValueType {
+    if number.contains('.') || number.contains('e') {
+        ValueType::F64
+    } else {
+        ValueType::I64
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaseType {
+    column_type: ValueType,
+    mixed: bool,
+}
+
+fn common_case_branch_type(branch_types: Vec<ValueType>) -> Option<CaseType> {
+    let first = branch_types.first()?.clone();
+    if branch_types.iter().all(|column_type| column_type == &first) {
+        Some(CaseType {
+            column_type: first,
+            mixed: false,
+        })
+    } else {
+        Some(CaseType {
+            column_type: ValueType::String,
+            mixed: true,
+        })
     }
 }
 
@@ -1224,5 +1374,195 @@ mod tests {
             }]
         );
         assert_eq!(project.queries[0].sql, "select name as name from users");
+    }
+
+    #[test]
+    fn case_with_int_literals_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 1 else 0 end as registered from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "registered".to_string(),
+                field_name: "registered".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_string_literals_returns_string_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 'yes' else 'no' end as label from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "label".to_string(),
+                field_name: "label".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_without_else_returns_nullable_branch_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 1 end as maybe_val from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "maybe_val".to_string(),
+                field_name: "maybe_val".to_string(),
+                column_type: ValueType::I64,
+                nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_null_branch_returns_nullable_branch_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 1 else null end as maybe_val from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "maybe_val".to_string(),
+                field_name: "maybe_val".to_string(),
+                column_type: ValueType::I64,
+                nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_mixed_branch_types_falls_back_to_nullable_string() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 1 else 'a' end as mixed from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "mixed".to_string(),
+                field_name: "mixed".to_string(),
+                column_type: ValueType::String,
+                nullable: true,
+            }]
+        );
     }
 }
