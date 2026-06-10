@@ -7766,6 +7766,64 @@ mod tests {
     }
 
     #[test]
+    fn case_with_exists_condition_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table seasons (
+                id integer primary key,
+                name text not null
+            );
+            create table events (
+                id integer primary key,
+                season_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("seasons/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_seasons.sql"),
+            "
+            select
+              case
+                when exists(select 1 from events where events.season_id = seasons.id)
+                then 1
+                else 0
+              end as registered
+            from seasons
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "registered".to_string(),
+                field_name: "registered".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn case_with_string_literals_returns_string_non_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -7780,6 +7838,45 @@ mod tests {
         fs::write(
             sql_dir.join("list_things.sql"),
             "select case when active then 'yes' else 'no' end as label from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "label".to_string(),
+                field_name: "label".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_string_literals_containing_end_returns_string_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 'THE END' else 'no END here' end as label from t",
         )
         .unwrap();
 
