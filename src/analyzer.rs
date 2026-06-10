@@ -4016,6 +4016,44 @@ mod tests {
     }
 
     #[test]
+    fn infers_not_like_parameter_type_from_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id from users where name not like ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn keeps_like_concat_parameter_as_text() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -4959,6 +4997,47 @@ mod tests {
     }
 
     #[test]
+    fn cross_join_keeps_result_columns_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table a (id integer primary key, val_a text not null);
+            create table b (id integer primary key, val_b text not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select a.id, b.id as b_id from a cross join b",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("id", false), ("b_id", false)]);
+    }
+
+    #[test]
     fn chained_left_joins_mark_each_right_side_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -5072,6 +5151,57 @@ mod tests {
         fs::write(
             sql_dir.join("list_things.sql"),
             "select a.id, a.val_a from a natural join b",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "val_a".to_string(),
+                    field_name: "val_a".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn natural_left_join_uses_origin_metadata_and_left_side_nullability() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table a (id integer primary key, val_a text not null);
+            create table b (id integer primary key, val_b text not null);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select a.id, a.val_a from a natural left join b",
         )
         .unwrap();
 
