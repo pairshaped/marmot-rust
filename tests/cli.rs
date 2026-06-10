@@ -211,6 +211,183 @@ output = "{}"
 }
 
 #[test]
+fn generate_command_uses_named_database_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("db/app.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    create_users_database(&database, "app_name");
+
+    let sql_dir = dir.path().join("src/sql/app");
+    fs::create_dir_all(&sql_dir).unwrap();
+    fs::write(
+        sql_dir.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot.databases.app]
+path = "{}"
+sql_dir = "{}"
+output = "{}"
+"#,
+            database.display(),
+            sql_dir.display(),
+            dir.path().join("generated/sql/app").display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--config")
+        .arg(&config)
+        .arg("generate")
+        .arg("--database-name")
+        .arg("app")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("generated/sql/app/sql.rs").exists());
+}
+
+#[test]
+fn generate_command_runs_all_named_database_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/app.sqlite"), "app_name");
+    let analytics = Connection::open(dir.path().join("db/analytics.sqlite")).unwrap();
+    analytics
+        .execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                title text not null
+            );
+            ",
+        )
+        .unwrap();
+    drop(analytics);
+
+    let app_sql = dir.path().join("src/sql/app");
+    let analytics_sql = dir.path().join("src/sql/analytics");
+    fs::create_dir_all(&app_sql).unwrap();
+    fs::create_dir_all(&analytics_sql).unwrap();
+    fs::write(
+        app_sql.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        analytics_sql.join("list_events.sql"),
+        "select id, title from events",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[[tools.marmot.databases]]
+name = "app"
+
+[[tools.marmot.databases]]
+name = "analytics"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/app/sql.rs").exists());
+    assert!(
+        dir.path()
+            .join("src/generated/sql/analytics/sql.rs")
+            .exists()
+    );
+}
+
+#[test]
+fn inspect_command_runs_all_named_database_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/app.sqlite"), "app_name");
+    let analytics = Connection::open(dir.path().join("db/analytics.sqlite")).unwrap();
+    analytics
+        .execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                title text not null
+            );
+            ",
+        )
+        .unwrap();
+    drop(analytics);
+
+    let app_sql = dir.path().join("src/sql/app");
+    let analytics_sql = dir.path().join("src/sql/analytics");
+    fs::create_dir_all(&app_sql).unwrap();
+    fs::create_dir_all(&analytics_sql).unwrap();
+    fs::write(
+        app_sql.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        analytics_sql.join("list_events.sql"),
+        "select id, title from events",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[[tools.marmot.databases]]
+name = "app"
+
+[[tools.marmot.databases]]
+name = "analytics"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("inspect")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("sql::find_user params=1 columns=2"));
+    assert!(stdout.contains("sql::list_events params=0 columns=2"));
+}
+
+#[test]
 fn seed_command_runs_seed_files() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.db");
@@ -252,6 +429,170 @@ fn seed_command_runs_seed_files() {
         .query_row("select count(*) from users", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn seed_command_runs_all_named_database_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db/seeds/app")).unwrap();
+    fs::create_dir_all(dir.path().join("db/seeds/analytics")).unwrap();
+    fs::write(
+        dir.path().join("db/seeds/app/001_create_app_table.sql"),
+        "create table app_table (id integer primary key)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path()
+            .join("db/seeds/analytics/001_create_analytics_table.sql"),
+        "create table analytics_table (id integer primary key)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.app]
+path = "db/app.db"
+seeds_dir = "db/seeds/app"
+
+[tools.marmot.databases.analytics]
+path = "db/analytics.db"
+seeds_dir = "db/seeds/analytics"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("seed")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "seed failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Ran 001_create_analytics_table\nRan 001_create_app_table\n"
+    );
+
+    let app = Connection::open(dir.path().join("db/app.db")).unwrap();
+    assert!(table_names(&app).contains(&"app_table".to_string()));
+    let analytics = Connection::open(dir.path().join("db/analytics.db")).unwrap();
+    assert!(table_names(&analytics).contains(&"analytics_table".to_string()));
+}
+
+#[test]
+fn migrate_command_runs_all_named_database_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db/migrations/app")).unwrap();
+    fs::create_dir_all(dir.path().join("db/migrations/analytics")).unwrap();
+    fs::write(
+        dir.path()
+            .join("db/migrations/app/001_create_app_table.sql"),
+        "create table app_table (id integer primary key)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path()
+            .join("db/migrations/analytics/001_create_analytics_table.sql"),
+        "create table analytics_table (id integer primary key)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.app]
+path = "db/app.db"
+migrations_dir = "db/migrations/app"
+
+[tools.marmot.databases.analytics]
+path = "db/analytics.db"
+migrations_dir = "db/migrations/analytics"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("migrate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "migrate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Applied 001_create_analytics_table\nApplied 001_create_app_table\n"
+    );
+
+    let app = Connection::open(dir.path().join("db/app.db")).unwrap();
+    assert!(table_names(&app).contains(&"app_table".to_string()));
+    let analytics = Connection::open(dir.path().join("db/analytics.db")).unwrap();
+    assert!(table_names(&analytics).contains(&"analytics_table".to_string()));
+}
+
+#[test]
+fn generate_command_rejects_unknown_database_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.app]
+path = "db/app.db"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database-name")
+        .arg("missing")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown database name missing"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generate_command_rejects_mixed_top_level_and_named_database_config() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+database = "db/app.db"
+
+[tools.marmot.databases.analytics]
+path = "db/analytics.db"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mixed database configuration"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -304,6 +645,55 @@ fn reset_command_drops_database_then_runs_migrations_and_seeds() {
     let conn = Connection::open(&database).unwrap();
     let tables = table_names(&conn);
     assert_eq!(tables, ["schema_migrations", "users"]);
+    let name: String = conn
+        .query_row("select name from users", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(name, "Lucy");
+}
+
+#[test]
+fn reset_command_uses_named_database_config() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db/migrations/curling")).unwrap();
+    fs::create_dir_all(dir.path().join("db/seeds/curling")).unwrap();
+    fs::write(
+        dir.path()
+            .join("db/migrations/curling/001_create_users.sql"),
+        "create table users (id integer primary key, name text not null)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("db/seeds/curling/001_add_lucy.sql"),
+        "insert into users (id, name) values (1, 'Lucy')",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot.databases.curling]
+path = "db/curling.db"
+migrations_dir = "db/migrations/curling"
+seeds_dir = "db/seeds/curling"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("reset")
+        .arg("--database-name")
+        .arg("curling")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "reset failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = Connection::open(dir.path().join("db/curling.db")).unwrap();
     let name: String = conn
         .query_row("select name from users", [], |row| row.get(0))
         .unwrap();

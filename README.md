@@ -40,8 +40,9 @@ It currently:
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
 - emits typed direct `rusqlite` functions using `prepare_cached`
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
+- supports named database references for multi-database projects
 
-The remaining work is deeper SQL coverage and polish around project configuration, diagnostics, and edge-case inference.
+The remaining work is deeper SQL coverage and polish around diagnostics and edge-case inference.
 
 ## Usage
 
@@ -64,6 +65,26 @@ seeds_dir = "db/seeds"
 ```
 
 Use another config path with `--config path/to/marmot.toml`. CLI flags override config values.
+
+Multi-database projects can use named references:
+
+```toml
+[tools.marmot.databases.app]
+path = "db/app.sqlite"
+sql_dir = "src/sql/app"
+output = "src/generated/sql/app"
+migrations_dir = "db/migrations/app"
+seeds_dir = "db/seeds/app"
+
+[tools.marmot.databases.analytics]
+path = "db/analytics.sqlite"
+sql_dir = "src/sql/analytics"
+output = "src/generated/sql/analytics"
+migrations_dir = "db/migrations/analytics"
+seeds_dir = "db/seeds/analytics"
+```
+
+Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/sql/NAME`, `src/generated/sql/NAME`, `db/migrations/NAME`, and `db/seeds/NAME`.
 
 Generate Rust files:
 
