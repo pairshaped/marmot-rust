@@ -24,13 +24,7 @@ pub fn emit(config: &Config, project: &Project) -> Result<()> {
         let path = config.output.join(format!("{module}.rs"));
         let content = render_module(queries)?;
         if config.check {
-            let current = fs::read_to_string(&path).map_err(|source| Error::ReadFile {
-                path: path.clone(),
-                source,
-            })?;
-            if current != content {
-                return Err(Error::StaleGeneratedFile { path });
-            }
+            ensure_file_current(&path, &content)?;
             continue;
         }
         fs::write(&path, content).map_err(|source| Error::WriteFile {
@@ -50,13 +44,7 @@ fn emit_mod_rs(config: &Config, modules: Vec<&str>) -> Result<()> {
         .collect::<String>();
 
     if config.check {
-        let current = fs::read_to_string(&path).map_err(|source| Error::ReadFile {
-            path: path.clone(),
-            source,
-        })?;
-        if current != content {
-            return Err(Error::StaleGeneratedFile { path });
-        }
+        ensure_file_current(&path, &content)?;
         return Ok(());
     }
 
@@ -64,6 +52,24 @@ fn emit_mod_rs(config: &Config, modules: Vec<&str>) -> Result<()> {
         path: path.clone(),
         source,
     })
+}
+
+fn ensure_file_current(path: &std::path::Path, content: &str) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(current) if current == content => Ok(()),
+        Ok(_) => Err(Error::StaleGeneratedFile {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::StaleGeneratedFile {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(Error::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn render_module(queries: Vec<&Query>) -> Result<String> {
@@ -419,6 +425,61 @@ mod tests {
         let output = render_query(&query, true);
 
         assert!(output.contains("r##\"select 'it''s fine', \"quoted\", r#\"raw\"#\"##"));
+    }
+
+    #[test]
+    fn emit_check_reports_missing_or_changed_files_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("src/generated/sql");
+        let project = Project {
+            queries: vec![Query {
+                source_path: PathBuf::from("src/users/sql/list_users.sql"),
+                module_name: "users_sql".to_string(),
+                name: "list_users".to_string(),
+                return_type: ReturnType::Rows { row_type: None },
+                sql: "select id, name from users".to_string(),
+                parameters: vec![],
+                columns: vec![
+                    Column {
+                        name: "id".to_string(),
+                        field_name: "id".to_string(),
+                        column_type: ValueType::I64,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        field_name: "name".to_string(),
+                        column_type: ValueType::String,
+                        nullable: false,
+                    },
+                ],
+            }],
+        };
+        let check_config = Config {
+            database: dir.path().join("app.sqlite3"),
+            source_root: dir.path().join("src"),
+            output: output.clone(),
+            target: crate::config::Target::Rust,
+            check: true,
+        };
+
+        assert!(matches!(
+            emit(&check_config, &project),
+            Err(Error::StaleGeneratedFile { .. })
+        ));
+
+        let write_config = Config {
+            check: false,
+            ..check_config.clone()
+        };
+        emit(&write_config, &project).unwrap();
+        emit(&check_config, &project).unwrap();
+
+        fs::write(output.join("users_sql.rs"), "stale").unwrap();
+        assert!(matches!(
+            emit(&check_config, &project),
+            Err(Error::StaleGeneratedFile { .. })
+        ));
     }
 
     #[test]
