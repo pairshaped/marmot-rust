@@ -75,6 +75,7 @@ impl Schema {
 struct SchemaColumn {
     declared_type: String,
     nullable: bool,
+    primary_key: bool,
 }
 
 fn load_schema(conn: &Connection) -> Result<Schema> {
@@ -119,6 +120,7 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
                     SchemaColumn {
                         declared_type,
                         nullable: notnull == 0 && primary_key == 0,
+                        primary_key: primary_key != 0,
                     },
                 ))
             })
@@ -249,20 +251,17 @@ fn insert_parameter_inferences(
     let Some(insert_index) = top_level_keyword(tokens, "INSERT") else {
         return inferences;
     };
-    if !tokens
-        .get(insert_index + 1)
-        .is_some_and(|token| token_is_word(token, "INTO"))
-    {
-        return inferences;
-    }
-    let Some(table) = tokens.get(insert_index + 2).and_then(table_name_from_token) else {
+    let Some(into_index) = insert_into_index(tokens, insert_index) else {
         return inferences;
     };
-    let Some(Token::OpenParen) = tokens.get(insert_index + 3) else {
+    let Some(table) = tokens.get(into_index + 1).and_then(table_name_from_token) else {
+        return inferences;
+    };
+    let Some(Token::OpenParen) = tokens.get(into_index + 2) else {
         return inferences;
     };
 
-    let (column_tokens, after_columns) = collect_balanced_parens(tokens, insert_index + 3);
+    let (column_tokens, after_columns) = collect_balanced_parens(tokens, into_index + 2);
     let columns = split_top_level_commas(column_tokens)
         .into_iter()
         .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
@@ -294,7 +293,7 @@ fn insert_parameter_inferences(
                     key,
                     ParameterInference {
                         column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
-                        nullable: schema_column.nullable,
+                        nullable: schema_column.nullable || schema_column.primary_key,
                     },
                 );
             }
@@ -302,6 +301,38 @@ fn insert_parameter_inferences(
     }
 
     inferences
+}
+
+fn insert_into_index(tokens: &[Token], insert_index: usize) -> Option<usize> {
+    if tokens
+        .get(insert_index + 1)
+        .is_some_and(|token| token_is_word(token, "INTO"))
+    {
+        return Some(insert_index + 1);
+    }
+
+    let has_conflict_action = tokens
+        .get(insert_index + 1)
+        .is_some_and(|token| token_is_word(token, "OR"))
+        && tokens.get(insert_index + 2).is_some_and(|token| {
+            matches!(
+                identifier_from_token(token).map(|word| word.to_ascii_uppercase()),
+                Some(action)
+                    if matches!(
+                        action.as_str(),
+                        "ABORT" | "FAIL" | "IGNORE" | "REPLACE" | "ROLLBACK"
+                    )
+            )
+        });
+    if has_conflict_action
+        && tokens
+            .get(insert_index + 3)
+            .is_some_and(|token| token_is_word(token, "INTO"))
+    {
+        return Some(insert_index + 3);
+    }
+
+    None
 }
 
 fn cast_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
@@ -1797,6 +1828,61 @@ mod tests {
                 ("username", ValueType::String, false),
                 ("bio", ValueType::String, true),
                 ("created_at", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_insert_or_replace_parameter_types_and_primary_key_nullability() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("replace_user.sql"),
+            "insert or replace into users (id, name) values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::String, false),
             ]
         );
     }
