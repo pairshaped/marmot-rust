@@ -53,6 +53,14 @@ pub enum Error {
         source: rusqlite::Error,
     },
 
+    #[error("insert values count mismatch in {path}: expected {expected}, got {got} in row {row}")]
+    InsertValuesCountMismatch {
+        path: PathBuf,
+        expected: usize,
+        got: usize,
+        row: usize,
+    },
+
     #[error("duplicate result column names in {path}: {columns:?}")]
     DuplicateColumns { path: PathBuf, columns: Vec<String> },
 

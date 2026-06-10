@@ -36,6 +36,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
                 reason,
             })?;
         let sqlite_sql = strip_nullability_overrides(&sql);
+        validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
         let parameters = parameters(&sqlite_sql, &schema);
         let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
         let return_type = if columns.is_empty() {
@@ -64,6 +65,10 @@ struct Schema {
 }
 
 impl Schema {
+    fn has_table(&self, table: &str) -> bool {
+        self.tables.contains_key(&table.to_ascii_lowercase())
+    }
+
     fn column(&self, table: &str, column: &str) -> Option<&SchemaColumn> {
         self.tables
             .get(&table.to_ascii_lowercase())
@@ -171,6 +176,49 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
     }
 
     Ok(schema)
+}
+
+fn validate_insert_values_counts(sql: &str, schema: &Schema, path: &std::path::Path) -> Result<()> {
+    let tokens = tokenize(sql);
+    let Some((table, columns, values_index)) = insert_values_shape(&tokens, schema) else {
+        return Ok(());
+    };
+    if !schema.has_table(&table) {
+        return Ok(());
+    }
+
+    let expected = columns.len();
+    for (row_index, row) in values_rows(&tokens, values_index + 1)
+        .into_iter()
+        .enumerate()
+    {
+        let got = split_top_level_commas(row).len();
+        if got != expected {
+            return Err(Error::InsertValuesCountMismatch {
+                path: path.to_path_buf(),
+                expected,
+                got,
+                row: row_index + 1,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_values_shape(tokens: &[Token], schema: &Schema) -> Option<(String, Vec<String>, usize)> {
+    let into_index = insert_or_replace_into_index(tokens)?;
+    let table = tokens
+        .get(into_index + 1)
+        .and_then(table_name_from_token)?
+        .to_string();
+    let (columns, after_target) = insert_target_columns(tokens, schema, &table, into_index);
+    let values_index = tokens
+        .iter()
+        .enumerate()
+        .skip(after_target)
+        .find_map(|(index, token)| token_is_word(token, "VALUES").then_some(index))?;
+    Some((table, columns, values_index))
 }
 
 fn table_without_rowid(conn: &Connection, table_name: &str) -> Result<bool> {
@@ -305,17 +353,7 @@ fn insert_parameter_inferences(
         return inferences;
     };
 
-    let (columns, after_target) = if matches!(tokens.get(into_index + 2), Some(Token::OpenParen)) {
-        let (column_tokens, after_columns) = collect_balanced_parens(tokens, into_index + 2);
-        let columns = split_top_level_commas(column_tokens)
-            .into_iter()
-            .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        (columns, after_columns)
-    } else {
-        (schema.column_names_in_table_order(table), into_index + 2)
-    };
+    let (columns, after_target) = insert_target_columns(tokens, schema, table, into_index);
 
     let Some(values_index) = tokens
         .iter()
@@ -352,6 +390,25 @@ fn insert_parameter_inferences(
     }
 
     inferences
+}
+
+fn insert_target_columns(
+    tokens: &[Token],
+    schema: &Schema,
+    table: &str,
+    into_index: usize,
+) -> (Vec<String>, usize) {
+    if matches!(tokens.get(into_index + 2), Some(Token::OpenParen)) {
+        let (column_tokens, after_columns) = collect_balanced_parens(tokens, into_index + 2);
+        let columns = split_top_level_commas(column_tokens)
+            .into_iter()
+            .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        (columns, after_columns)
+    } else {
+        (schema.column_names_in_table_order(table), into_index + 2)
+    }
 }
 
 fn values_rows(tokens: &[Token], mut index: usize) -> Vec<&[Token]> {
@@ -2583,6 +2640,121 @@ mod tests {
                 ("param_2", ValueType::I64, true),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_insert_values_count_mismatch_with_row_number() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer,
+                label text
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_events.sql"),
+            "insert into events values (?, ?), (?)",
+        )
+        .unwrap();
+
+        let result = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::InsertValuesCountMismatch {
+                expected: 2,
+                got: 1,
+                row: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_explicit_insert_values_count_mismatch() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer,
+                label text,
+                created_at integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_events.sql"),
+            "insert into events (id, label) values (?, ?, ?)",
+        )
+        .unwrap();
+
+        let result = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::InsertValuesCountMismatch {
+                expected: 2,
+                got: 3,
+                row: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_insert_target_table_falls_through_to_prepare_error() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        Connection::open(&database).unwrap();
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_events.sql"),
+            "insert into missing values (?)",
+        )
+        .unwrap();
+
+        let result = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        });
+
+        assert!(matches!(result, Err(Error::PrepareSql { .. })));
     }
 
     #[test]
