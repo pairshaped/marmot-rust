@@ -1026,6 +1026,12 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
     {
         return infer_case_expression(tokens);
     }
+    if tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "CAST"))
+    {
+        return infer_cast_expression(tokens);
+    }
 
     let function_name = match (tokens.first(), tokens.get(1)) {
         (Some(Token::Word(name)), Some(Token::OpenParen)) => name,
@@ -1051,6 +1057,36 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
         }),
         _ => None,
     }
+}
+
+fn infer_cast_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+    if !matches!(tokens.get(1), Some(Token::OpenParen)) {
+        return None;
+    }
+    let (inside, _) = collect_balanced_parens(tokens, 1);
+    let as_index = top_level_as_index(inside)?;
+    let declared_type = inside.get(as_index + 1).and_then(identifier_from_token)?;
+
+    Some(ExpressionInference {
+        column_type: Some(ValueType::from_sqlite_type(declared_type)),
+        inferred_nullable: Some(false),
+        nullable_override: None,
+    })
+}
+
+fn top_level_as_index(tokens: &[Token]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn infer_case_expression(tokens: &[Token]) -> Option<ExpressionInference> {
@@ -2319,6 +2355,134 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("total", ValueType::F64, true)]);
+    }
+
+    #[test]
+    fn cast_count_as_integer_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("count_things.sql"),
+            "select cast(count(*) as integer) as count from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "count".to_string(),
+                field_name: "count".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn cast_coalesce_sum_as_integer_returns_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                amount_cents integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("sum_things.sql"),
+            "select cast(coalesce(sum(amount_cents), 0) as integer) as total from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "total".to_string(),
+                field_name: "total".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_cast_returns_outer_cast_type_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val real not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("convert_things.sql"),
+            "select cast(cast(val as integer) as text) as converted from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "converted".to_string(),
+                field_name: "converted".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
     }
 
     #[test]
