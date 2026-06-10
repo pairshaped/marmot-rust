@@ -248,10 +248,7 @@ fn insert_parameter_inferences(
     schema: &Schema,
 ) -> BTreeMap<String, ParameterInference> {
     let mut inferences = BTreeMap::new();
-    let Some(insert_index) = top_level_keyword(tokens, "INSERT") else {
-        return inferences;
-    };
-    let Some(into_index) = insert_into_index(tokens, insert_index) else {
+    let Some(into_index) = insert_or_replace_into_index(tokens) else {
         return inferences;
     };
     let Some(table) = tokens.get(into_index + 1).and_then(table_name_from_token) else {
@@ -301,6 +298,23 @@ fn insert_parameter_inferences(
     }
 
     inferences
+}
+
+fn insert_or_replace_into_index(tokens: &[Token]) -> Option<usize> {
+    if let Some(insert_index) = top_level_keyword(tokens, "INSERT") {
+        return insert_into_index(tokens, insert_index);
+    }
+
+    if let Some(replace_index) = top_level_keyword(tokens, "REPLACE") {
+        if tokens
+            .get(replace_index + 1)
+            .is_some_and(|token| token_is_word(token, "INTO"))
+        {
+            return Some(replace_index + 1);
+        }
+    }
+
+    None
 }
 
 fn insert_into_index(tokens: &[Token], insert_index: usize) -> Option<usize> {
@@ -1854,6 +1868,61 @@ mod tests {
         fs::write(
             sql_dir.join("replace_user.sql"),
             "insert or replace into users (id, name) values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("param", ValueType::I64, true),
+                ("param_2", ValueType::String, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_replace_into_parameter_types_like_insert() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("replace_user.sql"),
+            "replace into users (id, name) values (?, ?)",
         )
         .unwrap();
 
