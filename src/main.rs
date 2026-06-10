@@ -123,7 +123,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Generate(args) => {
             let mut analyzed = Vec::new();
-            for config in configs(args, &file_config)? {
+            let configs = configs(args, &file_config)?;
+            for config in &configs {
+                validate_output_under_source_root(&config.source_root, &config.output)?;
+            }
+            for config in configs {
                 let project = analyze_project(&config)?;
                 analyzed.push((config, project));
             }
@@ -225,7 +229,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
     let target = args.target;
     let check = args.check;
 
-    let configs = targets
+    Ok(targets
         .into_iter()
         .map(|database_target| Config {
             database: database_target.database,
@@ -238,13 +242,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
             target,
             check,
         })
-        .collect::<Vec<_>>();
-
-    for config in &configs {
-        validate_output_under_source_root(&config.source_root, &config.output)?;
-    }
-
-    Ok(configs)
+        .collect())
 }
 
 #[derive(Debug)]

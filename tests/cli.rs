@@ -967,6 +967,38 @@ name = "analytics"
 }
 
 #[test]
+fn inspect_command_does_not_validate_generated_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    let output_dir = dir.path().join("generated/sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("inspect")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_dir.exists());
+}
+
+#[test]
 fn seed_command_runs_seed_files() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.db");
