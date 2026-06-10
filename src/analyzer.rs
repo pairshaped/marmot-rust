@@ -1261,7 +1261,7 @@ fn result_columns(
     let mut duplicate_field_names = BTreeSet::new();
     let mut columns = Vec::new();
     let metadata = stmt.columns_with_metadata();
-    let nullable_tables = left_join_nullable_tables(sql);
+    let nullable_tables = outer_join_nullable_tables(sql);
     let expression_inferences = select_expression_inferences(sql, schema, &nullable_tables);
 
     for index in 0..stmt.column_count() {
@@ -1325,44 +1325,78 @@ fn result_columns(
     Ok(columns)
 }
 
-fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
+fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
     let tokens = tokenize(sql);
     let mut aliases = BTreeMap::new();
     let mut nullable_tables = BTreeSet::new();
+    let mut joined_tables = BTreeSet::new();
     let mut index = 0;
 
     while index < tokens.len() {
-        if !token_is_word(&tokens[index], "LEFT") {
+        if token_is_word(&tokens[index], "FROM") {
+            register_joined_table(&tokens, index + 1, &mut aliases, &mut joined_tables);
             index += 1;
             continue;
         }
 
-        let mut join_index = index + 1;
-        if tokens
-            .get(join_index)
-            .is_some_and(|token| token_is_word(token, "OUTER"))
-        {
-            join_index += 1;
-        }
-
-        if !tokens
-            .get(join_index)
-            .is_some_and(|token| token_is_word(token, "JOIN"))
-        {
+        if token_is_word(&tokens[index], "JOIN") {
+            register_joined_table(&tokens, index + 1, &mut aliases, &mut joined_tables);
             index += 1;
             continue;
         }
 
-        if let Some(table_name) = tokens.get(join_index + 1).and_then(table_name_from_token) {
-            let table_name = table_name.to_ascii_lowercase();
-            nullable_tables.insert(table_name.clone());
-            if let Some(alias) = table_alias_after_join(&tokens, join_index + 2) {
-                aliases.insert(alias.to_ascii_lowercase(), table_name.clone());
+        if token_is_word(&tokens[index], "LEFT") {
+            let mut join_index = index + 1;
+            if tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "OUTER"))
+            {
+                join_index += 1;
             }
-            aliases.insert(table_name.clone(), table_name);
+
+            if !tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "JOIN"))
+            {
+                index += 1;
+                continue;
+            }
+
+            if let Some(table_name) =
+                register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables)
+            {
+                nullable_tables.insert(table_name);
+            }
+
+            index = join_index + 1;
+            continue;
         }
 
-        index = join_index + 1;
+        if token_is_word(&tokens[index], "RIGHT") {
+            let mut join_index = index + 1;
+            if tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "OUTER"))
+            {
+                join_index += 1;
+            }
+
+            if !tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "JOIN"))
+            {
+                index += 1;
+                continue;
+            }
+
+            nullable_tables.extend(joined_tables.iter().cloned());
+            register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables);
+
+            index = join_index + 1;
+            continue;
+        }
+
+        index += 1;
     }
 
     for table in where_null_rejected_tables(&tokens, &aliases) {
@@ -1370,6 +1404,24 @@ fn left_join_nullable_tables(sql: &str) -> BTreeSet<String> {
     }
 
     nullable_tables
+}
+
+fn register_joined_table(
+    tokens: &[Token],
+    table_index: usize,
+    aliases: &mut BTreeMap<String, String>,
+    joined_tables: &mut BTreeSet<String>,
+) -> Option<String> {
+    let table_name = tokens
+        .get(table_index)
+        .and_then(table_name_from_token)?
+        .to_ascii_lowercase();
+    aliases.insert(table_name.clone(), table_name.clone());
+    if let Some(alias) = table_alias_after_join(tokens, table_index + 1) {
+        aliases.insert(alias.to_ascii_lowercase(), table_name.clone());
+    }
+    joined_tables.insert(table_name.clone());
+    Some(table_name)
 }
 
 fn table_alias_after_join(tokens: &[Token], mut index: usize) -> Option<&str> {
@@ -4135,6 +4187,58 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("id", false), ("name", false), ("bio", true)]);
+    }
+
+    #[test]
+    fn right_join_marks_left_side_result_columns_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                org_id integer not null,
+                name text not null
+            );
+            create table orgs (
+                id integer primary key,
+                org_name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_org_users.sql"),
+            "
+            select u.id, o.org_name
+            from users u
+            right join orgs o on u.org_id = o.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("id", true), ("org_name", false)]);
     }
 
     #[test]
