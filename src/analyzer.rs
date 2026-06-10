@@ -3486,6 +3486,120 @@ mod tests {
     }
 
     #[test]
+    fn infers_insert_conflict_action_variants_like_insert() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_ignore.sql"),
+            "insert or ignore into users (id, name) values (?, ?)",
+        )
+        .unwrap();
+        fs::write(
+            sql_dir.join("insert_fail.sql"),
+            "insert or fail into users (id, name) values (?, ?)",
+        )
+        .unwrap();
+        fs::write(
+            sql_dir.join("insert_rollback.sql"),
+            "insert or rollback into users (id, name) values (?, ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        for query_name in ["insert_fail", "insert_ignore", "insert_rollback"] {
+            let query = project
+                .queries
+                .iter()
+                .find(|query| query.name == query_name)
+                .unwrap();
+            assert!(matches!(query.return_type, ReturnType::Execute));
+            assert_eq!(
+                query.parameters,
+                [
+                    Parameter {
+                        name: "param".to_string(),
+                        sql_names: vec![],
+                        column_type: ValueType::I64,
+                        nullable: true,
+                    },
+                    Parameter {
+                        name: "param_2".to_string(),
+                        sql_names: vec![],
+                        column_type: ValueType::String,
+                        nullable: false,
+                    },
+                ],
+                "{query_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn analyzes_insert_default_values_as_execute_without_parameters() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                name text not null default 'untitled'
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("create_event.sql"),
+            "insert into events default values",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            project.queries[0].return_type,
+            ReturnType::Execute
+        ));
+        assert!(project.queries[0].parameters.is_empty());
+        assert!(project.queries[0].columns.is_empty());
+    }
+
+    #[test]
     fn infers_replace_into_parameter_types_like_insert() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
