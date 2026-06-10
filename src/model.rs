@@ -158,7 +158,68 @@ pub fn sanitize_identifier(name: &str) -> String {
         cleaned.insert(0, '_');
     }
 
+    if is_rust_reserved_word(&cleaned) {
+        cleaned.push('_');
+    }
+
     cleaned
+}
+
+fn is_rust_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+            | "union"
+            | "gen"
+    )
 }
 
 pub fn query_name_from_filename(filename: &str) -> Option<String> {
@@ -281,6 +342,15 @@ mod tests {
         assert_eq!(sanitize_identifier("voila"), "voila");
         assert_eq!(sanitize_identifier("voila!"), "voila");
         assert_eq!(sanitize_identifier("voilà"), "voil");
+    }
+
+    #[test]
+    fn sanitizes_rust_reserved_words() {
+        assert_eq!(sanitize_identifier("type"), "type_");
+        assert_eq!(sanitize_identifier("let"), "let_");
+        assert_eq!(sanitize_identifier("fn"), "fn_");
+        assert_eq!(sanitize_identifier("use"), "use_");
+        assert_eq!(sanitize_identifier("match"), "match_");
     }
 
     #[test]

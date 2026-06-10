@@ -289,7 +289,7 @@ fn add_named_parameter(
     sql_name: &str,
     inference: ParameterInference,
 ) {
-    let name = raw_name.to_snake_case();
+    let name = sanitize_identifier(&raw_name.to_snake_case());
     let sql_name = sql_name.to_string();
     if let Some(param) = params.iter_mut().find(|param| param.name == name) {
         if !param.sql_names.contains(&sql_name) {
@@ -2592,6 +2592,51 @@ mod tests {
             [Parameter {
                 name: "order_id".to_string(),
                 sql_names: vec!["@order_id".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn sanitizes_reserved_words_in_named_parameters() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            r#"
+            create table things (
+                id integer primary key,
+                "type" text not null
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_by_type.sql"),
+            r#"select id from things where "type" = @type"#,
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "type_".to_string(),
+                sql_names: vec!["@type".to_string()],
                 column_type: ValueType::String,
                 nullable: false,
             }]
