@@ -5,7 +5,7 @@ use heck::ToPascalCase;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{Column, Project, Query, ReturnType};
+use crate::model::{Project, Query, ReturnType};
 
 pub fn emit(config: &Config, project: &Project) -> Result<()> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
@@ -262,7 +262,7 @@ fn render_import_macros(queries: &[&Query]) -> String {
     }
 }
 fn validate_shared_row_types(queries: &[&Query]) -> Result<()> {
-    let mut shared_rows: BTreeMap<&str, &[Column]> = BTreeMap::new();
+    let mut shared_rows: BTreeMap<&str, &Query> = BTreeMap::new();
     for query in queries {
         let ReturnType::Rows {
             row_type: Some(row_type),
@@ -271,14 +271,18 @@ fn validate_shared_row_types(queries: &[&Query]) -> Result<()> {
             continue;
         };
 
-        if let Some(existing_columns) = shared_rows.get(row_type.as_str()) {
-            if *existing_columns != query.columns.as_slice() {
+        if let Some(existing_query) = shared_rows.get(row_type.as_str()) {
+            if existing_query.columns != query.columns {
                 return Err(Error::SharedRowTypeMismatch {
                     row_type: row_type.clone(),
+                    paths: vec![
+                        existing_query.source_path.clone(),
+                        query.source_path.clone(),
+                    ],
                 });
             }
         } else {
-            shared_rows.insert(row_type, query.columns.as_slice());
+            shared_rows.insert(row_type, query);
         }
     }
 
@@ -1099,9 +1103,10 @@ mod tests {
 
         let result = render_module(vec![&query_1, &query_2]);
 
-        assert!(matches!(
-            result,
-            Err(Error::SharedRowTypeMismatch { row_type }) if row_type == "OrgRow"
-        ));
+        let message = result.unwrap_err().to_string();
+
+        assert!(message.contains("OrgRow"));
+        assert!(message.contains("src/orgs/sql/find_org.sql"));
+        assert!(message.contains("src/orgs/sql/list_orgs.sql"));
     }
 }

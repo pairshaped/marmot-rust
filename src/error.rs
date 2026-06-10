@@ -73,6 +73,7 @@ pub enum Error {
 
     SharedRowTypeMismatch {
         row_type: String,
+        paths: Vec<PathBuf>,
     },
 
     DuplicateQueryNames {
@@ -168,8 +169,12 @@ impl std::fmt::Display for Error {
                     path.display()
                 )
             }
-            Self::SharedRowTypeMismatch { row_type } => {
-                write!(f, "shared row type {row_type} has mismatched column shapes")
+            Self::SharedRowTypeMismatch { row_type, paths } => {
+                write!(f, "shared row type {row_type} has mismatched column shapes")?;
+                for path in paths {
+                    write!(f, "\n  {}", path.display())?;
+                }
+                Ok(())
             }
             Self::DuplicateQueryNames { names } => {
                 write!(f, "duplicate generated query names: {names:?}")
