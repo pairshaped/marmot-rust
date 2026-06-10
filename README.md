@@ -51,6 +51,20 @@ Inspect discovered queries:
 cargo run -- inspect --database path/to/app.db --source-root path/to/src
 ```
 
+Project defaults can live in `marmot.toml`:
+
+```toml
+[tools.marmot]
+database = "path/to/app.db"
+source_root = "path/to/src"
+sql_dir = "path/to/src/sql"
+output = "path/to/src/generated/sql"
+migrations_dir = "db/migrations"
+seeds_dir = "db/seeds"
+```
+
+Use another config path with `--config path/to/marmot.toml`. CLI flags override config values.
+
 Generate Rust files:
 
 ```sh

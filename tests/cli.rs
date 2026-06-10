@@ -47,6 +47,170 @@ fn migrate_command_applies_migrations() {
 }
 
 #[test]
+fn migrate_command_uses_marmot_toml_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.db");
+    let migrations_dir = dir.path().join("db/migrations/custom");
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::write(
+        migrations_dir.join("001_create_users.sql"),
+        "create table users (id integer primary key)",
+    )
+    .unwrap();
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+migrations_dir = "{}"
+"#,
+            database.display(),
+            migrations_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--config")
+        .arg(&config)
+        .arg("migrate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "migrate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Applied 001_create_users\n"
+    );
+}
+
+#[test]
+fn generate_command_uses_marmot_toml_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table users (
+            id integer primary key,
+            name text not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let users_sql = source_root.join("users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(
+        users_sql.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "{}"
+output = "{}"
+"#,
+            database.display(),
+            source_root.display(),
+            dir.path().join("generated/sql").display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--config")
+        .arg(&config)
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("generated/sql/users_sql.rs").exists());
+}
+
+#[test]
+fn generate_command_cli_flags_override_marmot_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_database = dir.path().join("config.sqlite3");
+    let cli_database = dir.path().join("cli.sqlite3");
+    create_users_database(&config_database, "config_name");
+    create_users_database(&cli_database, "cli_name");
+
+    let config_source_root = dir.path().join("config_src");
+    let cli_source_root = dir.path().join("cli_src");
+    let config_sql = config_source_root.join("users/sql");
+    let cli_sql = cli_source_root.join("users/sql");
+    fs::create_dir_all(&config_sql).unwrap();
+    fs::create_dir_all(&cli_sql).unwrap();
+    fs::write(config_sql.join("from_config.sql"), "select name from users").unwrap();
+    fs::write(cli_sql.join("from_cli.sql"), "select name from users").unwrap();
+
+    let config_output = dir.path().join("config_generated/sql");
+    let cli_output = dir.path().join("cli_generated/sql");
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "{}"
+output = "{}"
+"#,
+            config_database.display(),
+            config_source_root.display(),
+            config_output.display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--config")
+        .arg(&config)
+        .arg("generate")
+        .arg("--database")
+        .arg(&cli_database)
+        .arg("--source-root")
+        .arg(&cli_source_root)
+        .arg("--output")
+        .arg(&cli_output)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!config_output.exists());
+    assert!(cli_output.join("users_sql.rs").exists());
+    let generated = fs::read_to_string(cli_output.join("users_sql.rs")).unwrap();
+    assert!(generated.contains("FROM_CLI_SQL"));
+}
+
+#[test]
 fn seed_command_runs_seed_files() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.db");
@@ -154,4 +318,19 @@ fn table_names(conn: &Connection) -> Vec<String> {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn create_users_database(path: &std::path::Path, name: &str) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "
+        create table users (
+            id integer primary key,
+            name text not null
+        );
+        ",
+    )
+    .unwrap();
+    conn.execute("insert into users (name) values (?1)", [name])
+        .unwrap();
 }
