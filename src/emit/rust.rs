@@ -236,7 +236,7 @@ fn render_params(query: &Query) -> String {
     query
         .parameters
         .iter()
-        .map(|param| format!(", {}: impl rusqlite::ToSql", param.name))
+        .map(|param| format!(", {}: {}", param.name, param.rust_argument_type()))
         .collect()
 }
 
@@ -253,7 +253,7 @@ fn render_named_params(query: &Query) -> String {
         let names = query
             .parameters
             .iter()
-            .map(|param| param.name.as_str())
+            .map(param_binding_expr)
             .collect::<Vec<_>>()
             .join(", ");
         return format!("params![{names}]");
@@ -266,11 +266,24 @@ fn render_named_params(query: &Query) -> String {
             param
                 .sql_names
                 .iter()
-                .map(|sql_name| format!("{sql_name:?}: {}", param.name))
+                .map(|sql_name| format!("{sql_name:?}: {}", param_binding_expr(param)))
         })
         .collect::<Vec<_>>()
         .join(", ");
     format!("named_params! {{ {pairs} }}")
+}
+
+fn param_binding_expr(param: &crate::model::Parameter) -> String {
+    if !param.nullable
+        && matches!(
+            param.column_type,
+            crate::model::ValueType::String | crate::model::ValueType::Bytes
+        )
+    {
+        format!("{}.as_ref()", param.name)
+    } else {
+        param.name.clone()
+    }
 }
 
 fn raw_string(value: &str) -> String {
@@ -326,7 +339,7 @@ mod tests {
         assert!(output.contains("\"@user_id\": user_id"));
         assert!(output.contains("\":user_id\": user_id"));
         assert!(output.contains("\":since\": since"));
-        assert!(output.contains("\"$pattern\": pattern"));
+        assert!(output.contains("\"$pattern\": pattern.as_ref()"));
     }
 
     #[test]
@@ -356,7 +369,39 @@ mod tests {
 
         let output = render_query(&query, true);
 
-        assert!(output.contains("params![param, param_2]"));
+        assert!(output.contains("params![param.as_ref(), param_2]"));
+    }
+
+    #[test]
+    fn render_query_uses_inferred_parameter_types() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/sql/find.sql"),
+            module_name: "users_sql".to_string(),
+            name: "find".to_string(),
+            return_type: ReturnType::Execute,
+            sql: "update users set bio = @bio where id = @id".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "bio".to_string(),
+                    sql_names: vec!["@bio".to_string()],
+                    column_type: ValueType::String,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ],
+            columns: vec![],
+        };
+
+        let output = render_query(&query, true);
+
+        assert!(output.contains("bio: Option<&str>"));
+        assert!(output.contains("id: i64"));
+        assert!(!output.contains("impl rusqlite::ToSql"));
     }
 
     #[test]

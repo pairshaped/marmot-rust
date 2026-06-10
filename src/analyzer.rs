@@ -331,6 +331,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     for (key, inference) in case_result_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
+    for (key, inference) in in_list_parameter_inferences(&tokens, schema, &table_refs) {
+        inferences.insert(key, inference);
+    }
     for (key, inference) in between_parameter_inferences(&tokens, schema, &table_refs) {
         inferences.insert(key, inference);
     }
@@ -573,6 +576,62 @@ fn comparison_parameter_inferences(
     }
 
     inferences
+}
+
+fn in_list_parameter_inferences(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeMap<String, ParameterInference> {
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut inferences = BTreeMap::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        if !token_is_word(token, "IN") {
+            continue;
+        }
+        let Some(Token::OpenParen) = tokens.get(index + 1) else {
+            continue;
+        };
+        let Some(column_ref) = in_list_column_ref(tokens, index) else {
+            continue;
+        };
+        let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
+            continue;
+        };
+        let (inside, after_list) = collect_balanced_parens(tokens, index + 1);
+        if inside
+            .iter()
+            .any(|token| token_is_word(token, "SELECT") || token_is_word(token, "WITH"))
+        {
+            continue;
+        }
+
+        for token_index in index + 2..after_list.saturating_sub(1) {
+            let Some(key) = parameter_keys.get(&token_index) else {
+                continue;
+            };
+            inferences.insert(
+                key.clone(),
+                ParameterInference {
+                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    nullable: false,
+                },
+            );
+        }
+    }
+
+    inferences
+}
+
+fn in_list_column_ref(tokens: &[Token], in_index: usize) -> Option<ColumnRef> {
+    if tokens
+        .get(in_index.checked_sub(1)?)
+        .is_some_and(|token| token_is_word(token, "NOT"))
+    {
+        return column_ref_ending_at(tokens, in_index.checked_sub(2)?);
+    }
+    column_ref_ending_at(tokens, in_index.checked_sub(1)?)
 }
 
 fn case_result_parameter_inferences(
@@ -3660,6 +3719,64 @@ mod tests {
                 column_type: ValueType::I64,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn infers_parameters_from_in_list_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table fees (
+                id integer primary key,
+                club_id integer not null,
+                active integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("fees/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("count_fees.sql"),
+            "select count(*) from fees where club_id in (@club_id, @parent_id, @grandparent_id) and active = @active",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("club_id", ValueType::I64, false),
+                ("parent_id", ValueType::I64, false),
+                ("grandparent_id", ValueType::I64, false),
+                ("active", ValueType::I64, false),
+            ]
         );
     }
 

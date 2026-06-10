@@ -121,6 +121,23 @@ impl Parameter {
             rust_type.to_string()
         }
     }
+
+    pub fn rust_argument_type(&self) -> String {
+        if !self.nullable {
+            return match self.column_type {
+                ValueType::String => "impl AsRef<str>".to_string(),
+                ValueType::Bytes => "impl AsRef<[u8]>".to_string(),
+                _ => self.column_type.rust_type().to_string(),
+            };
+        }
+
+        let rust_type = match self.column_type {
+            ValueType::String => "&str",
+            ValueType::Bytes => "&[u8]",
+            _ => self.column_type.rust_type(),
+        };
+        format!("Option<{rust_type}>")
+    }
 }
 
 pub fn sanitize_identifier(name: &str) -> String {
@@ -234,6 +251,25 @@ mod tests {
         };
 
         assert_eq!(parameter.rust_type(), "Option<String>");
+    }
+
+    #[test]
+    fn renders_borrowed_parameter_argument_types() {
+        let text = Parameter {
+            name: "bio".to_string(),
+            sql_names: vec!["@bio".to_string()],
+            column_type: ValueType::String,
+            nullable: true,
+        };
+        let bytes = Parameter {
+            name: "payload".to_string(),
+            sql_names: vec!["@payload".to_string()],
+            column_type: ValueType::Bytes,
+            nullable: false,
+        };
+
+        assert_eq!(text.rust_argument_type(), "Option<&str>");
+        assert_eq!(bytes.rust_argument_type(), "impl AsRef<[u8]>");
     }
 
     #[test]
