@@ -21,6 +21,8 @@ Rust Marmot will provide forward-only SQL file runners as library APIs.
 
 Migration files live in `db/migrations` by default. `migrations::migrate_from` accepts an explicit directory for applications with another layout.
 
+Seed files live in `db/seeds` by default. `seeds::seed_from` accepts an explicit directory for applications with another layout.
+
 Migration filenames must match:
 
 ```text
@@ -31,7 +33,9 @@ The `NNN` prefix is three digits. The description uses lowercase letters, digits
 
 Migrations run in filename order. Each migration runs in a transaction. After a migration succeeds, Marmot records its filename stem in `schema_migrations.version`. Already-recorded versions are skipped. Failed migrations are rolled back and are not recorded.
 
-The SQL-file runner is shared internally so seed support can use the same ordering, filename validation, file reading, and transaction behavior without schema tracking.
+Seeds run in filename order every time. Marmot does not create a seed tracking table.
+
+The SQL-file runner is shared internally so migrations and seeds use the same ordering, filename validation, file reading, and transaction behavior.
 
 ## Consequences
 
