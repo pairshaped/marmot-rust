@@ -2161,6 +2161,52 @@ mod tests {
     }
 
     #[test]
+    fn infers_order_by_query_parameters_and_limit_parameter() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table users (id integer primary key, name text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "select id, name from users where name = ? order by id limit ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn infers_like_parameter_type_from_column() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -2182,6 +2228,59 @@ mod tests {
         fs::write(
             sql_dir.join("find_users.sql"),
             "select id, name from users where name like ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_not_in_subquery_from_interfering_with_following_parameter_inference() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table deleted (
+                user_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select id, name
+            from users
+            where id not in (select user_id from deleted)
+              and name = ?
+            ",
         )
         .unwrap();
 
