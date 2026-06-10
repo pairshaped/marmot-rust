@@ -39,6 +39,7 @@ It currently:
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
 - emits typed direct `rusqlite` functions using `prepare_cached`
+- runs forward-only SQL migrations through `marmot::migrations`
 
 The remaining work is deeper SQL coverage and polish around project configuration, diagnostics, and edge-case inference.
 

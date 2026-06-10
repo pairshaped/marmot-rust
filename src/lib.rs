@@ -3,7 +3,9 @@ pub mod config;
 pub mod discovery;
 pub mod emit;
 pub mod error;
+pub mod migrations;
 pub mod model;
+mod sql_files;
 pub mod sql_text;
 pub mod sqlite;
 
