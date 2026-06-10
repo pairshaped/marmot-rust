@@ -4,6 +4,45 @@ use std::process::Command;
 use rusqlite::Connection;
 
 #[test]
+fn help_does_not_require_database_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--help")
+        .current_dir(dir.path())
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: marmot"));
+}
+
+#[test]
+fn unknown_command_shows_help_without_database_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("wat")
+        .current_dir(dir.path())
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrecognized subcommand 'wat'"));
+    assert!(stderr.contains("Usage: marmot"));
+}
+
+#[test]
 fn migrate_command_applies_migrations() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.db");
