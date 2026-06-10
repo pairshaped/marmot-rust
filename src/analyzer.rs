@@ -2641,6 +2641,155 @@ mod tests {
     }
 
     #[test]
+    fn subquery_where_parameter_uses_subquery_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table orders (
+                id integer primary key,
+                user_id integer not null,
+                total real not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select id, name
+            from users
+            where id in (
+                select user_id from orders where total > ?
+            )
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::F64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn quoted_identifier_containing_placeholder_does_not_create_parameter() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (\"what?\" integer primary key, val text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_thing.sql"),
+            "select \"what?\", val from t where val = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "what?".to_string(),
+                    field_name: "what".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "val".to_string(),
+                    field_name: "val".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn quoted_keyword_identifier_in_where_infers_parameter_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, \"AND\" text not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_thing.sql"),
+            "select id from t where \"AND\" = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn order_by_collate_nocase_keeps_where_parameter_inference() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
