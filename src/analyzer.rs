@@ -601,15 +601,31 @@ fn resolve_column_ref<'a>(
     table_refs: &BTreeMap<String, String>,
     column_ref: &ColumnRef,
 ) -> Option<&'a SchemaColumn> {
+    resolve_column_ref_with_table(schema, table_refs, column_ref).map(|(_, column)| column)
+}
+
+fn resolve_column_ref_with_table<'a>(
+    schema: &'a Schema,
+    table_refs: &BTreeMap<String, String>,
+    column_ref: &ColumnRef,
+) -> Option<(String, &'a SchemaColumn)> {
     if let Some(qualifier) = &column_ref.qualifier {
         return table_refs
             .get(&qualifier.to_ascii_lowercase())
-            .and_then(|table| schema.column(table, &column_ref.column));
+            .and_then(|table| {
+                schema
+                    .column(table, &column_ref.column)
+                    .map(|column| (table.clone(), column))
+            });
     }
 
     table_refs
         .values()
-        .filter_map(|table| schema.column(table, &column_ref.column))
+        .filter_map(|table| {
+            schema
+                .column(table, &column_ref.column)
+                .map(|column| (table.clone(), column))
+        })
         .next()
 }
 
@@ -666,7 +682,7 @@ fn result_columns(
     let mut columns = Vec::new();
     let metadata = stmt.columns_with_metadata();
     let nullable_tables = left_join_nullable_tables(sql);
-    let expression_inferences = select_expression_inferences(sql);
+    let expression_inferences = select_expression_inferences(sql, schema, &nullable_tables);
 
     for index in 0..stmt.column_count() {
         let name = metadata
@@ -906,10 +922,20 @@ struct Alias {
     nullable_override: Option<bool>,
 }
 
-fn select_expression_inferences(sql: &str) -> BTreeMap<String, ExpressionInference> {
+fn select_expression_inferences(
+    sql: &str,
+    schema: &Schema,
+    nullable_tables: &BTreeSet<String>,
+) -> BTreeMap<String, ExpressionInference> {
     let tokens = tokenize(sql);
     let Some(select_list) = top_level_select_list(&tokens) else {
         return BTreeMap::new();
+    };
+    let table_refs = table_references(&tokens);
+    let context = ExpressionContext {
+        schema,
+        table_refs: &table_refs,
+        nullable_tables,
     };
     let mut inferences = BTreeMap::new();
 
@@ -918,7 +944,7 @@ fn select_expression_inferences(sql: &str) -> BTreeMap<String, ExpressionInferen
             continue;
         };
         let expression = expression_without_alias(expression);
-        let expression_inference = infer_expression_tokens(expression);
+        let expression_inference = infer_expression_tokens(expression, &context);
         if expression_inference.is_some() || alias.nullable_override.is_some() {
             let mut inference = expression_inference.unwrap_or(ExpressionInference {
                 column_type: None,
@@ -954,6 +980,13 @@ fn top_level_select_list(tokens: &[Token]) -> Option<&[Token]> {
     }
 
     select_start.map(|start| &tokens[start..])
+}
+
+#[derive(Debug)]
+struct ExpressionContext<'a> {
+    schema: &'a Schema,
+    table_refs: &'a BTreeMap<String, String>,
+    nullable_tables: &'a BTreeSet<String>,
 }
 
 fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
@@ -1028,15 +1061,18 @@ fn expression_without_alias(tokens: &[Token]) -> &[Token] {
     tokens
 }
 
-fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
-    if let Some(inference) = infer_top_level_numeric_binary_expression(tokens) {
+fn infer_expression_tokens(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
+    if let Some(inference) = infer_top_level_numeric_binary_expression(tokens, context) {
         return Some(inference);
     }
     if tokens
         .first()
         .is_some_and(|token| token_is_word(token, "CASE"))
     {
-        return infer_case_expression(tokens);
+        return infer_case_expression(tokens, context);
     }
     if tokens
         .first()
@@ -1074,20 +1110,23 @@ fn infer_expression_tokens(tokens: &[Token]) -> Option<ExpressionInference> {
             inferred_nullable: Some(true),
             nullable_override: None,
         }),
-        "coalesce" => infer_coalesce_expression(tokens),
+        "coalesce" => infer_coalesce_expression(tokens, context),
         _ => None,
     }
 }
 
-fn infer_top_level_numeric_binary_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+fn infer_top_level_numeric_binary_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate() {
         match token {
             Token::OpenParen => depth += 1,
             Token::CloseParen => depth = depth.saturating_sub(1),
             Token::Plus | Token::Minus if depth == 0 => {
-                let left = infer_expression_tokens(&tokens[..index])?;
-                let right = infer_expression_tokens(&tokens[index + 1..])?;
+                let left = infer_expression_tokens(&tokens[..index], context)?;
+                let right = infer_expression_tokens(&tokens[index + 1..], context)?;
                 let column_type = common_numeric_type(left.column_type?, right.column_type?)?;
                 return Some(ExpressionInference {
                     column_type: Some(column_type),
@@ -1114,13 +1153,16 @@ fn common_numeric_type(left: ValueType, right: ValueType) -> Option<ValueType> {
     }
 }
 
-fn infer_coalesce_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+fn infer_coalesce_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
     let (inside, _) = collect_balanced_parens(tokens, 1);
     let mut column_type = None;
     let mut nullable = true;
 
     for arg in split_top_level_commas(inside) {
-        let Some(inference) = infer_expression_tokens(arg) else {
+        let Some(inference) = infer_expression_tokens(arg, context) else {
             continue;
         };
         if column_type.is_none() {
@@ -1168,7 +1210,10 @@ fn top_level_as_index(tokens: &[Token]) -> Option<usize> {
     None
 }
 
-fn infer_case_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+fn infer_case_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
     let mut branch_types = Vec::new();
     let mut nullable = false;
     let mut has_else = false;
@@ -1178,7 +1223,7 @@ fn infer_case_expression(tokens: &[Token]) -> Option<ExpressionInference> {
         if token_is_word(&tokens[index], "THEN") {
             let start = index + 1;
             let end = case_branch_end(tokens, start);
-            let branch = infer_case_branch(&tokens[start..end]);
+            let branch = infer_case_branch(&tokens[start..end], context);
             nullable |= branch.nullable;
             if let Some(column_type) = branch.column_type {
                 branch_types.push(column_type);
@@ -1188,7 +1233,7 @@ fn infer_case_expression(tokens: &[Token]) -> Option<ExpressionInference> {
             has_else = true;
             let start = index + 1;
             let end = case_branch_end(tokens, start);
-            let branch = infer_case_branch(&tokens[start..end]);
+            let branch = infer_case_branch(&tokens[start..end], context);
             nullable |= branch.nullable;
             if let Some(column_type) = branch.column_type {
                 branch_types.push(column_type);
@@ -1249,7 +1294,7 @@ fn case_branch_end(tokens: &[Token], start: usize) -> usize {
     tokens.len()
 }
 
-fn infer_case_branch(tokens: &[Token]) -> CaseBranch {
+fn infer_case_branch(tokens: &[Token], context: &ExpressionContext<'_>) -> CaseBranch {
     match tokens.first() {
         Some(Token::Number(number)) => CaseBranch {
             column_type: Some(number_value_type(number)),
@@ -1267,11 +1312,32 @@ fn infer_case_branch(tokens: &[Token]) -> CaseBranch {
             column_type: Some(ValueType::String),
             nullable: true,
         },
-        _ => CaseBranch {
+        _ => infer_column_ref_case_branch(tokens, context).unwrap_or(CaseBranch {
             column_type: None,
             nullable: true,
-        },
+        }),
     }
+}
+
+fn infer_column_ref_case_branch(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<CaseBranch> {
+    let column_ref = match tokens {
+        [Token::Word(_)] | [Token::QuotedId(_)] => column_ref_starting_at(tokens, 0),
+        [Token::Word(_), Token::Dot, Token::Word(_)]
+        | [Token::Word(_), Token::Dot, Token::QuotedId(_)]
+        | [Token::QuotedId(_), Token::Dot, Token::Word(_)]
+        | [Token::QuotedId(_), Token::Dot, Token::QuotedId(_)] => column_ref_starting_at(tokens, 0),
+        _ => None,
+    }?;
+    let (table, schema_column) =
+        resolve_column_ref_with_table(context.schema, context.table_refs, &column_ref)?;
+
+    Some(CaseBranch {
+        column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
+        nullable: schema_column.nullable || context.nullable_tables.contains(&table),
+    })
 }
 
 fn number_value_type(number: &str) -> ValueType {
@@ -3032,6 +3098,52 @@ mod tests {
             [Column {
                 name: "label".to_string(),
                 field_name: "label".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_column_branches_uses_schema_type_and_nullability() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                a text not null,
+                b text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when id > 0 then a else b end as val from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "val".to_string(),
+                field_name: "val".to_string(),
                 column_type: ValueType::String,
                 nullable: false,
             }]
