@@ -4607,6 +4607,61 @@ mod tests {
     }
 
     #[test]
+    fn insert_select_where_parameter_uses_source_query_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table logs (
+                user_id integer not null,
+                action text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("logs/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_login_logs.sql"),
+            "
+            insert into logs (user_id, action)
+            select id, 'login'
+            from users
+            where name = ?
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn infers_insert_values_without_column_list_from_schema_order() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
