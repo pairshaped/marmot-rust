@@ -1584,28 +1584,33 @@ fn resolve_column_ref_with_table<'a>(
 
 fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
     let mut refs = crate::sqlite::parse::table_references(tokens);
-    let mut index = 0usize;
 
-    if let Some(into_index) = insert_or_replace_into_index(tokens) {
-        if let Some(table) = tokens.get(into_index + 1).and_then(table_name_from_token) {
-            let table = table.to_ascii_lowercase();
-            refs.insert(table.clone(), table);
+    match crate::sqlite::parse::parse_statement(tokens) {
+        crate::sqlite::parse::Statement::Insert(statement) => {
+            add_table_binding_ref(&mut refs, &statement.target);
         }
-    }
-
-    while index < tokens.len() {
-        if token_is_word(&tokens[index], "UPDATE") {
-            if let Some(table) = tokens.get(index + 1).and_then(table_name_from_token) {
-                let table = table.to_ascii_lowercase();
-                refs.insert(table.clone(), table);
-            }
-            index += 2;
-            continue;
+        crate::sqlite::parse::Statement::Update(statement) => {
+            add_table_binding_ref(&mut refs, &statement.target);
         }
-        index += 1;
+        crate::sqlite::parse::Statement::Delete(statement) => {
+            add_table_binding_ref(&mut refs, &statement.target);
+        }
+        _ => {}
     }
 
     refs
+}
+
+fn add_table_binding_ref(
+    refs: &mut BTreeMap<String, String>,
+    binding: &crate::sqlite::parse::TableBinding,
+) {
+    let key = binding
+        .alias
+        .as_deref()
+        .unwrap_or(&binding.table.name)
+        .to_ascii_lowercase();
+    refs.insert(key, binding.table.name.to_ascii_lowercase());
 }
 
 fn result_columns(
