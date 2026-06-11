@@ -22,6 +22,10 @@ fn help_does_not_require_database_configuration() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: marmot"));
+    assert!(stdout.contains("generate"));
+    assert!(stdout.contains("migrate"));
+    assert!(stdout.contains("seed"));
+    assert!(stdout.contains("reset"));
 }
 
 #[test]

@@ -293,4 +293,18 @@ mod tests {
 
         assert!(matches!(error, ConfigError::MalformedDatabaseArrayEntry));
     }
+
+    #[test]
+    fn rejects_named_database_array_entry_with_empty_name() {
+        let error = FileConfig::from_toml_str(
+            r#"
+            [[tools.marmot.databases]]
+            name = ""
+            path = "db/primary.sqlite"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConfigError::MalformedDatabaseArrayEntry));
+    }
 }

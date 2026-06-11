@@ -6503,6 +6503,62 @@ mod tests {
     }
 
     #[test]
+    fn infers_between_parameter_types_from_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_events.sql"),
+            "select id from events where created_at between @from_ts and @to_ts",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("from_ts", ValueType::I64, false),
+                ("to_ts", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
     fn infers_not_between_parameter_types_from_column() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
