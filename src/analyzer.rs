@@ -3449,6 +3449,69 @@ mod tests {
     }
 
     #[test]
+    fn multiple_ctes_can_infer_from_previous_cte_columns() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_order_ids.sql"),
+            "
+            with filtered(id) as (
+                select id from orders where org_id = @org_id
+            ),
+            ids(id) as (
+                select id from filtered
+            )
+            select id from ids
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "id".to_string(),
+                field_name: "id".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn infers_update_parameters_inside_in_subquery() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -5922,6 +5985,59 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("id", false), ("name", false), ("bio", true)]);
+    }
+
+    #[test]
+    fn left_join_on_unindexed_column_marks_right_side_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table profiles (
+                id integer primary key,
+                user_name text not null,
+                bio text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select u.name, p.bio
+            from users u
+            left join profiles p on p.user_name = u.name
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("name", false), ("bio", true)]);
     }
 
     #[test]
