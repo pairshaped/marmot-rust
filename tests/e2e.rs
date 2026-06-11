@@ -63,7 +63,8 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let items_output = fs::read_to_string(config.output.join("items_sql.rs")).unwrap();
     assert!(items_output.contains("pub struct ListItemsRow"));
     assert!(items_output.contains("pub fn list_items(conn: &Connection, owner_id: i64)"));
-    assert!(items_output.contains("\"@owner_id\": owner_id"));
+    assert!(items_output.contains("where owner_id = ?1"));
+    assert!(items_output.contains("params![owner_id]"));
 }
 
 #[test]
