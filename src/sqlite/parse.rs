@@ -62,6 +62,20 @@ pub struct SelectBody {
 pub struct InsertStmt {
     pub conflict_action: InsertConflictAction,
     pub target: TableBinding,
+    pub column_list: Option<Vec<String>>,
+    pub source: InsertSource,
+    pub upsert: Option<Vec<Token>>,
+    pub returning: Option<Vec<Token>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertSource {
+    Values {
+        raw: Vec<Token>,
+        rows: Vec<Vec<Vec<Token>>>,
+    },
+    Select(SelectStmt),
+    DefaultValues,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,12 +290,116 @@ fn parse_insert(tokens: &[Token]) -> Option<InsertStmt> {
         return None;
     }
     let into_index = after_conflict + 1;
-    let (target, _) = parse_table_binding(tokens, into_index)?;
+    let (target, after_target) = parse_table_binding(tokens, into_index)?;
+    let (column_list, after_columns) = parse_optional_column_list(tokens, after_target);
+    let (source_tokens, after_source) = take_until_insert_source_end(&tokens[after_columns..]);
+    let source = parse_insert_source(source_tokens);
+    let (upsert, after_upsert) = take_clause(after_source, "ON", &["RETURNING"]);
+    let (returning, _) = take_clause(after_upsert, "RETURNING", &[]);
 
     Some(InsertStmt {
         conflict_action,
         target,
+        column_list,
+        source,
+        upsert: upsert.map(<[Token]>::to_vec),
+        returning: returning.map(<[Token]>::to_vec),
     })
+}
+
+fn parse_optional_column_list(tokens: &[Token], index: usize) -> (Option<Vec<String>>, usize) {
+    if !matches!(tokens.get(index), Some(Token::OpenParen)) {
+        return (None, index);
+    }
+
+    let (column_tokens, after_columns) = collect_balanced_parens(tokens, index);
+    let columns = split_top_level_commas(column_tokens)
+        .into_iter()
+        .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    (Some(columns), after_columns)
+}
+
+fn take_until_insert_source_end(tokens: &[Token]) -> (&[Token], &[Token]) {
+    let mut depth = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            _ if depth == 0 && token_is_word(token, "RETURNING") => {
+                return (&tokens[..index], &tokens[index..]);
+            }
+            _ if depth == 0
+                && token_is_word(token, "ON")
+                && tokens
+                    .get(index + 1)
+                    .is_some_and(|token| token_is_word(token, "CONFLICT")) =>
+            {
+                return (&tokens[..index], &tokens[index..]);
+            }
+            _ => {}
+        }
+    }
+
+    (tokens, &[])
+}
+
+fn parse_insert_source(tokens: &[Token]) -> InsertSource {
+    match tokens.first() {
+        Some(token) if token_is_word(token, "VALUES") => InsertSource::Values {
+            raw: tokens.to_vec(),
+            rows: parse_values_rows(&tokens[1..]),
+        },
+        Some(token) if token_is_word(token, "DEFAULT") => {
+            if tokens
+                .get(1)
+                .is_some_and(|token| token_is_word(token, "VALUES"))
+            {
+                InsertSource::DefaultValues
+            } else {
+                InsertSource::Values {
+                    raw: tokens.to_vec(),
+                    rows: Vec::new(),
+                }
+            }
+        }
+        Some(token) if token_is_word(token, "SELECT") || token_is_word(token, "WITH") => {
+            parse_select(tokens)
+                .map(InsertSource::Select)
+                .unwrap_or_else(|| InsertSource::Values {
+                    raw: tokens.to_vec(),
+                    rows: Vec::new(),
+                })
+        }
+        _ => InsertSource::Values {
+            raw: tokens.to_vec(),
+            rows: Vec::new(),
+        },
+    }
+}
+
+fn parse_values_rows(tokens: &[Token]) -> Vec<Vec<Vec<Token>>> {
+    let mut rows = Vec::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if matches!(tokens.get(index), Some(Token::OpenParen)) {
+            let (row_tokens, after_row) = collect_balanced_parens(tokens, index);
+            rows.push(
+                split_top_level_commas(row_tokens)
+                    .into_iter()
+                    .map(<[Token]>::to_vec)
+                    .collect(),
+            );
+            index = after_row;
+            continue;
+        }
+        index += 1;
+    }
+
+    rows
 }
 
 fn parse_insert_conflict_action(tokens: &[Token]) -> (InsertConflictAction, usize) {
@@ -712,6 +830,9 @@ fn alias_stop_word(word: &str) -> bool {
             | "NOT"
             | "RETURNING"
             | "VALUES"
+            | "DEFAULT"
+            | "SELECT"
+            | "WITH"
             | "SET"
             | "FROM"
     )
@@ -743,8 +864,120 @@ mod tests {
                     },
                     alias: None,
                 },
+                column_list: Some(vec!["a".to_string()]),
+                source: InsertSource::Values {
+                    raw: tokenize("values (?)"),
+                    rows: vec![vec![vec![Token::ParamAnon]]],
+                },
+                upsert: None,
+                returning: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_insert_values_source() {
+        let Statement::Insert(stmt) = parse_sql("insert into t (a, b) values (?, ?)") else {
+            panic!("expected insert statement");
+        };
+
+        assert_eq!(
+            stmt.column_list,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        let InsertSource::Values { rows, .. } = stmt.source else {
+            panic!("expected values source");
+        };
+        assert_eq!(
+            rows,
+            vec![vec![vec![Token::ParamAnon], vec![Token::ParamAnon]]]
+        );
+    }
+
+    #[test]
+    fn parses_insert_values_multi_row_source() {
+        let Statement::Insert(stmt) = parse_sql("insert into t (a, b) values (?, ?), (?, ?)")
+        else {
+            panic!("expected insert statement");
+        };
+
+        let InsertSource::Values { rows, .. } = stmt.source else {
+            panic!("expected values source");
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_insert_values_without_column_list() {
+        let Statement::Insert(stmt) = parse_sql("insert into t values (?, ?)") else {
+            panic!("expected insert statement");
+        };
+
+        assert_eq!(stmt.column_list, None);
+        let InsertSource::Values { rows, .. } = stmt.source else {
+            panic!("expected values source");
+        };
+        assert_eq!(
+            rows,
+            vec![vec![vec![Token::ParamAnon], vec![Token::ParamAnon]]]
+        );
+    }
+
+    #[test]
+    fn parses_insert_default_values() {
+        let Statement::Insert(stmt) = parse_sql("insert into t default values") else {
+            panic!("expected insert statement");
+        };
+
+        assert_eq!(stmt.source, InsertSource::DefaultValues);
+    }
+
+    #[test]
+    fn parses_insert_select_source() {
+        let Statement::Insert(stmt) = parse_sql("insert into t (a) select id from other") else {
+            panic!("expected insert statement");
+        };
+
+        let InsertSource::Select(select) = stmt.source else {
+            panic!("expected select source");
+        };
+        assert_eq!(select.body.from.len(), 1);
+    }
+
+    #[test]
+    fn parses_insert_returning_clause() {
+        let Statement::Insert(stmt) = parse_sql("insert into t (a) values (?) returning id, name")
+        else {
+            panic!("expected insert statement");
+        };
+
+        assert!(stmt.returning.is_some());
+    }
+
+    #[test]
+    fn parses_insert_select_with_join_on_without_upsert() {
+        let Statement::Insert(stmt) =
+            parse_sql("insert into t (a, b) select a.id, b.id from a join b on a.id = b.a_id")
+        else {
+            panic!("expected insert statement");
+        };
+
+        let InsertSource::Select(select) = stmt.source else {
+            panic!("expected select source");
+        };
+        assert_eq!(select.body.from.len(), 2);
+        assert!(stmt.upsert.is_none());
+    }
+
+    #[test]
+    fn parses_insert_on_conflict_upsert() {
+        let Statement::Insert(stmt) =
+            parse_sql("insert into t (a) values (?) on conflict (a) do update set a = excluded.a")
+        else {
+            panic!("expected insert statement");
+        };
+
+        assert!(stmt.upsert.is_some());
     }
 
     #[test]
