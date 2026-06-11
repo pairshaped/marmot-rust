@@ -1583,7 +1583,7 @@ fn resolve_column_ref_with_table<'a>(
 }
 
 fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
-    let mut refs = BTreeMap::new();
+    let mut refs = crate::sqlite::parse::table_references(tokens);
     let mut index = 0usize;
 
     if let Some(into_index) = insert_or_replace_into_index(tokens) {
@@ -1602,21 +1602,7 @@ fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
             index += 2;
             continue;
         }
-
-        if !(token_is_word(&tokens[index], "FROM") || token_is_word(&tokens[index], "JOIN")) {
-            index += 1;
-            continue;
-        }
-        let Some(table) = tokens.get(index + 1).and_then(table_name_from_token) else {
-            index += 1;
-            continue;
-        };
-        let table = table.to_ascii_lowercase();
-        refs.insert(table.clone(), table.clone());
-        if let Some(alias) = table_alias_after_join(tokens, index + 2) {
-            refs.insert(alias.to_ascii_lowercase(), table);
-        }
-        index += 2;
+        index += 1;
     }
 
     refs
