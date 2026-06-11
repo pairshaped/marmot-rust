@@ -26,10 +26,36 @@ pub enum AliasError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    Select(SelectStmt),
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectStmt {
+    pub ctes: Vec<CteDef>,
+    pub body: SelectBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CteDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub body: Vec<Token>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectBody {
+    pub is_distinct: bool,
+    pub select_list: Vec<Token>,
+    pub from: Vec<FromItem>,
+    pub where_clause: Option<Vec<Token>>,
+    pub group_by: Option<Vec<Token>>,
+    pub having: Option<Vec<Token>>,
+    pub order_by: Option<Vec<Token>>,
+    pub limit: Option<Vec<Token>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +91,11 @@ pub enum InsertConflictAction {
 
 pub fn parse_statement(tokens: &[Token]) -> Statement {
     match tokens.first() {
+        Some(token) if token_is_word(token, "SELECT") || token_is_word(token, "WITH") => {
+            parse_select(tokens)
+                .map(Statement::Select)
+                .unwrap_or(Statement::Unsupported)
+        }
         Some(token) if token_is_word(token, "INSERT") || token_is_word(token, "REPLACE") => {
             parse_insert(tokens)
                 .map(Statement::Insert)
@@ -78,6 +109,162 @@ pub fn parse_statement(tokens: &[Token]) -> Statement {
             .unwrap_or(Statement::Unsupported),
         _ => Statement::Unsupported,
     }
+}
+
+fn parse_select(tokens: &[Token]) -> Option<SelectStmt> {
+    let (ctes, body_tokens) = parse_ctes(tokens);
+    Some(SelectStmt {
+        ctes,
+        body: parse_select_body(body_tokens)?,
+    })
+}
+
+fn parse_ctes(tokens: &[Token]) -> (Vec<CteDef>, &[Token]) {
+    if !tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "WITH"))
+    {
+        return (Vec::new(), tokens);
+    }
+
+    let mut index = 1usize;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token_is_word(token, "RECURSIVE"))
+    {
+        index += 1;
+    }
+
+    let mut ctes = Vec::new();
+    while index < tokens.len() {
+        let Some(name) = tokens.get(index).and_then(identifier_from_token) else {
+            break;
+        };
+        let name = name.to_ascii_lowercase();
+        index += 1;
+
+        let mut columns = Vec::new();
+        if matches!(tokens.get(index), Some(Token::OpenParen)) {
+            let (column_tokens, after_columns) = collect_balanced_parens(tokens, index);
+            columns = split_top_level_commas(column_tokens)
+                .into_iter()
+                .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+                .map(str::to_ascii_lowercase)
+                .collect();
+            index = after_columns;
+        }
+
+        if !tokens
+            .get(index)
+            .is_some_and(|token| token_is_word(token, "AS"))
+            || !matches!(tokens.get(index + 1), Some(Token::OpenParen))
+        {
+            break;
+        }
+
+        let (body, after_body) = collect_balanced_parens(tokens, index + 1);
+        ctes.push(CteDef {
+            name,
+            columns,
+            body: body.to_vec(),
+        });
+        index = after_body;
+
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    (ctes, &tokens[index..])
+}
+
+fn parse_select_body(tokens: &[Token]) -> Option<SelectBody> {
+    if !tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "SELECT"))
+    {
+        return None;
+    }
+
+    let mut after_select = &tokens[1..];
+    let is_distinct = after_select
+        .first()
+        .is_some_and(|token| token_is_word(token, "DISTINCT"));
+    if is_distinct {
+        after_select = &after_select[1..];
+    }
+
+    let compound_boundaries = ["UNION", "INTERSECT", "EXCEPT"];
+    let (select_list, after_select_list) = take_until_top_level_keywords(
+        after_select,
+        &[
+            "FROM",
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "LIMIT",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    );
+    let (from_slice, after_from) = take_clause(
+        after_select_list,
+        "FROM",
+        &[
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "LIMIT",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    );
+    let (where_clause, after_where) = take_clause(
+        after_from,
+        "WHERE",
+        &[
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "LIMIT",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ],
+    );
+    let (group_by, after_group) = take_clause(
+        after_where,
+        "GROUP",
+        &["HAVING", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT"],
+    );
+    let (having, after_having) = take_clause(
+        after_group,
+        "HAVING",
+        &["ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT"],
+    );
+    let (order_by, after_order) = take_clause(
+        after_having,
+        "ORDER",
+        &["LIMIT", "UNION", "INTERSECT", "EXCEPT"],
+    );
+    let (limit, _) = take_clause(after_order, "LIMIT", &compound_boundaries);
+
+    Some(SelectBody {
+        is_distinct,
+        select_list: select_list.to_vec(),
+        from: from_slice.map(from_items_from_clause).unwrap_or_default(),
+        where_clause: where_clause.map(<[Token]>::to_vec),
+        group_by: group_by.map(<[Token]>::to_vec),
+        having: having.map(<[Token]>::to_vec),
+        order_by: order_by.map(<[Token]>::to_vec),
+        limit: limit.map(<[Token]>::to_vec),
+    })
 }
 
 fn parse_insert(tokens: &[Token]) -> Option<InsertStmt> {
@@ -201,6 +388,53 @@ fn take_until_top_level_keywords<'a>(
     }
 
     (tokens, &[])
+}
+
+fn collect_balanced_parens(tokens: &[Token], open_index: usize) -> (&[Token], usize) {
+    if !matches!(tokens.get(open_index), Some(Token::OpenParen)) {
+        return (&[], open_index);
+    }
+
+    let mut depth = 0usize;
+    let inner_start = open_index + 1;
+    for (index, token) in tokens.iter().enumerate().skip(open_index) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (&tokens[inner_start..index], index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (&tokens[inner_start..], tokens.len())
+}
+
+fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut groups = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                groups.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < tokens.len() {
+        groups.push(&tokens[start..]);
+    }
+
+    groups
 }
 
 fn from_items_from_clause(tokens: &[Token]) -> Vec<FromItem> {
@@ -510,6 +744,158 @@ mod tests {
                     alias: None,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn parses_select_simple() {
+        let Statement::Select(stmt) = parse_sql("select a, b from t") else {
+            panic!("expected select statement");
+        };
+
+        assert!(!stmt.body.is_distinct);
+        assert!(!stmt.body.select_list.is_empty());
+        assert_eq!(
+            stmt.body.from,
+            [FromItem {
+                binding: TableBinding {
+                    table: TableRef {
+                        schema: None,
+                        name: "t".to_string(),
+                    },
+                    alias: None,
+                },
+            }]
+        );
+        assert!(stmt.body.where_clause.is_none());
+        assert!(stmt.body.group_by.is_none());
+        assert!(stmt.body.having.is_none());
+        assert!(stmt.body.order_by.is_none());
+        assert!(stmt.body.limit.is_none());
+    }
+
+    #[test]
+    fn parses_select_distinct() {
+        let Statement::Select(stmt) = parse_sql("select distinct a from t") else {
+            panic!("expected select statement");
+        };
+
+        assert!(stmt.body.is_distinct);
+    }
+
+    #[test]
+    fn parses_select_full_clauses() {
+        let Statement::Select(stmt) = parse_sql(
+            "select a from t where x = 1 group by a having count(*) > 1 order by a limit 10",
+        ) else {
+            panic!("expected select statement");
+        };
+
+        assert!(stmt.body.where_clause.is_some());
+        assert!(stmt.body.group_by.is_some());
+        assert!(stmt.body.having.is_some());
+        assert!(stmt.body.order_by.is_some());
+        assert!(stmt.body.limit.is_some());
+    }
+
+    #[test]
+    fn parse_select_does_not_split_on_subquery_keyword() {
+        let Statement::Select(stmt) = parse_sql("select a from (select a from t where b = 1) sub")
+        else {
+            panic!("expected select statement");
+        };
+
+        assert!(stmt.body.where_clause.is_none());
+    }
+
+    #[test]
+    fn parses_select_compound_without_aliasing_table_as_compound_keyword() {
+        for sql in [
+            "select a from t1 union select b from t2",
+            "select a from t1 intersect select a from t2",
+            "select a from t1 except select a from t2",
+        ] {
+            let Statement::Select(stmt) = parse_sql(sql) else {
+                panic!("expected select statement for {sql}");
+            };
+
+            assert_eq!(
+                stmt.body.from,
+                [FromItem {
+                    binding: TableBinding {
+                        table: TableRef {
+                            schema: None,
+                            name: "t1".to_string(),
+                        },
+                        alias: None,
+                    },
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn parses_with_simple_cte() {
+        let Statement::Select(stmt) = parse_sql("with foo as (select 1) select * from foo") else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(stmt.ctes.len(), 1);
+        assert_eq!(stmt.ctes[0].name, "foo");
+        assert!(stmt.ctes[0].body.len() > 0);
+        assert_eq!(
+            stmt.body.from,
+            [FromItem {
+                binding: TableBinding {
+                    table: TableRef {
+                        schema: None,
+                        name: "foo".to_string(),
+                    },
+                    alias: None,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_with_cte_columns() {
+        let Statement::Select(stmt) =
+            parse_sql("with foo (a, b) as (select 1, 2) select * from foo")
+        else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(stmt.ctes[0].columns, ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parses_with_recursive_cte() {
+        let Statement::Select(stmt) = parse_sql(
+            "with recursive counter(n) as (
+                select 1 union all select n+1 from counter where n < 10
+            ) select * from counter",
+        ) else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(stmt.ctes[0].name, "counter");
+        assert_eq!(stmt.ctes[0].columns, ["n".to_string()]);
+    }
+
+    #[test]
+    fn parses_with_multiple_ctes() {
+        let Statement::Select(stmt) =
+            parse_sql("with a as (select 1), b as (select 2) select * from a, b")
+        else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(
+            stmt.ctes
+                .iter()
+                .map(|cte| cte.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
         );
     }
 
