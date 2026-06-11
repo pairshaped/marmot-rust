@@ -2582,6 +2582,32 @@ mod tests {
     }
 
     #[test]
+    fn infers_dollar_named_parameter_types_from_where_columns() {
+        let params = analyze_single_query(
+            "create table users (id integer primary key, name text not null);",
+            "select id, name from users where id = $id and name = $name",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["$id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "name".to_string(),
+                    sql_names: vec!["$name".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_named_parameter_tokens_inside_strings_identifiers_and_comments() {
         let params = parameters(
             r#"
@@ -3061,6 +3087,42 @@ mod tests {
                 ("updated_at", ValueType::I64, false),
                 ("id", ValueType::I64, false),
             ]
+        );
+    }
+
+    #[test]
+    fn update_with_nested_function_assignment_keeps_where_parameter_inference() {
+        let params = analyze_single_query(
+            "create table t (id integer primary key, name text not null);",
+            "update t set name = lower(trim(name)) where id = ?",
+        );
+
+        assert_eq!(
+            params,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn update_string_literals_do_not_split_where_clause() {
+        let params = analyze_single_query(
+            "create table t (id integer primary key, name text not null);",
+            "update t set name = 'hello WHERE world' where id = ?",
+        );
+
+        assert_eq!(
+            params,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
         );
     }
 
