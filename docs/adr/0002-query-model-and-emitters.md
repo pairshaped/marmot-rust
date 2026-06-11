@@ -30,7 +30,9 @@ The analyzer owns source discovery, SQL loading, SQLite introspection, named par
 
 Emitters consume a language-neutral query model. They should not inspect SQLite directly.
 
-The analyzer should use direct SQLite introspection as its foundation. SQLx may be used as a reference implementation, test oracle, or optional verification backend, but Marmot should not depend on SQLx for its core runtime output.
+The analyzer should use direct SQLite introspection as its foundation. When SQLite does not expose enough metadata, the analyzer should use tokenized SQL structure to recover query facts. That includes expression inference, CTE-derived schema, parameter slot mapping, and nullability overrides.
+
+SQLx may be used as a reference implementation, test oracle, or optional verification backend, but Marmot should not depend on SQLx for its core runtime output.
 
 The query model should describe database-facing facts:
 
