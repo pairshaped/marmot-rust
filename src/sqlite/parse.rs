@@ -344,6 +344,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_comma_separated_from_items() {
+        assert_eq!(
+            parse_from("select * from users u, orders o"),
+            [
+                FromItem {
+                    binding: TableBinding {
+                        table: TableRef {
+                            schema: None,
+                            name: "users".to_string(),
+                        },
+                        alias: Some("u".to_string()),
+                    },
+                },
+                FromItem {
+                    binding: TableBinding {
+                        table: TableRef {
+                            schema: None,
+                            name: "orders".to_string(),
+                        },
+                        alias: Some("o".to_string()),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_self_join_aliases() {
+        assert_eq!(
+            parse_from("select * from users u join users manager on manager.id = u.manager_id"),
+            [
+                FromItem {
+                    binding: TableBinding {
+                        table: TableRef {
+                            schema: None,
+                            name: "users".to_string(),
+                        },
+                        alias: Some("u".to_string()),
+                    },
+                },
+                FromItem {
+                    binding: TableBinding {
+                        table: TableRef {
+                            schema: None,
+                            name: "users".to_string(),
+                        },
+                        alias: Some("manager".to_string()),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn does_not_treat_clause_keywords_as_aliases() {
         assert_eq!(
             parse_from("select a from t1 union select b from t2"),
@@ -352,6 +406,18 @@ mod tests {
                     table: TableRef {
                         schema: None,
                         name: "t1".to_string(),
+                    },
+                    alias: None,
+                },
+            }]
+        );
+        assert_eq!(
+            parse_from("select * from into"),
+            [FromItem {
+                binding: TableBinding {
+                    table: TableRef {
+                        schema: None,
+                        name: "into".to_string(),
                     },
                     alias: None,
                 },
