@@ -2494,7 +2494,12 @@ struct CaseType {
 }
 
 fn common_case_branch_type(branch_types: Vec<ValueType>) -> Option<CaseType> {
-    let first = branch_types.first()?.clone();
+    let Some(first) = branch_types.first().cloned() else {
+        return Some(CaseType {
+            column_type: ValueType::String,
+            mixed: false,
+        });
+    };
     if branch_types.iter().all(|column_type| column_type == &first) {
         Some(CaseType {
             column_type: first,
@@ -10077,6 +10082,84 @@ mod tests {
                 field_name: "registered".to_string(),
                 column_type: ValueType::I64,
                 nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_float_literals_returns_f64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then 1.5 else 2.5 end as score from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "score".to_string(),
+                field_name: "score".to_string(),
+                column_type: ValueType::F64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn case_with_only_null_branches_falls_back_to_nullable_string() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key, active boolean not null);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("things/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_things.sql"),
+            "select case when active then null else null end as unknown from t",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "unknown".to_string(),
+                field_name: "unknown".to_string(),
+                column_type: ValueType::String,
+                nullable: true,
             }]
         );
     }
