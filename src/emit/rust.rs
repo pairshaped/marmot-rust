@@ -1113,7 +1113,7 @@ mod tests {
             return_type: ReturnType::Rows {
                 row_type: Some("OrgRow".to_string()),
             },
-            sql: "-- returns: OrgRow\nselect id, name from orgs where id = @id".to_string(),
+            sql: "select id, name from orgs where id = @id".to_string(),
             parameters: vec![Parameter {
                 name: "id".to_string(),
                 sql_names: vec!["@id".to_string()],
@@ -1129,7 +1129,7 @@ mod tests {
             return_type: ReturnType::Rows {
                 row_type: Some("OrgRow".to_string()),
             },
-            sql: "-- returns: OrgRow\nselect id, name from orgs".to_string(),
+            sql: "select id, name from orgs".to_string(),
             parameters: vec![],
             columns,
         };
@@ -1151,7 +1151,7 @@ mod tests {
             return_type: ReturnType::Rows {
                 row_type: Some("OrgRow".to_string()),
             },
-            sql: "-- returns: OrgRow\nselect id from orgs".to_string(),
+            sql: "select id from orgs".to_string(),
             parameters: vec![],
             columns: vec![Column {
                 name: "id".to_string(),
@@ -1167,7 +1167,7 @@ mod tests {
             return_type: ReturnType::Rows {
                 row_type: Some("OrgRow".to_string()),
             },
-            sql: "-- returns: OrgRow\nselect name from orgs".to_string(),
+            sql: "select name from orgs".to_string(),
             parameters: vec![],
             columns: vec![Column {
                 name: "name".to_string(),

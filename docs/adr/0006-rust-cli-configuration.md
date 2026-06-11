@@ -24,7 +24,7 @@ migrations_dir = "db/migrations"
 seeds_dir = "db/seeds"
 ```
 
-CLI flags override config values. `DATABASE_URL` may provide the database path when no `--database` flag is present.
+CLI flags override config values. `DATABASE_URL` may provide the top-level database path when no `--database` flag is present and no named database reference is selected.
 
 Named database references live under `[tools.marmot.databases.NAME]`:
 
@@ -45,7 +45,9 @@ name = "app"
 path = "db/app.sqlite"
 ```
 
-When named databases are configured, `--database-name NAME` selects one reference. Without `--database-name`, `generate`, `migrate`, `seed`, and `reset` run every named reference in sorted name order.
+When named databases are configured, `--database-name NAME` selects one reference. Without `--database-name`, `generate`, `migrate`, `seed`, and `reset` run every named reference in sorted name order. In this mode, ambient `DATABASE_URL` is ignored so one environment variable cannot accidentally collapse all named references onto a single database path.
+
+`--database PATH` can still select an explicit unnamed target. That mode uses the selected top-level paths for SQL input, output, migrations, and seeds instead of expanding named database references.
 
 Named references can omit paths. Marmot derives defaults from the database name:
 
@@ -67,7 +69,7 @@ Generated output must be under `source_root` after lexical path normalization. T
 
 `generate` checks generated output paths across all selected database targets before writing files. If two targets would write the same Rust module or `mod.rs`, generation fails instead of allowing a later target to overwrite an earlier one.
 
-Missing `marmot.toml` is allowed. In that case Marmot uses built-in defaults for source, output, migrations, and seeds, while still requiring a database from `--database`, `DATABASE_URL`, or config.
+Missing `marmot.toml` is allowed. In that case Marmot uses built-in defaults for source, output, migrations, and seeds, while still requiring a database from `--database` or `DATABASE_URL`.
 
 ## Consequences
 

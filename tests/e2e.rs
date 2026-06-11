@@ -262,7 +262,20 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     };
 
     let project = analyze_project(&config).unwrap();
+    let shared_query = project
+        .queries
+        .iter()
+        .find(|query| query.name == "get_user_shared")
+        .unwrap();
+    assert_eq!(
+        shared_query.sql,
+        "select id, name from users where id = @id"
+    );
+
     emit_project(&config, &project).unwrap();
+    let app_sql = fs::read_to_string(config.output.join("app_sql.rs")).unwrap();
+    assert!(!app_sql.contains("-- returns:"));
+
     write_runtime_crate(dir.path());
 
     let output = Command::new("cargo")

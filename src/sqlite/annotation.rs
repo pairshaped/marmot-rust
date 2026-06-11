@@ -34,6 +34,33 @@ pub fn parse_returns_annotation(
     Ok(None)
 }
 
+pub fn strip_returns_annotation(sql: &str) -> String {
+    let mut offset = 0usize;
+
+    for line in sql.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        if !trimmed.starts_with("--") {
+            return sql.to_string();
+        }
+
+        let body = trimmed.trim_start_matches("--").trim();
+        if body.starts_with("returns:") {
+            let mut stripped = String::with_capacity(sql.len().saturating_sub(line.len()));
+            stripped.push_str(&sql[..offset]);
+            stripped.push_str(&sql[offset + line.len()..]);
+            return stripped;
+        }
+
+        offset += line.len();
+    }
+
+    sql.to_string()
+}
+
 fn validate_returns_type_name(name: &str) -> std::result::Result<String, ReturnsAnnotationError> {
     if name.is_empty() {
         return Err(ReturnsAnnotationError::InvalidTypeName {
@@ -114,5 +141,21 @@ mod tests {
             parse_returns_annotation("-- returns: Org-Row\nSELECT 1"),
             Err(ReturnsAnnotationError::InvalidTypeName { .. })
         ));
+    }
+
+    #[test]
+    fn strips_leading_returns_annotation_only() {
+        assert_eq!(
+            strip_returns_annotation("-- returns: OrgRow\nSELECT 1"),
+            "SELECT 1"
+        );
+        assert_eq!(
+            strip_returns_annotation("-- comment\n-- returns: OrgRow\nSELECT 1"),
+            "-- comment\nSELECT 1"
+        );
+        assert_eq!(
+            strip_returns_annotation("SELECT 1\n-- returns: OrgRow"),
+            "SELECT 1\n-- returns: OrgRow"
+        );
     }
 }

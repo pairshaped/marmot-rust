@@ -9,7 +9,7 @@ use crate::discovery::discover_sql_files_with_sql_dir;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
-use crate::sqlite::annotation::parse_returns_annotation;
+use crate::sqlite::annotation::{parse_returns_annotation, strip_returns_annotation};
 use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
@@ -35,7 +35,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
                 path: file.path.clone(),
                 reason,
             })?;
-        let sqlite_sql = strip_nullability_overrides(&sql);
+        let sqlite_sql = strip_nullability_overrides(&strip_returns_annotation(&sql));
         validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
         let parameters = parameters(&sqlite_sql, &schema);
         let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
@@ -6907,6 +6907,7 @@ mod tests {
                 row_type: Some("OrgRow".to_string())
             }
         );
+        assert_eq!(project.queries[0].sql, "select id, name from orgs");
     }
 
     #[test]

@@ -39,6 +39,7 @@ It currently:
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
 - emits typed direct `rusqlite` functions using `prepare_cached`
+- lowers source-level SQL parameters to dense positional binds in generated Rust
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
 - supports named database references for multi-database projects
 
@@ -84,7 +85,7 @@ migrations_dir = "db/migrations/analytics"
 seeds_dir = "db/seeds/analytics"
 ```
 
-Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/sql/NAME`, `src/generated/sql/NAME`, `db/migrations/NAME`, and `db/seeds/NAME`.
+Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Ambient `DATABASE_URL` does not replace named database paths in that mode. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/sql/NAME`, `src/generated/sql/NAME`, `db/migrations/NAME`, and `db/seeds/NAME`.
 
 Generate Rust files:
 
@@ -142,7 +143,7 @@ cargo run -- reset \
 
 ## Design Notes
 
-The generator should emit boring concrete code. Runtime speed should come from staying close to hand-written `rusqlite`: cached prepared statements, positional row access, concrete row structs, and no dynamic mapper layer.
+The generator should emit boring concrete code. Runtime speed should come from staying close to hand-written `rusqlite`: cached prepared statements, positional parameter binds, positional row access, concrete row structs, and no dynamic mapper layer. SQL files can use named parameters for readability, but generated runtime SQL lowers them to dense positional slots so SQLite does not do a name lookup on every call.
 
 SQLx's SQLite analyzer is useful reference material for closing inference gaps. In particular:
 

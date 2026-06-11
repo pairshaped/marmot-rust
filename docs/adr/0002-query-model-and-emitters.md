@@ -26,13 +26,13 @@ SQLx's SQLite implementation is useful reference material for the analyzer. Its 
 
 ## Decision
 
-The analyzer owns source discovery, SQL loading, SQLite introspection, named parameter discovery, result column discovery, nullability inference, and type inference.
+The analyzer owns source discovery, SQL loading, SQLite introspection, source parameter discovery, SQLite bind slot mapping, result column discovery, nullability inference, and type inference.
 
 Emitters consume a language-neutral query model. They should not inspect SQLite directly.
 
 The analyzer should use direct SQLite introspection as its foundation. When SQLite does not expose enough metadata, the analyzer should use parsed SQL structure to recover query facts. The parser should model statement skeletons for `SELECT`, `INSERT`, `UPDATE`, and `DELETE`: table bindings, aliases, CTE definitions, source and target tables, clause boundaries, and returning clauses. Expression internals can stay in targeted inference code until a deeper expression model earns its shape.
 
-Analyzer inference also owns CTE-derived schema, parameter slot mapping, nullability overrides, and expression-derived parameter and result types.
+Analyzer inference also owns CTE-derived schema, nullability overrides, and expression-derived parameter and result types.
 
 SQLite has no native temporal storage class. The analyzer should map declared temporal types (`DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`) to text values by default, matching SQLite's documented ISO-8601 text convention and SQLx's SQLite encoding behavior. Schemas that want Unix timestamps should declare those columns as `INTEGER`. A future explicit type override may provide richer chrono-style Rust output without changing schema inference.
 
@@ -45,6 +45,7 @@ The query model should describe database-facing facts:
 - module name
 - SQL text
 - parameters
+- SQLite bind slots
 - result columns
 - column types
 - nullability
