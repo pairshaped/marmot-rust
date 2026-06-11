@@ -166,6 +166,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_seed_path_that_is_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::write(&seeds_dir, "not a directory").unwrap();
+
+        assert!(matches!(
+            seed_from(&database, &seeds_dir),
+            Err(SeedError::SeedPathIsNotDirectory { path }) if path == seeds_dir
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_seed_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(&seeds_dir).unwrap();
+
+        assert!(matches!(
+            seed_from(&database, &seeds_dir),
+            Err(SeedError::NoSeedFiles { path }) if path == seeds_dir
+        ));
+    }
+
+    #[test]
     fn seed_error_messages_include_context_paths() {
         assert_eq!(
             SeedError::MissingSeedDirectory {

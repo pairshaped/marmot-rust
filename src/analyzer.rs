@@ -4546,6 +4546,58 @@ mod tests {
     }
 
     #[test]
+    fn insert_values_int_primary_key_is_not_treated_as_rowid_alias_on_write() {
+        for (table_name, primary_key_type) in [("int_t", "int"), ("bigint_t", "bigint")] {
+            let dir = tempdir().unwrap();
+            let database = dir.path().join("app.sqlite3");
+            let conn = Connection::open(&database).unwrap();
+            conn.execute_batch(&format!(
+                "create table {table_name} (id {primary_key_type} primary key, name text not null);"
+            ))
+            .unwrap();
+            drop(conn);
+
+            let source_root = dir.path().join("src");
+            let sql_dir = source_root.join("items/sql");
+            fs::create_dir_all(&sql_dir).unwrap();
+            fs::write(
+                sql_dir.join("insert_item.sql"),
+                format!("insert into {table_name} (id, name) values (?, ?)"),
+            )
+            .unwrap();
+
+            let project = analyze_project(&Config {
+                database,
+                source_root,
+                sql_dir: None,
+                output: dir.path().join("generated"),
+                target: Target::Rust,
+                check: false,
+            })
+            .unwrap();
+
+            assert_eq!(
+                project.queries[0].parameters,
+                [
+                    Parameter {
+                        name: "param".to_string(),
+                        sql_names: vec![],
+                        column_type: ValueType::I64,
+                        nullable: true,
+                    },
+                    Parameter {
+                        name: "param_2".to_string(),
+                        sql_names: vec![],
+                        column_type: ValueType::String,
+                        nullable: false,
+                    },
+                ],
+                "{primary_key_type} primary key should not be treated as an integer rowid alias"
+            );
+        }
+    }
+
+    #[test]
     fn insert_values_composite_primary_key_columns_are_nullable_on_write() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
