@@ -4055,6 +4055,83 @@ mod tests {
     }
 
     #[test]
+    fn with_insert_parameters_use_write_target_columns() {
+        let params = analyze_single_query(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                active boolean not null
+            );
+            ",
+            "
+            with defaults as (select 1 as id)
+            insert into users (id, name, active)
+            values (@id, @name, @active)
+            ",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "name".to_string(),
+                    sql_names: vec!["@name".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "active".to_string(),
+                    sql_names: vec!["@active".to_string()],
+                    column_type: ValueType::Bool,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn with_delete_parameters_use_write_target_columns() {
+        let params = analyze_single_query(
+            "
+            create table users (
+                id integer primary key,
+                active boolean not null
+            );
+            ",
+            "
+            with ids as (select 1 as id)
+            delete from users
+            where id = @id and active = @active
+            ",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "active".to_string(),
+                    sql_names: vec!["@active".to_string()],
+                    column_type: ValueType::Bool,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn infers_update_parameters_inside_in_subquery() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -7924,6 +8001,141 @@ mod tests {
                     nullable: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn group_by_multiple_columns_preserves_grouped_columns_and_sum_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                region text not null,
+                category text not null,
+                amount integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("region_category_totals.sql"),
+            "
+            select region, category, sum(amount) as total
+            from orders
+            group by region, category
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "region".to_string(),
+                    field_name: "region".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "category".to_string(),
+                    field_name: "category".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "total".to_string(),
+                    field_name: "total".to_string(),
+                    column_type: ValueType::F64,
+                    nullable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_with_where_param_infers_grouped_result_and_param_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tickets (
+                id integer primary key,
+                status text not null,
+                count integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tickets/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("status_totals.sql"),
+            "
+            select status, sum(count) as total
+            from tickets
+            where status = ?
+            group by status
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "status".to_string(),
+                    field_name: "status".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "total".to_string(),
+                    field_name: "total".to_string(),
+                    column_type: ValueType::F64,
+                    nullable: true,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
         );
     }
 
