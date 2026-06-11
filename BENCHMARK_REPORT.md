@@ -21,6 +21,9 @@ The dedicated benchmark host is:
 - Memory: 62 GiB
 - Architecture: x86_64
 
+See the [full benchmark report](https://github.com/pairshaped/gleam_sqlite_benchmarks/blob/master/REPORT.md)
+for the complete cross-runtime comparison.
+
 ## Results
 
 These are median rows from a five-run benchmark with 10,000 simulated requests
@@ -93,9 +96,3 @@ For a local SQLite application, the main question is whether SQLx's async and
 pooling model is worth the overhead. Marmot's Rust target is intentionally
 closer to hand-written `rusqlite`: cached prepared statements, positional
 parameter binds, and concrete row decoding.
-
-## Scope
-
-This report intentionally excludes Gleam SQLite and Gleam Postgres rows. Those
-are useful in the broader benchmark suite, but this document is about Rust
-Marmot's generated `rusqlite` path.
