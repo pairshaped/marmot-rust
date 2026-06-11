@@ -3180,6 +3180,64 @@ mod tests {
     }
 
     #[test]
+    fn update_table_name_containing_set_does_not_confuse_set_clause_parsing() {
+        let params = analyze_single_query(
+            "create table asset (id integer primary key, value real not null);",
+            "update asset set value = ? where id = ?",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::F64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_case_logical_operator_keeps_parameter_inference() {
+        let params = analyze_single_query(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                age integer not null
+            );
+            ",
+            "select id from users where name = ? And age > ?",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn update_string_literals_do_not_split_where_clause() {
         let params = analyze_single_query(
             "create table t (id integer primary key, name text not null);",
