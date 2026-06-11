@@ -59,7 +59,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
     Ok(Project { queries })
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Schema {
     tables: BTreeMap<String, BTreeMap<String, SchemaColumn>>,
 }
@@ -91,7 +91,7 @@ impl Schema {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SchemaColumn {
     declared_type: String,
     nullable: bool,
@@ -176,6 +176,161 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
     }
 
     Ok(schema)
+}
+
+fn schema_with_ctes(tokens: &[Token], schema: &Schema) -> Schema {
+    let mut schema = schema.clone();
+    add_ctes_to_schema(tokens, &mut schema);
+    schema
+}
+
+fn add_ctes_to_schema(tokens: &[Token], schema: &mut Schema) {
+    if !tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "WITH"))
+    {
+        return;
+    }
+
+    let mut index = 1usize;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token_is_word(token, "RECURSIVE"))
+    {
+        index += 1;
+    }
+
+    while index < tokens.len() {
+        let Some(name) = tokens.get(index).and_then(identifier_from_token) else {
+            break;
+        };
+        let cte_name = name.to_ascii_lowercase();
+        index += 1;
+
+        let mut column_names = Vec::new();
+        if matches!(tokens.get(index), Some(Token::OpenParen)) {
+            let (column_tokens, after_columns) = collect_balanced_parens(tokens, index);
+            column_names = split_top_level_commas(column_tokens)
+                .into_iter()
+                .filter_map(|tokens| tokens.first().and_then(identifier_from_token))
+                .map(|name| name.to_ascii_lowercase())
+                .collect();
+            index = after_columns;
+        }
+
+        if !tokens
+            .get(index)
+            .is_some_and(|token| token_is_word(token, "AS"))
+            || !matches!(tokens.get(index + 1), Some(Token::OpenParen))
+        {
+            break;
+        }
+
+        let (body, after_body) = collect_balanced_parens(tokens, index + 1);
+        if let Some(columns) = infer_cte_columns(body, &column_names, schema) {
+            schema.tables.insert(cte_name, columns);
+        }
+        index = after_body;
+
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+}
+
+fn infer_cte_columns(
+    body_tokens: &[Token],
+    column_names: &[String],
+    schema: &Schema,
+) -> Option<BTreeMap<String, SchemaColumn>> {
+    let select_list = first_select_list(body_tokens)?;
+    let table_refs = table_references(body_tokens);
+    let nullable_tables = BTreeSet::new();
+    let context = ExpressionContext {
+        schema,
+        table_refs: &table_refs,
+        nullable_tables: &nullable_tables,
+    };
+    let mut columns = BTreeMap::new();
+
+    for (ordinal, expression) in split_top_level_commas(select_list).into_iter().enumerate() {
+        let expression_without_alias = expression_without_alias(expression);
+        let name = column_names
+            .get(ordinal)
+            .cloned()
+            .or_else(|| expression_alias(expression).map(|alias| alias.name.to_ascii_lowercase()))
+            .or_else(|| {
+                column_ref_from_expression(expression_without_alias)
+                    .map(|column_ref| column_ref.column.to_ascii_lowercase())
+            })?;
+
+        let inference = infer_expression_tokens(expression_without_alias, &context);
+        let column_type = inference
+            .as_ref()
+            .and_then(|inference| inference.column_type.clone())
+            .unwrap_or(ValueType::Value);
+        let nullable = inference
+            .as_ref()
+            .and_then(|inference| inference.inferred_nullable)
+            .unwrap_or(true);
+
+        columns.insert(
+            name,
+            SchemaColumn {
+                declared_type: declared_type_for_value_type(&column_type).to_string(),
+                nullable,
+                notnull: !nullable,
+                primary_key: false,
+                rowid_alias: false,
+                ordinal: ordinal as i64,
+            },
+        );
+    }
+
+    Some(columns)
+}
+
+fn first_select_list(tokens: &[Token]) -> Option<&[Token]> {
+    let mut depth = 0usize;
+    let mut select_start = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if depth == 0 && select_start.is_none() && word.eq_ignore_ascii_case("SELECT") =>
+            {
+                select_start = Some(index + 1);
+            }
+            Token::Word(word)
+                if depth == 0
+                    && select_start.is_some()
+                    && matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "FROM" | "UNION" | "INTERSECT" | "EXCEPT"
+                    ) =>
+            {
+                return select_start.map(|start| &tokens[start..index]);
+            }
+            _ => {}
+        }
+    }
+
+    select_start.map(|start| &tokens[start..])
+}
+
+fn declared_type_for_value_type(value_type: &ValueType) -> &'static str {
+    match value_type {
+        ValueType::I64 => "integer",
+        ValueType::F64 => "real",
+        ValueType::Bool => "boolean",
+        ValueType::String => "text",
+        ValueType::Bytes => "blob",
+        ValueType::Value => "",
+    }
 }
 
 fn validate_insert_values_counts(sql: &str, schema: &Schema, path: &std::path::Path) -> Result<()> {
@@ -472,28 +627,29 @@ impl ParameterSlots {
 
 fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, ParameterInference> {
     let tokens = tokenize(sql);
-    let mut inferences = insert_parameter_inferences(&tokens, schema);
+    let schema = schema_with_ctes(&tokens, schema);
+    let mut inferences = insert_parameter_inferences(&tokens, &schema);
     let table_refs = table_references(&tokens);
 
     for (key, inference) in cast_parameter_inferences(&tokens) {
         inferences.insert(key, inference);
     }
-    for (key, inference) in comparison_parameter_inferences(&tokens, schema, &table_refs) {
+    for (key, inference) in comparison_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
-    for (key, inference) in case_result_parameter_inferences(&tokens, schema, &table_refs) {
+    for (key, inference) in case_result_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
-    for (key, inference) in in_list_parameter_inferences(&tokens, schema, &table_refs) {
+    for (key, inference) in in_list_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
-    for (key, inference) in between_parameter_inferences(&tokens, schema, &table_refs) {
+    for (key, inference) in between_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
     for (key, inference) in limit_parameter_inferences(&tokens) {
         inferences.insert(key, inference);
     }
-    for (key, inference) in update_set_parameter_inferences(&tokens, schema, &table_refs) {
+    for (key, inference) in update_set_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
 
@@ -1486,7 +1642,9 @@ fn result_columns(
     let mut columns = Vec::new();
     let metadata = stmt.columns_with_metadata();
     let nullable_tables = outer_join_nullable_tables(sql);
-    let expression_inferences = select_expression_inferences(sql, schema, &nullable_tables);
+    let tokens = tokenize(sql);
+    let schema = schema_with_ctes(&tokens, schema);
+    let expression_inferences = select_expression_inferences(sql, &schema, &nullable_tables);
 
     for index in 0..stmt.column_count() {
         let name = metadata
@@ -1798,19 +1956,25 @@ fn select_expression_inferences(
     let mut inferences = BTreeMap::new();
 
     for expression in split_top_level_commas(expression_list) {
-        let Some(alias) = expression_alias(expression) else {
+        let alias = expression_alias(expression);
+        let expression = expression_without_alias(expression);
+        let Some(name) = alias
+            .as_ref()
+            .map(|alias| alias.name.clone())
+            .or_else(|| column_ref_from_expression(expression).map(|column_ref| column_ref.column))
+        else {
             continue;
         };
-        let expression = expression_without_alias(expression);
         let expression_inference = infer_expression_tokens(expression, &context);
-        if expression_inference.is_some() || alias.nullable_override.is_some() {
+        let nullable_override = alias.and_then(|alias| alias.nullable_override);
+        if expression_inference.is_some() || nullable_override.is_some() {
             let mut inference = expression_inference.unwrap_or(ExpressionInference {
                 column_type: None,
                 inferred_nullable: None,
                 nullable_override: None,
             });
-            inference.nullable_override = alias.nullable_override;
-            inferences.insert(alias.name.to_ascii_lowercase(), inference);
+            inference.nullable_override = nullable_override;
+            inferences.insert(name.to_ascii_lowercase(), inference);
         }
     }
 
@@ -2961,6 +3125,326 @@ mod tests {
                 ("account_id", ValueType::I64, false),
                 ("org_id", ValueType::I64, false),
             ]
+        );
+    }
+
+    #[test]
+    fn read_parameter_against_nullable_column_is_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tasks (
+                id integer primary key,
+                account_id integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tasks/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_tasks.sql"),
+            "select id from tasks where account_id = @account_id",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "account_id".to_string(),
+                sql_names: vec!["@account_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn read_parameter_with_is_operator_uses_column_type_and_is_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table standings (
+                id integer primary key,
+                season integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("standings/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_standings.sql"),
+            "select id from standings where season is @season",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "season".to_string(),
+                sql_names: vec!["@season".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn update_write_nullable_column_but_read_parameter_is_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tasks (
+                id integer primary key,
+                account_id integer,
+                deleted_at integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tasks/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("soft_delete_tasks.sql"),
+            "
+            update tasks
+            set deleted_at = @deleted_at
+            where account_id = @account_id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "deleted_at".to_string(),
+                    sql_names: vec!["@deleted_at".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+                Parameter {
+                    name: "account_id".to_string(),
+                    sql_names: vec!["@account_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_parameter_inside_select_list_subquery_resolves_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table feature_requests (
+                id integer primary key
+            );
+            create table feature_request_votes (
+                id integer primary key,
+                feature_request_id integer not null,
+                org_id integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("feature_requests/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_feature_requests.sql"),
+            "
+            select (
+                select count(*)
+                from feature_request_votes frv
+                where frv.org_id = @org_id
+            ) as vote_count
+            from feature_requests
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn cte_result_columns_keep_underlying_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("orders/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("recent_orders.sql"),
+            "
+            with recent as (
+                select id from orders where org_id = @org_id
+            )
+            select id from recent
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "id".to_string(),
+                field_name: "id".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_result_and_parameter_use_seed_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        Connection::open(&database).unwrap().close().unwrap();
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("reports/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("count_to_limit.sql"),
+            "
+            with recursive counter(n) as (
+                select 1
+                union all
+                select n + 1 from counter where n < @limit
+            )
+            select n from counter
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "n".to_string(),
+                field_name: "n".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "limit".to_string(),
+                sql_names: vec!["@limit".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
         );
     }
 
