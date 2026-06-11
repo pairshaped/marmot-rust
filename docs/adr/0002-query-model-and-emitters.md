@@ -34,6 +34,8 @@ The analyzer should use direct SQLite introspection as its foundation. When SQLi
 
 Analyzer inference also owns CTE-derived schema, parameter slot mapping, nullability overrides, and expression-derived parameter and result types.
 
+SQLite has no native temporal storage class. The analyzer should map declared temporal types (`DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`) to text values by default, matching SQLite's documented ISO-8601 text convention and SQLx's SQLite encoding behavior. Schemas that want Unix timestamps should declare those columns as `INTEGER`. A future explicit type override may provide richer chrono-style Rust output without changing schema inference.
+
 SQLx may be used as a reference implementation, test oracle, or optional verification backend, but Marmot should not depend on SQLx for its core runtime output.
 
 The query model should describe database-facing facts:
