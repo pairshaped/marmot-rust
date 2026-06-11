@@ -232,6 +232,48 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn migration_error_messages_include_context_paths() {
+        assert_eq!(
+            MigrationError::MissingMigrationDirectory {
+                path: PathBuf::from("db/migrations"),
+            }
+            .to_string(),
+            "missing migration directory: db/migrations"
+        );
+        assert_eq!(
+            MigrationError::MigrationPathIsNotDirectory {
+                path: PathBuf::from("db/migrations"),
+            }
+            .to_string(),
+            "migration path is not a directory: db/migrations"
+        );
+        assert_eq!(
+            MigrationError::InvalidMigrationFilename {
+                path: PathBuf::from("db/migrations/001-create-users.sql"),
+            }
+            .to_string(),
+            "invalid migration filename: db/migrations/001-create-users.sql"
+        );
+    }
+
+    #[test]
+    fn migration_sql_error_message_includes_file_and_sqlite_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        let source = conn
+            .execute_batch("insert into missing_table (id) values (1)")
+            .unwrap_err();
+
+        let message = MigrationError::MigrationSqlError {
+            path: PathBuf::from("db/migrations/002_insert_missing.sql"),
+            source,
+        }
+        .to_string();
+
+        assert!(message.contains("migration SQL failed in db/migrations/002_insert_missing.sql"));
+        assert!(message.contains("no such table: missing_table"));
+    }
+
     fn applied_versions(conn: &Connection) -> Vec<String> {
         let mut stmt = conn
             .prepare("select version from schema_migrations order by version")

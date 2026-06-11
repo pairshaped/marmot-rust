@@ -165,6 +165,48 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn seed_error_messages_include_context_paths() {
+        assert_eq!(
+            SeedError::MissingSeedDirectory {
+                path: PathBuf::from("db/seeds"),
+            }
+            .to_string(),
+            "missing seed directory: db/seeds"
+        );
+        assert_eq!(
+            SeedError::SeedPathIsNotDirectory {
+                path: PathBuf::from("db/seeds"),
+            }
+            .to_string(),
+            "seed path is not a directory: db/seeds"
+        );
+        assert_eq!(
+            SeedError::InvalidSeedFilename {
+                path: PathBuf::from("db/seeds/001-create-users.sql"),
+            }
+            .to_string(),
+            "invalid seed filename: db/seeds/001-create-users.sql"
+        );
+    }
+
+    #[test]
+    fn seed_sql_error_message_includes_file_and_sqlite_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        let source = conn
+            .execute_batch("insert into missing_table (id) values (1)")
+            .unwrap_err();
+
+        let message = SeedError::SeedSqlError {
+            path: PathBuf::from("db/seeds/002_add_lucy.sql"),
+            source,
+        }
+        .to_string();
+
+        assert!(message.contains("seed SQL failed in db/seeds/002_add_lucy.sql"));
+        assert!(message.contains("no such table: missing_table"));
+    }
+
     fn user_count(conn: &Connection) -> i64 {
         conn.query_row("select count(*) from users", [], |row| row.get(0))
             .unwrap()
