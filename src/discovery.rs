@@ -129,9 +129,9 @@ fn configured_sql_module_name(sql_dir: &Path, path: &Path) -> String {
     let relative_parent = parent.strip_prefix(sql_dir).unwrap_or(parent);
     let owner_dir = relative_parent
         .components()
-        .next_back()
-        .and_then(|component| component.as_os_str().to_str())
-        .filter(|name| !name.is_empty())
+        .rev()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find(|name| !name.is_empty() && *name != "sql")
         .unwrap_or("sql");
 
     if owner_dir == "sql" {
@@ -257,6 +257,21 @@ mod tests {
                 ("likes_sql", "get_likes"),
             ]
         );
+    }
+
+    #[test]
+    fn configured_sql_dir_uses_nearest_non_sql_directory_for_nested_sql_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let sql_dir = temp.path().join("src/sql");
+        fs::create_dir_all(sql_dir.join("likes/sql")).unwrap();
+        fs::write(sql_dir.join("likes/sql/get_likes.sql"), "select 1").unwrap();
+
+        let files =
+            discover_sql_files_with_sql_dir(&temp.path().join("src"), Some(&sql_dir)).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].module_name, "likes_sql");
+        assert_eq!(files[0].query_name, "get_likes");
     }
 
     #[test]

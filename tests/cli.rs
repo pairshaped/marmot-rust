@@ -363,6 +363,68 @@ fn generate_command_rejects_output_outside_source_root() {
 }
 
 #[test]
+fn generate_command_accepts_output_with_current_dir_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
+
+    let users_sql = dir.path().join("src/users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg("src")
+        .arg("--output")
+        .arg("src/./generated/sql")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/users_sql.rs").exists());
+}
+
+#[test]
+fn generate_command_rejects_output_that_escapes_source_root_with_parent_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
+
+    let users_sql = dir.path().join("src/users/sql");
+    fs::create_dir_all(&users_sql).unwrap();
+    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg("src")
+        .arg("--output")
+        .arg("src/a/../../../outside")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("output path must be under source root"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.path().join("outside").exists());
+}
+
+#[test]
 fn generate_command_succeeds_with_no_sql_directories() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
@@ -695,6 +757,50 @@ output = "src/generated/sql"
         "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn generate_command_uses_parent_entity_for_nested_sql_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "nested_sql_dir");
+
+    let sql_dir = dir.path().join("src/sql");
+    fs::create_dir_all(sql_dir.join("likes/sql")).unwrap();
+    fs::write(
+        sql_dir.join("likes/sql/get_likes.sql"),
+        "select id, name from users",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "src"
+sql_dir = "src/sql"
+output = "src/generated/sql"
+"#,
+            database.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/likes_sql.rs").exists());
+    assert!(!dir.path().join("src/generated/sql/sql.rs").exists());
 }
 
 #[test]
