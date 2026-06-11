@@ -2514,6 +2514,31 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn analyze_single_query(schema_sql: &str, query_sql: &str) -> Vec<Parameter> {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(schema_sql).unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("queries/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(sql_dir.join("query.sql"), query_sql).unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        project.queries[0].parameters.clone()
+    }
+
     #[test]
     fn extracts_unique_named_parameters_in_encounter_order() {
         let params = parameters(
@@ -3437,6 +3462,205 @@ mod tests {
                 column_type: ValueType::I64,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn correlated_select_list_subquery_parameters_resolve_column_types() {
+        let parameters = analyze_single_query(
+            "
+            create table feature_requests (
+                id integer primary key
+            );
+            create table feature_request_votes (
+                id integer primary key,
+                feature_request_id integer not null,
+                org_id integer not null
+            );
+            ",
+            "
+            select
+                fr.id,
+                cast((
+                    select count(*)
+                    from feature_request_votes frv
+                    where frv.feature_request_id = fr.id
+                      and frv.org_id = @org_id
+                ) as integer) as has_voted
+            from feature_requests fr
+            where fr.id = @id
+            ",
+        );
+
+        assert_eq!(
+            parameters,
+            [
+                Parameter {
+                    name: "org_id".to_string(),
+                    sql_names: vec!["@org_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_table_subquery_parameters_resolve_column_types() {
+        let parameters = analyze_single_query(
+            "
+            create table participants (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+            "
+            select count(*) from (
+                select id from participants p where p.org_id = @org_id
+            )
+            ",
+        );
+
+        assert_eq!(
+            parameters,
+            [Parameter {
+                name: "org_id".to_string(),
+                sql_names: vec!["@org_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn derived_table_exists_parameters_resolve_names_and_types() {
+        let parameters = analyze_single_query(
+            "
+            create table participants (
+                id integer primary key,
+                name text not null
+            );
+            create table participant_orgs (
+                participant_id integer not null,
+                org_id integer not null
+            );
+            ",
+            "
+            select count(*) from (
+                select distinct p.id
+                from participants p
+                where exists (
+                    select 1
+                    from participant_orgs po
+                    where po.participant_id = p.id
+                      and po.org_id = @org_id
+                )
+                and cast(@search as text) = ''
+            )
+            ",
+        );
+
+        assert_eq!(
+            parameters,
+            [
+                Parameter {
+                    name: "org_id".to_string(),
+                    sql_names: vec!["@org_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "search".to_string(),
+                    sql_names: vec!["@search".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn count_wrapper_preserves_real_world_parameter_names() {
+        let parameters = analyze_single_query(
+            "
+            create table participants (
+                id integer primary key,
+                first_name text not null,
+                last_name text not null,
+                email text not null
+            );
+            create table line_items (
+                participant_id integer not null,
+                item_id integer
+            );
+            create table items (
+                id integer primary key,
+                org_id integer not null,
+                season integer
+            );
+            create table waiver_responses (
+                participant_id integer,
+                org_id integer not null
+            );
+            ",
+            "
+            select cast(count(*) as integer) as count from (
+                select distinct p.id
+                from participants p
+                where (
+                    exists (
+                        select 1 from line_items li2
+                        join items pr2 on li2.item_id = pr2.id
+                        where li2.participant_id = p.id and pr2.org_id = @org_id
+                    )
+                    or exists (
+                        select 1 from waiver_responses wa
+                        where wa.participant_id = p.id and wa.org_id = @org_id
+                    )
+                )
+                and (cast(@search as text) = ''
+                    or p.first_name like cast(@search as text) || '%'
+                    or p.last_name like cast(@search as text) || '%'
+                    or p.email like cast(@search as text) || '%')
+                and (cast(@season as integer) = 0 or exists (
+                    select 1 from line_items li3
+                    join items pr3 on li3.item_id = pr3.id
+                    where li3.participant_id = p.id
+                      and pr3.org_id = @org_id
+                      and pr3.season = cast(@season as integer)
+                ))
+            )
+            ",
+        );
+
+        assert_eq!(
+            parameters,
+            [
+                Parameter {
+                    name: "org_id".to_string(),
+                    sql_names: vec!["@org_id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "search".to_string(),
+                    sql_names: vec!["@search".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "season".to_string(),
+                    sql_names: vec!["@season".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
         );
     }
 
