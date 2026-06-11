@@ -471,6 +471,52 @@ fn generate_command_rejects_missing_database_configuration() {
 }
 
 #[test]
+fn generate_command_rejects_database_flag_without_value() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .env_remove("DATABASE_URL")
+        .arg("generate")
+        .arg("--database")
+        .arg("--output")
+        .arg("src/generated/sql")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("a value is required for '--database <DATABASE>'"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generate_command_rejects_empty_database_flag_value() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .env_remove("DATABASE_URL")
+        .arg("generate")
+        .arg("--database=")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("a value is required for '--database <DATABASE>'"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn generate_command_reports_database_open_errors() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("missing/app.sqlite3");
