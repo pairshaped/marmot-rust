@@ -2,6 +2,9 @@
 
 Experimental Rust port of Marmot.
 
+See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for the Rust SQLite benchmark
+summary.
+
 The goal is to keep Marmot's source layout:
 
 ```text
