@@ -638,7 +638,7 @@ mod tests {
 
         assert!(matches!(
             render_module(vec![&query]),
-            Err(Error::MixedParameterStyles { path }) if path == PathBuf::from("src/users/sql/find.sql")
+            Err(Error::MixedParameterStyles { path }) if path.as_path() == std::path::Path::new("src/users/sql/find.sql")
         ));
     }
 
@@ -669,7 +669,7 @@ mod tests {
 
         assert!(matches!(
             render_module(vec![&query]),
-            Err(Error::MixedParameterStyles { path }) if path == PathBuf::from("src/users/sql/find.sql")
+            Err(Error::MixedParameterStyles { path }) if path.as_path() == std::path::Path::new("src/users/sql/find.sql")
         ));
     }
 
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn render_module_rejects_duplicate_query_names() {
-        let queries = vec![
+        let queries = [
             Query {
                 source_path: PathBuf::from("src/users/sql/find-user.sql"),
                 module_name: "users_sql".to_string(),
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn render_module_rejects_scalar_helper_name_collisions() {
-        let queries = vec![
+        let queries = [
             Query {
                 source_path: PathBuf::from("src/users/sql/find.sql"),
                 module_name: "users_sql".to_string(),
@@ -979,7 +979,7 @@ mod tests {
                 nullable: false,
             },
         ];
-        let queries = vec![
+        let queries = [
             Query {
                 source_path: PathBuf::from("src/orgs/sql/list_orgs.sql"),
                 module_name: "orgs_sql".to_string(),

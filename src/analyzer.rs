@@ -166,7 +166,7 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
                 && column.primary_key
                 && column.declared_type.eq_ignore_ascii_case("INTEGER");
             column.nullable =
-                !column.notnull && !column.rowid_alias && !(without_rowid && column.primary_key);
+                !(column.notnull || column.rowid_alias || without_rowid && column.primary_key);
         }
         let columns = column_rows.into_iter().collect::<BTreeMap<_, _>>();
 
@@ -410,10 +410,9 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
                     if let Some(param) = params
                         .iter_mut()
                         .find(|param| param.name == *parameter_name)
+                        && !param.sql_names.contains(&sql_name)
                     {
-                        if !param.sql_names.contains(&sql_name) {
-                            param.sql_names.push(sql_name);
-                        }
+                        param.sql_names.push(sql_name);
                     }
                     parameter_name.clone()
                 } else {
@@ -454,15 +453,13 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
                     if let Some(param) = params
                         .iter_mut()
                         .find(|param| param.name == *parameter_name)
-                    {
-                        if param
+                        && param
                             .sql_names
                             .iter()
                             .all(|sql_name| sql_name.starts_with('?'))
-                            && !param.sql_names.contains(&sql_name)
-                        {
-                            param.sql_names.push(sql_name.clone());
-                        }
+                        && !param.sql_names.contains(&sql_name)
+                    {
+                        param.sql_names.push(sql_name.clone());
                     }
                 } else if let Some(param) = params
                     .iter_mut()
@@ -881,13 +878,12 @@ fn insert_or_replace_into_index(tokens: &[Token]) -> Option<usize> {
         return insert_into_index(tokens, insert_index);
     }
 
-    if let Some(replace_index) = top_level_keyword(tokens, "REPLACE") {
-        if tokens
+    if let Some(replace_index) = top_level_keyword(tokens, "REPLACE")
+        && tokens
             .get(replace_index + 1)
             .is_some_and(|token| token_is_word(token, "INTO"))
-        {
-            return Some(replace_index + 1);
-        }
+    {
+        return Some(replace_index + 1);
     }
 
     None
@@ -1144,8 +1140,13 @@ fn case_result_parameter_indexes(
     let mut paren_depth = 0usize;
     let mut nested_case_depth = 0usize;
 
-    for index in case_index + 1..end_index {
-        match &tokens[index] {
+    for (index, token) in tokens
+        .iter()
+        .enumerate()
+        .take(end_index)
+        .skip(case_index + 1)
+    {
+        match token {
             Token::OpenParen => paren_depth += 1,
             Token::CloseParen => paren_depth = paren_depth.saturating_sub(1),
             Token::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("CASE") => {
@@ -1707,7 +1708,15 @@ fn result_columns(
             .get(index)
             .and_then(|column| Some((column.table_name()?, column.origin_name()?)))
             .and_then(|(table, column)| schema.column(table, column));
-        let expression_inference = expression_inferences.get(&name.to_ascii_lowercase());
+        let expression_inference = expression_inferences
+            .by_name
+            .get(&name.to_ascii_lowercase())
+            .or_else(|| {
+                expression_inferences
+                    .by_index
+                    .get(index)
+                    .and_then(Option::as_ref)
+            });
         let column_type = schema_column
             .map(|column| ValueType::from_sqlite_type(&column.declared_type))
             .or_else(|| expression_inference.and_then(|inference| inference.column_type.clone()))
@@ -1819,6 +1828,34 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
             continue;
         }
 
+        if token_is_word(&tokens[index], "FULL") {
+            let mut join_index = index + 1;
+            if tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "OUTER"))
+            {
+                join_index += 1;
+            }
+
+            if !tokens
+                .get(join_index)
+                .is_some_and(|token| token_is_word(token, "JOIN"))
+            {
+                index += 1;
+                continue;
+            }
+
+            nullable_tables.extend(joined_tables.iter().cloned());
+            if let Some(table_name) =
+                register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables)
+            {
+                nullable_tables.insert(table_name);
+            }
+
+            index = join_index + 1;
+            continue;
+        }
+
         index += 1;
     }
 
@@ -1884,10 +1921,10 @@ fn where_null_rejected_tables(
             continue;
         };
 
-        if null_rejecting_predicate_follows(tokens, next_index, where_end) {
-            if let Some(table) = aliases.get(&qualifier.to_ascii_lowercase()) {
-                rejected.insert(table.clone());
-            }
+        if null_rejecting_predicate_follows(tokens, next_index, where_end)
+            && let Some(table) = aliases.get(&qualifier.to_ascii_lowercase())
+        {
+            rejected.insert(table.clone());
         }
 
         index = next_index;
@@ -1977,16 +2014,22 @@ struct Alias {
     nullable_override: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SelectExpressionInferences {
+    by_name: BTreeMap<String, ExpressionInference>,
+    by_index: Vec<Option<ExpressionInference>>,
+}
+
 fn select_expression_inferences(
     sql: &str,
     schema: &Schema,
     nullable_tables: &BTreeSet<String>,
-) -> BTreeMap<String, ExpressionInference> {
+) -> SelectExpressionInferences {
     let tokens = tokenize(sql);
     let Some(expression_list) =
         top_level_select_list(&tokens).or_else(|| top_level_returning_list(&tokens))
     else {
-        return BTreeMap::new();
+        return SelectExpressionInferences::default();
     };
     let table_refs = table_references(&tokens);
     let context = ExpressionContext {
@@ -1994,29 +2037,35 @@ fn select_expression_inferences(
         table_refs: &table_refs,
         nullable_tables,
     };
-    let mut inferences = BTreeMap::new();
+    let mut inferences = SelectExpressionInferences::default();
 
     for expression in split_top_level_commas(expression_list) {
         let alias = expression_alias(expression);
         let expression = expression_without_alias(expression);
-        let Some(name) = alias
+        let name = alias
             .as_ref()
             .map(|alias| alias.name.clone())
-            .or_else(|| column_ref_from_expression(expression).map(|column_ref| column_ref.column))
-        else {
-            continue;
-        };
+            .or_else(|| column_ref_from_expression(expression).map(|column_ref| column_ref.column));
         let expression_inference = infer_expression_tokens(expression, &context);
         let nullable_override = alias.and_then(|alias| alias.nullable_override);
-        if expression_inference.is_some() || nullable_override.is_some() {
+        let inference = if expression_inference.is_some() || nullable_override.is_some() {
             let mut inference = expression_inference.unwrap_or(ExpressionInference {
                 column_type: None,
                 inferred_nullable: None,
                 nullable_override: None,
             });
             inference.nullable_override = nullable_override;
-            inferences.insert(name.to_ascii_lowercase(), inference);
+            Some(inference)
+        } else {
+            None
+        };
+
+        if let (Some(name), Some(inference)) = (&name, &inference) {
+            inferences
+                .by_name
+                .insert(name.to_ascii_lowercase(), inference.clone());
         }
+        inferences.by_index.push(inference);
     }
 
     inferences
@@ -2554,7 +2603,6 @@ fn infer_column_type(name: &str) -> ValueType {
         || normalized.ends_with("_id")
         || normalized == "counter"
         || normalized.contains("count(")
-        || normalized.contains("coalesce(")
     {
         return ValueType::I64;
     }
@@ -2752,7 +2800,7 @@ mod tests {
     fn infers_common_integer_columns() {
         assert_eq!(infer_column_type("id"), ValueType::I64);
         assert_eq!(infer_column_type("count(*)"), ValueType::I64);
-        assert_eq!(infer_column_type("coalesce(sum(id), 0)"), ValueType::I64);
+        assert_eq!(infer_column_type("coalesce(sum(id), 0)"), ValueType::F64);
         assert_eq!(infer_column_type("sum(id)"), ValueType::F64);
         assert_eq!(infer_column_type("name"), ValueType::Value);
     }
@@ -7054,6 +7102,59 @@ mod tests {
     }
 
     #[test]
+    fn full_outer_join_marks_both_sides_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null
+            );
+            create table profiles (
+                id integer primary key,
+                user_id integer not null,
+                bio text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_users.sql"),
+            "
+            select u.id as user_id, p.bio
+            from users u
+            full outer join profiles p on p.user_id = u.id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| (column.field_name.as_str(), column.nullable))
+            .collect::<Vec<_>>();
+
+        assert_eq!(facts, [("user_id", true), ("bio", true)]);
+    }
+
+    #[test]
     fn inner_join_keeps_result_columns_non_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -7868,6 +7969,52 @@ mod tests {
                 ("label", ValueType::String, false),
                 ("unknown", ValueType::String, true),
             ]
+        );
+    }
+
+    #[test]
+    fn unaliased_coalesce_expression_uses_expression_inference() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("names.sql"),
+            "select coalesce(name, '') from users",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "coalesce(name, '')".to_string(),
+                field_name: "coalescename_".to_string(),
+                column_type: ValueType::String,
+                nullable: false,
+            }]
         );
     }
 

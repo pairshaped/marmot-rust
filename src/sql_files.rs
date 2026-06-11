@@ -235,17 +235,17 @@ fn apply_file(
         });
     }
 
-    if let Some(table_name) = tracking_table {
-        if let Err(source) = conn.execute(
+    if let Some(table_name) = tracking_table
+        && let Err(source) = conn.execute(
             &format!("insert into {table_name} (version, applied_at) values (?1, datetime('now'))"),
             [&file.version],
-        ) {
-            let _ = conn.execute_batch("rollback");
-            return Err(SqlFilesError::SqlError {
-                path: file.path.clone(),
-                source,
-            });
-        }
+        )
+    {
+        let _ = conn.execute_batch("rollback");
+        return Err(SqlFilesError::SqlError {
+            path: file.path.clone(),
+            source,
+        });
     }
 
     conn.execute_batch("commit")

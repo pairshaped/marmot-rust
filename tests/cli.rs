@@ -1069,6 +1069,73 @@ name = "analytics"
 }
 
 #[test]
+fn generate_command_runs_named_database_configs_when_database_url_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db")).unwrap();
+    create_users_database(&dir.path().join("db/env.sqlite"), "env_name");
+    create_users_database(&dir.path().join("db/app.sqlite"), "app_name");
+    let analytics = Connection::open(dir.path().join("db/analytics.sqlite")).unwrap();
+    analytics
+        .execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                title text not null
+            );
+            ",
+        )
+        .unwrap();
+    drop(analytics);
+
+    let app_sql = dir.path().join("src/sql/app");
+    let analytics_sql = dir.path().join("src/sql/analytics");
+    fs::create_dir_all(&app_sql).unwrap();
+    fs::create_dir_all(&analytics_sql).unwrap();
+    fs::write(
+        app_sql.join("find_user.sql"),
+        "select id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        analytics_sql.join("list_events.sql"),
+        "select id, title from events",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[[tools.marmot.databases]]
+name = "app"
+
+[[tools.marmot.databases]]
+name = "analytics"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .env("DATABASE_URL", dir.path().join("db/env.sqlite"))
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("src/generated/sql/app/sql.rs").exists());
+    assert!(
+        dir.path()
+            .join("src/generated/sql/analytics/sql.rs")
+            .exists()
+    );
+}
+
+#[test]
 fn generate_command_rejects_named_database_output_collisions() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("db")).unwrap();

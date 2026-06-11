@@ -742,12 +742,11 @@ fn all_from_items(tokens: &[Token]) -> Vec<FromItem> {
         if tokens
             .get(index)
             .is_some_and(|token| token_is_word(token, "JOIN"))
+            && let Some((binding, after_binding)) = parse_table_binding(tokens, index + 1)
         {
-            if let Some((binding, after_binding)) = parse_table_binding(tokens, index + 1) {
-                items.push(FromItem { binding });
-                index = after_binding;
-                continue;
-            }
+            items.push(FromItem { binding });
+            index = after_binding;
+            continue;
         }
         index += 1;
     }
@@ -1207,7 +1206,7 @@ mod tests {
 
         assert_eq!(stmt.ctes.len(), 1);
         assert_eq!(stmt.ctes[0].name, "foo");
-        assert!(stmt.ctes[0].body.len() > 0);
+        assert!(!stmt.ctes[0].body.is_empty());
         assert_eq!(
             stmt.body.from,
             [FromItem {

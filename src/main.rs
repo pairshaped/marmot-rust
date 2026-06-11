@@ -292,6 +292,14 @@ fn database_targets(
         return Err(ConfigError::UnknownDatabaseName(name));
     }
 
+    if !file_config.databases.is_empty() && cli_database.is_none() {
+        return Ok(file_config
+            .databases
+            .iter()
+            .map(|(name, reference)| named_database_target(name, reference, file_config))
+            .collect());
+    }
+
     if let Some(database) = explicit_database_path(cli_database, file_config) {
         return Ok(vec![DatabaseTarget {
             name: None,
@@ -301,14 +309,6 @@ fn database_targets(
             migrations_dir: file_config.migrations_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
         }]);
-    }
-
-    if !file_config.databases.is_empty() {
-        return Ok(file_config
-            .databases
-            .iter()
-            .map(|(name, reference)| named_database_target(name, reference, file_config))
-            .collect());
     }
 
     Err(ConfigError::MissingDatabase)
