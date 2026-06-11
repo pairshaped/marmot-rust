@@ -3207,6 +3207,119 @@ mod tests {
     }
 
     #[test]
+    fn null_guard_read_parameters_are_non_nullable() {
+        for (file_name, sql, expected_name) in [
+            (
+                "prefix_null_guard.sql",
+                "select id from tasks where (@account_id is null or account_id = @account_id)",
+                "account_id",
+            ),
+            (
+                "suffix_null_guard.sql",
+                "select id from tasks where account_id = @account_id or @account_id is null",
+                "account_id",
+            ),
+            (
+                "not_null_guard.sql",
+                "select id from tasks where @account_id is not null and account_id = @account_id",
+                "account_id",
+            ),
+            (
+                "range_null_guard.sql",
+                "select id from tasks where @from_date is null or created_at >= @from_date",
+                "from_date",
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let database = dir.path().join("app.sqlite3");
+            let conn = Connection::open(&database).unwrap();
+            conn.execute_batch(
+                "
+                create table tasks (
+                    id integer primary key,
+                    account_id integer not null,
+                    created_at integer not null
+                );
+                ",
+            )
+            .unwrap();
+            drop(conn);
+
+            let source_root = dir.path().join("src");
+            let sql_dir = source_root.join("tasks/sql");
+            fs::create_dir_all(&sql_dir).unwrap();
+            fs::write(sql_dir.join(file_name), sql).unwrap();
+
+            let project = analyze_project(&Config {
+                database,
+                source_root,
+                sql_dir: None,
+                output: dir.path().join("generated"),
+                target: Target::Rust,
+                check: false,
+            })
+            .unwrap();
+
+            assert_eq!(
+                project.queries[0].parameters,
+                [Parameter {
+                    name: expected_name.to_string(),
+                    sql_names: vec![format!("@{expected_name}")],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                }],
+                "{file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_where_read_parameter_against_nullable_column_is_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tasks (
+                id integer primary key,
+                account_id integer
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tasks/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("delete_tasks.sql"),
+            "delete from tasks where account_id = @account_id",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "account_id".to_string(),
+                sql_names: vec!["@account_id".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn update_write_nullable_column_but_read_parameter_is_non_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
