@@ -5205,6 +5205,11 @@ mod tests {
             "insert or rollback into users (id, name) values (?, ?)",
         )
         .unwrap();
+        fs::write(
+            sql_dir.join("insert_abort.sql"),
+            "insert or abort into users (id, name) values (?, ?)",
+        )
+        .unwrap();
 
         let project = analyze_project(&Config {
             database,
@@ -5216,7 +5221,12 @@ mod tests {
         })
         .unwrap();
 
-        for query_name in ["insert_fail", "insert_ignore", "insert_rollback"] {
+        for query_name in [
+            "insert_abort",
+            "insert_fail",
+            "insert_ignore",
+            "insert_rollback",
+        ] {
             let query = project
                 .queries
                 .iter()

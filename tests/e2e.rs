@@ -181,6 +181,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     )
     .unwrap();
     fs::write(
+        sql_dir.join("find_name_numbered_leading_zero.sql"),
+        "select name from users where id = ?01 and active = ?02",
+    )
+    .unwrap();
+    fs::write(
         sql_dir.join("find_active_sparse_numbered.sql"),
         "select name from users where active = ?2 order by id",
     )
@@ -400,6 +405,10 @@ mod tests {
 
         assert_eq!(
             app_sql::find_name_numbered_one(&conn, 1, true).unwrap(),
+            "bob"
+        );
+        assert_eq!(
+            app_sql::find_name_numbered_leading_zero_one(&conn, 1, true).unwrap(),
             "bob"
         );
         assert_eq!(

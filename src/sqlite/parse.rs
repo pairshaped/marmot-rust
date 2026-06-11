@@ -1327,6 +1327,10 @@ mod tests {
                 InsertConflictAction::Rollback,
             ),
             (
+                "insert or abort into t (a) values (?)",
+                InsertConflictAction::Abort,
+            ),
+            (
                 "replace into t (a) values (?)",
                 InsertConflictAction::Replace,
             ),
