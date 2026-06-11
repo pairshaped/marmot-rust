@@ -25,7 +25,7 @@ Generated query functions should use:
 - `execute` for statements without result columns
 - `query_map` or `query_row` for result statements
 
-Parameter inference follows SQLite bind slots. Anonymous `?` placeholders take the next slot after the highest prior slot, numbered `?NNN` placeholders use slot `NNN`, and repeated references to the same positional slot share one generated argument. Dense positional slots bind with `params!`; sparse numbered slots bind by SQLite parameter name so generated functions do not need unused dummy arguments.
+Parameter inference follows SQLite bind slots. Named parameters occupy slots, anonymous `?` placeholders take the next slot after the highest prior slot, numbered `?NNN` placeholders use slot `NNN`, and repeated references to the same slot share one generated argument. If a numbered placeholder refers to a named slot, the generated function binds that slot once using the named placeholder. Dense positional slots bind with `params!`; sparse numbered slots bind by SQLite parameter name so generated functions do not need unused dummy arguments.
 
 The emitter should avoid:
 

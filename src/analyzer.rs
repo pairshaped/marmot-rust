@@ -390,34 +390,47 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
     let inferences = parameter_inferences(sql, schema);
     let mut params: Vec<Parameter> = Vec::new();
     let mut slots = ParameterSlots::default();
+    let mut slot_params: BTreeMap<usize, String> = BTreeMap::new();
 
     for token in tokenize(sql) {
         match token {
             Token::ParamNamed { prefix, name } => {
                 let sql_name = format!("{prefix}{name}");
-                slots.key(&Token::ParamNamed {
+                let Some(slot) = slots.slot(&Token::ParamNamed {
                     prefix,
                     name: name.clone(),
-                });
+                }) else {
+                    continue;
+                };
                 let inference = inferences
                     .get(&sql_name)
                     .cloned()
                     .unwrap_or_else(ParameterInference::default);
-                add_named_parameter(&mut params, &name, &sql_name, inference);
+                let parameter_name = if let Some(parameter_name) = slot_params.get(&slot.index) {
+                    if let Some(param) = params
+                        .iter_mut()
+                        .find(|param| param.name == *parameter_name)
+                    {
+                        if !param.sql_names.contains(&sql_name) {
+                            param.sql_names.push(sql_name);
+                        }
+                    }
+                    parameter_name.clone()
+                } else {
+                    add_named_parameter(&mut params, &name, &sql_name, inference)
+                };
+                slot_params.insert(slot.index, parameter_name);
             }
             Token::ParamAnon => {
-                let Some(placeholder) = slots.key(&Token::ParamAnon) else {
+                let Some(slot) = slots.slot(&Token::ParamAnon) else {
                     continue;
                 };
-                let slot = placeholder
-                    .strip_prefix('?')
-                    .and_then(|number| number.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let name = anonymous_parameter_name(slot);
+                let name = anonymous_parameter_name(slot.index);
                 let inference = inferences
-                    .get(&placeholder)
+                    .get(&slot.key)
                     .cloned()
                     .unwrap_or_else(ParameterInference::default);
+                slot_params.insert(slot.index, name.clone());
                 params.push(Parameter {
                     name,
                     sql_names: vec![],
@@ -427,25 +440,41 @@ fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
             }
             Token::ParamNumbered { number } => {
                 let name = numbered_parameter_name(&number);
-                let Some(placeholder) = slots.key(&Token::ParamNumbered {
+                let Some(slot) = slots.slot(&Token::ParamNumbered {
                     number: number.clone(),
                 }) else {
                     continue;
                 };
                 let sql_name = format!("?{number}");
                 let inference = inferences
-                    .get(&placeholder)
+                    .get(&slot.key)
                     .cloned()
                     .unwrap_or_else(ParameterInference::default);
-                if let Some(param) = params
+                if let Some(parameter_name) = slot_params.get(&slot.index) {
+                    if let Some(param) = params
+                        .iter_mut()
+                        .find(|param| param.name == *parameter_name)
+                    {
+                        if param
+                            .sql_names
+                            .iter()
+                            .all(|sql_name| sql_name.starts_with('?'))
+                            && !param.sql_names.contains(&sql_name)
+                        {
+                            param.sql_names.push(sql_name.clone());
+                        }
+                    }
+                } else if let Some(param) = params
                     .iter_mut()
                     .find(|param| parameter_matches_positional_index(param, &number))
                 {
                     if !param.sql_names.contains(&sql_name) {
                         param.sql_names.push(sql_name);
                     }
+                    slot_params.insert(slot.index, param.name.clone());
                 } else {
                     let name = unique_parameter_name(&name, &params);
+                    slot_params.insert(slot.index, name.clone());
                     params.push(Parameter {
                         name,
                         sql_names: vec![sql_name],
@@ -490,7 +519,7 @@ fn add_named_parameter(
     raw_name: &str,
     sql_name: &str,
     inference: ParameterInference,
-) {
+) -> String {
     let logical_name = raw_name.to_ascii_lowercase();
     let name = sanitize_identifier(&raw_name.to_snake_case());
     let sql_name = sql_name.to_string();
@@ -501,14 +530,16 @@ fn add_named_parameter(
         if !param.sql_names.contains(&sql_name) {
             param.sql_names.push(sql_name);
         }
+        param.name.clone()
     } else {
         let name = unique_parameter_name(&name, params);
         params.push(Parameter {
-            name,
+            name: name.clone(),
             sql_names: vec![sql_name],
             column_type: inference.column_type,
             nullable: inference.nullable,
         });
+        name
     }
 }
 
@@ -600,8 +631,18 @@ struct ParameterSlots {
     named_slots: BTreeMap<String, usize>,
 }
 
+#[derive(Debug)]
+struct ParameterSlot {
+    key: String,
+    index: usize,
+}
+
 impl ParameterSlots {
     fn key(&mut self, token: &Token) -> Option<String> {
+        self.slot(token).map(|slot| slot.key)
+    }
+
+    fn slot(&mut self, token: &Token) -> Option<ParameterSlot> {
         match token {
             Token::ParamNamed { prefix, name } => {
                 let sql_name = format!("{prefix}{name}");
@@ -609,16 +650,25 @@ impl ParameterSlots {
                     self.next_index += 1;
                     self.named_slots.insert(sql_name.clone(), self.next_index);
                 }
-                Some(sql_name)
+                Some(ParameterSlot {
+                    index: self.named_slots[&sql_name],
+                    key: sql_name,
+                })
             }
             Token::ParamNumbered { number } => {
                 let index = numbered_parameter_index(number);
                 self.next_index = self.next_index.max(index);
-                Some(anonymous_placeholder_key(index))
+                Some(ParameterSlot {
+                    key: anonymous_placeholder_key(index),
+                    index,
+                })
             }
             Token::ParamAnon => {
                 self.next_index += 1;
-                Some(anonymous_placeholder_key(self.next_index))
+                Some(ParameterSlot {
+                    key: anonymous_placeholder_key(self.next_index),
+                    index: self.next_index,
+                })
             }
             _ => None,
         }
@@ -2663,8 +2713,22 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_numbered_parameter_names_that_collide_with_named_parameters() {
+    fn deduplicates_named_and_numbered_parameters_that_share_a_sqlite_slot() {
         let params = parameters("where name = @param and id = ?1", &Schema::default());
+        let names = params
+            .into_iter()
+            .map(|param| (param.name, param.sql_names))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, [("param".to_string(), vec!["@param".to_string()])]);
+    }
+
+    #[test]
+    fn deduplicates_numbered_parameters_that_reference_later_named_slots() {
+        let params = parameters(
+            "where id = ?1 and name = @name and nickname = ?2",
+            &Schema::default(),
+        );
         let names = params
             .into_iter()
             .map(|param| (param.name, param.sql_names))
@@ -2673,8 +2737,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                ("param".to_string(), vec!["@param".to_string()]),
-                ("param_2".to_string(), vec!["?1".to_string()]),
+                ("param".to_string(), vec!["?1".to_string()]),
+                ("name".to_string(), vec!["@name".to_string()]),
             ]
         );
     }
@@ -7065,6 +7129,71 @@ mod tests {
         assert_eq!(
             facts,
             [("id", ValueType::I64, false), ("rk", ValueType::I64, false)]
+        );
+    }
+
+    #[test]
+    fn dense_rank_and_ntile_window_functions_return_i64_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer primary key,
+                name text not null,
+                score integer not null,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("ranked_items.sql"),
+            "
+            select
+                id,
+                dense_rank() over (order by score desc) as dense_position,
+                ntile(4) over (order by created_at) as quartile
+            from items
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("id", ValueType::I64, false),
+                ("dense_position", ValueType::I64, false),
+                ("quartile", ValueType::I64, false),
+            ]
         );
     }
 

@@ -191,6 +191,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     )
     .unwrap();
     fs::write(
+        sql_dir.join("find_name_named_numbered_same_slot.sql"),
+        "select name from users where id = @id and id = ?1",
+    )
+    .unwrap();
+    fs::write(
         sql_dir.join("create_user_returning_star.sql"),
         "insert into users (name, active, avatar, score, nickname) \
          values (@name, @active, @avatar, @score, @nickname) \
@@ -390,6 +395,10 @@ mod tests {
         );
         assert_eq!(
             app_sql::find_name_mixed_positional_one(&conn, 1, true).unwrap(),
+            "bob"
+        );
+        assert_eq!(
+            app_sql::find_name_named_numbered_same_slot_one(&conn, 1).unwrap(),
             "bob"
         );
     }
