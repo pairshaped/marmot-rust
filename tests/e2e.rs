@@ -218,6 +218,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     )
     .unwrap();
     fs::write(
+        sql_dir.join("find_typed_thing.sql"),
+        r#"select id, "type" from typed_things where "type" = @type"#,
+    )
+    .unwrap();
+    fs::write(
         sql_dir.join("get_user_shared.sql"),
         "-- returns: UserRow\nselect id, name from users where id = @id",
     )
@@ -271,6 +276,10 @@ fn create_runtime_schema(conn: &Connection) {
             id integer not null,
             name text not null
         );
+        create table typed_things (
+            id integer primary key,
+            "type" text not null
+        );
         "#,
     )
     .unwrap();
@@ -318,6 +327,10 @@ mod tests {
             create table "returning" (
                 id integer not null,
                 name text not null
+            );
+            create table typed_things (
+                id integer primary key,
+                "type" text not null
             );
             "#,
         )
@@ -447,6 +460,23 @@ mod tests {
             app_sql::find_keyword_table_row_one(&conn, 10).unwrap(),
             "keyword"
         );
+    }
+
+    #[test]
+    fn generated_functions_handle_reserved_word_column_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        conn.execute(
+            r#"insert into typed_things (id, "type") values (1, 'primary')"#,
+            [],
+        )
+        .unwrap();
+
+        let rows = app_sql::find_typed_thing(&conn, "primary").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].type_, "primary");
     }
 
     #[test]
