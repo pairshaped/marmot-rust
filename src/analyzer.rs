@@ -5187,6 +5187,44 @@ mod tests {
     }
 
     #[test]
+    fn invalid_insert_values_default_is_rejected_by_sqlite_prepare() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table events (
+                id integer primary key,
+                name text not null default 'untitled',
+                created_at integer not null default 0
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("events/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_event.sql"),
+            "insert into events (id, name, created_at) values (?, default, ?)",
+        )
+        .unwrap();
+
+        let result = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        });
+
+        assert!(matches!(result, Err(Error::PrepareSql { .. })));
+    }
+
+    #[test]
     fn infers_insert_or_replace_parameter_types_and_primary_key_nullability() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
