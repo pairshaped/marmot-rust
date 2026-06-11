@@ -2116,6 +2116,13 @@ fn infer_expression_tokens(
     {
         return infer_cast_expression(tokens);
     }
+    if let [Token::Minus | Token::Plus, Token::Number(number)] = tokens {
+        return Some(ExpressionInference {
+            column_type: Some(number_value_type(number)),
+            inferred_nullable: Some(false),
+            nullable_override: None,
+        });
+    }
     if let Some(Token::Number(number)) = tokens.first() {
         return Some(ExpressionInference {
             column_type: Some(number_value_type(number)),
@@ -2182,7 +2189,7 @@ fn infer_top_level_numeric_binary_expression(
         match token {
             Token::OpenParen => depth += 1,
             Token::CloseParen => depth = depth.saturating_sub(1),
-            Token::Plus | Token::Minus if depth == 0 => {
+            Token::Plus | Token::Minus if depth == 0 && index > 0 => {
                 let left = infer_expression_tokens(&tokens[..index], context)?;
                 let right = infer_expression_tokens(&tokens[index + 1..], context)?;
                 let column_type = common_numeric_type(left.column_type?, right.column_type?)?;
@@ -7111,6 +7118,124 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(facts, [("total", ValueType::F64, true)]);
+    }
+
+    #[test]
+    fn avg_min_and_max_return_aggregate_result_types() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table scores (
+                score integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("scores/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("summarize_scores.sql"),
+            "
+            select avg(score) as avg_score, min(score) as min_score, max(score) as max_score
+            from scores
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("avg_score", ValueType::F64, true),
+                ("min_score", ValueType::I64, true),
+                ("max_score", ValueType::I64, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_result_expressions_infer_result_types() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("reports/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("literal_values.sql"),
+            "
+            select 42 as answer,
+                   -5 as debt,
+                   3.14 as ratio,
+                   -3.14 as negative_ratio,
+                   'hello' as greeting
+            from t
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("answer", ValueType::I64, false),
+                ("debt", ValueType::I64, false),
+                ("ratio", ValueType::F64, false),
+                ("negative_ratio", ValueType::F64, false),
+                ("greeting", ValueType::String, false),
+            ]
+        );
     }
 
     #[test]
