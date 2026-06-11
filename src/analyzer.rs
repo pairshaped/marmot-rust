@@ -4540,6 +4540,72 @@ mod tests {
     }
 
     #[test]
+    fn string_literals_in_insert_values_do_not_split_value_positions() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table notes (
+                id integer primary key,
+                title text not null,
+                body text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("notes/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("insert_note.sql"),
+            "insert into notes (id, title, body) values (?, 'hello, world', ?)",
+        )
+        .unwrap();
+        fs::write(
+            sql_dir.join("insert_quoted_note.sql"),
+            "insert into notes (id, title, body) values (?, 'it''s, complicated', ?)",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        for query in &project.queries {
+            let facts = query
+                .parameters
+                .iter()
+                .map(|param| {
+                    (
+                        param.name.as_str(),
+                        param.column_type.clone(),
+                        param.nullable,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                facts,
+                [
+                    ("param", ValueType::I64, true),
+                    ("param_2", ValueType::String, false),
+                ],
+                "{}",
+                query.name
+            );
+        }
+    }
+
+    #[test]
     fn infers_insert_select_parameters_from_target_columns() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
