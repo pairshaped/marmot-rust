@@ -8005,6 +8005,64 @@ mod tests {
     }
 
     #[test]
+    fn group_by_with_count_infers_grouped_column_and_count_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tickets (
+                id integer primary key,
+                status text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tickets/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("count_by_status.sql"),
+            "
+            select status, count(*) as cnt
+            from tickets
+            group by status
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "status".to_string(),
+                    field_name: "status".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "cnt".to_string(),
+                    field_name: "cnt".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn group_by_multiple_columns_preserves_grouped_columns_and_sum_type() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -8140,6 +8198,75 @@ mod tests {
     }
 
     #[test]
+    fn group_by_with_having_param_infers_aggregate_param_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table tickets (
+                id integer primary key,
+                status text not null,
+                count integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("tickets/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("large_status_totals.sql"),
+            "
+            select status, sum(count) as total
+            from tickets
+            group by status
+            having sum(count) > ?
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "status".to_string(),
+                    field_name: "status".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Column {
+                    name: "total".to_string(),
+                    field_name: "total".to_string(),
+                    column_type: ValueType::F64,
+                    nullable: true,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn compound_query_as_subquery_infers_outer_where_param() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -8212,6 +8339,164 @@ mod tests {
                 nullable: false,
             }]
         );
+    }
+
+    #[test]
+    fn union_parameters_in_both_arms_keep_positional_order_and_column_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table active_users (
+                id integer primary key,
+                name text not null
+            );
+            create table archived_users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_matching_users.sql"),
+            "
+            select id, name from active_users where name = ?
+            union
+            select id, name from archived_users where name = ?
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "name".to_string(),
+                    field_name: "name".to_string(),
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "param".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "param_2".to_string(),
+                    sql_names: vec![],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn union_and_union_all_preserve_first_arm_result_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table active_users (
+                id integer primary key,
+                name text not null
+            );
+            create table archived_users (
+                id integer primary key,
+                name text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_all_users.sql"),
+            "
+            select id, name from active_users
+            union
+            select id, name from archived_users
+            ",
+        )
+        .unwrap();
+        fs::write(
+            sql_dir.join("list_all_users_with_duplicates.sql"),
+            "
+            select id, name from active_users
+            union all
+            select id, name from archived_users
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        for query_name in ["list_all_users", "list_all_users_with_duplicates"] {
+            let query = project
+                .queries
+                .iter()
+                .find(|query| query.name == query_name)
+                .unwrap();
+            assert_eq!(
+                query.columns,
+                [
+                    Column {
+                        name: "id".to_string(),
+                        field_name: "id".to_string(),
+                        column_type: ValueType::I64,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        field_name: "name".to_string(),
+                        column_type: ValueType::String,
+                        nullable: false,
+                    },
+                ],
+                "{query_name}"
+            );
+        }
     }
 
     #[test]
