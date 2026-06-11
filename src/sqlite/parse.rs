@@ -25,6 +25,22 @@ pub enum AliasError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedColumn<T> {
+    pub table: String,
+    pub column: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnResolution<T> {
+    Resolved(ResolvedColumn<T>),
+    AmbiguousColumn,
+    UnknownBareColumn,
+    UnknownColumnInKnownTable,
+    UnknownQualifiedAlias,
+    UnknownTableRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     Select(SelectStmt),
     Insert(InsertStmt),
@@ -636,6 +652,58 @@ pub fn build_alias_map(bindings: &[TableBinding]) -> Result<BTreeMap<String, Str
     Ok(map)
 }
 
+pub fn resolve_qualified<'a, C>(
+    aliases: &BTreeMap<String, String>,
+    qualifier: &str,
+    column: &str,
+    schema: &'a BTreeMap<String, BTreeMap<String, C>>,
+) -> ColumnResolution<&'a C> {
+    let Some(table) = aliases.get(&qualifier.to_ascii_lowercase()) else {
+        return ColumnResolution::UnknownQualifiedAlias;
+    };
+    let Some(columns) = schema.get(table) else {
+        return ColumnResolution::UnknownTableRef;
+    };
+    let Some(column) = columns.get(&column.to_ascii_lowercase()) else {
+        return ColumnResolution::UnknownColumnInKnownTable;
+    };
+
+    ColumnResolution::Resolved(ResolvedColumn {
+        table: table.clone(),
+        column,
+    })
+}
+
+pub fn resolve_bare<'a, C>(
+    aliases: &BTreeMap<String, String>,
+    column: &str,
+    schema: &'a BTreeMap<String, BTreeMap<String, C>>,
+) -> ColumnResolution<&'a C> {
+    let column = column.to_ascii_lowercase();
+    let mut unknown_table = false;
+    let mut matches = Vec::new();
+
+    for table in aliases.values() {
+        let Some(columns) = schema.get(table) else {
+            unknown_table = true;
+            continue;
+        };
+        if let Some(schema_column) = columns.get(&column) {
+            matches.push(ResolvedColumn {
+                table: table.clone(),
+                column: schema_column,
+            });
+        }
+    }
+
+    match matches.len() {
+        0 if unknown_table => ColumnResolution::UnknownTableRef,
+        0 => ColumnResolution::UnknownBareColumn,
+        1 => ColumnResolution::Resolved(matches.remove(0)),
+        _ => ColumnResolution::AmbiguousColumn,
+    }
+}
+
 pub fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
     let mut refs = BTreeMap::new();
     for item in all_from_items(tokens) {
@@ -849,6 +917,60 @@ mod tests {
 
     fn parse_sql(sql: &str) -> Statement {
         parse_statement(&tokenize(sql))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestColumn {
+        name: &'static str,
+        ty: &'static str,
+        nullable: bool,
+    }
+
+    fn test_schema() -> BTreeMap<String, BTreeMap<String, TestColumn>> {
+        BTreeMap::from([
+            (
+                "users".to_string(),
+                BTreeMap::from([
+                    (
+                        "id".to_string(),
+                        TestColumn {
+                            name: "id",
+                            ty: "integer",
+                            nullable: false,
+                        },
+                    ),
+                    (
+                        "email".to_string(),
+                        TestColumn {
+                            name: "email",
+                            ty: "text",
+                            nullable: false,
+                        },
+                    ),
+                ]),
+            ),
+            (
+                "orders".to_string(),
+                BTreeMap::from([
+                    (
+                        "id".to_string(),
+                        TestColumn {
+                            name: "id",
+                            ty: "integer",
+                            nullable: false,
+                        },
+                    ),
+                    (
+                        "total".to_string(),
+                        TestColumn {
+                            name: "total",
+                            ty: "integer",
+                            nullable: false,
+                        },
+                    ),
+                ]),
+            ),
+        ])
     }
 
     #[test]
@@ -1514,6 +1636,144 @@ mod tests {
         assert_eq!(
             build_alias_map(&bindings),
             Err(AliasError::Collision("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolves_qualified_known_columns() {
+        let bindings = [
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "users".to_string(),
+                },
+                alias: Some("u".to_string()),
+            },
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "orders".to_string(),
+                },
+                alias: Some("o".to_string()),
+            },
+        ];
+        let aliases = build_alias_map(&bindings).unwrap();
+        let schema = test_schema();
+
+        let ColumnResolution::Resolved(column) = resolve_qualified(&aliases, "u", "email", &schema)
+        else {
+            panic!("expected resolved column");
+        };
+
+        assert_eq!(column.table, "users");
+        assert_eq!(column.column.name, "email");
+    }
+
+    #[test]
+    fn reports_qualified_resolution_failures() {
+        let bindings = [TableBinding {
+            table: TableRef {
+                schema: None,
+                name: "users".to_string(),
+            },
+            alias: Some("u".to_string()),
+        }];
+        let aliases = build_alias_map(&bindings).unwrap();
+        let schema = test_schema();
+
+        assert_eq!(
+            resolve_qualified(&aliases, "x", "id", &schema),
+            ColumnResolution::UnknownQualifiedAlias
+        );
+        assert_eq!(
+            resolve_qualified(&aliases, "u", "nope", &schema),
+            ColumnResolution::UnknownColumnInKnownTable
+        );
+
+        let unknown_table_aliases = build_alias_map(&[TableBinding {
+            table: TableRef {
+                schema: None,
+                name: "foo_cte".to_string(),
+            },
+            alias: None,
+        }])
+        .unwrap();
+        assert_eq!(
+            resolve_qualified(&unknown_table_aliases, "foo_cte", "x", &schema),
+            ColumnResolution::UnknownTableRef
+        );
+    }
+
+    #[test]
+    fn resolves_bare_columns() {
+        let aliases = build_alias_map(&[TableBinding {
+            table: TableRef {
+                schema: None,
+                name: "users".to_string(),
+            },
+            alias: Some("u".to_string()),
+        }])
+        .unwrap();
+        let schema = test_schema();
+
+        let ColumnResolution::Resolved(column) = resolve_bare(&aliases, "email", &schema) else {
+            panic!("expected resolved column");
+        };
+
+        assert_eq!(column.table, "users");
+        assert_eq!(column.column.name, "email");
+    }
+
+    #[test]
+    fn reports_bare_resolution_failures() {
+        let schema = test_schema();
+        let aliases = build_alias_map(&[
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "users".to_string(),
+                },
+                alias: Some("u".to_string()),
+            },
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "orders".to_string(),
+                },
+                alias: Some("o".to_string()),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            resolve_bare(&aliases, "id", &schema),
+            ColumnResolution::AmbiguousColumn
+        );
+        assert_eq!(
+            resolve_bare(&aliases, "missing", &schema),
+            ColumnResolution::UnknownBareColumn
+        );
+
+        let unknown_table_aliases = build_alias_map(&[
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "users".to_string(),
+                },
+                alias: Some("u".to_string()),
+            },
+            TableBinding {
+                table: TableRef {
+                    schema: None,
+                    name: "foo_cte".to_string(),
+                },
+                alias: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_bare(&unknown_table_aliases, "x", &schema),
+            ColumnResolution::UnknownTableRef
         );
     }
 
