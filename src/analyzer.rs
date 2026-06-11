@@ -2604,6 +2604,57 @@ mod tests {
     }
 
     #[test]
+    fn infers_parameter_type_from_indexed_non_first_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                username text not null,
+                email text not null,
+                age integer not null
+            );
+            create index users_email_idx on users(email);
+            insert into users (id, username, email, age)
+            values (1, 'alice', 'alice@example.com', 30);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("users/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("find_users.sql"),
+            "select id, username, email, age from users where email = ?",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec![],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn infers_numbered_parameter_types_by_sqlite_index() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -2768,6 +2819,72 @@ mod tests {
     }
 
     #[test]
+    fn infers_update_parameters_inside_coalesce_assignments() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table participants (
+                id integer primary key,
+                gender text,
+                birthdate text,
+                updated_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("participants/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("update_participant.sql"),
+            "
+            update participants
+            set gender = coalesce(@gender, gender),
+                birthdate = coalesce(@birthdate, birthdate),
+                updated_at = @updated_at
+            where id = @id
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("gender", ValueType::String, true),
+                ("birthdate", ValueType::String, true),
+                ("updated_at", ValueType::I64, false),
+                ("id", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
     fn update_with_eq_subquery_infers_set_and_nested_where_parameters() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -2842,6 +2959,83 @@ mod tests {
                 ("updated_at", ValueType::I64, false),
                 ("item_id", ValueType::I64, false),
                 ("account_id", ValueType::I64, false),
+                ("org_id", ValueType::I64, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_update_parameters_inside_in_subquery() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table line_item_question_values (
+                id integer primary key,
+                line_item_id integer not null,
+                question_key text not null,
+                question_name text
+            );
+            create table line_items (
+                id integer primary key,
+                order_id integer not null
+            );
+            create table orders (
+                id integer primary key,
+                org_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("questions/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("update_question_names.sql"),
+            "
+            update line_item_question_values
+            set question_name = @question_name
+            where question_key = @question_key
+              and line_item_id in (
+                select li.id
+                from line_items li
+                join orders o on o.id = li.order_id
+                where o.org_id = @org_id
+              )
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| {
+                (
+                    param.name.as_str(),
+                    param.column_type.clone(),
+                    param.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("question_name", ValueType::String, true),
+                ("question_key", ValueType::String, false),
                 ("org_id", ValueType::I64, false),
             ]
         );
