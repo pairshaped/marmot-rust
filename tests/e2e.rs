@@ -207,6 +207,16 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         "select name from \"returning\" where id = @id",
     )
     .unwrap();
+    fs::write(
+        sql_dir.join("get_user_shared.sql"),
+        "-- returns: UserRow\nselect id, name from users where id = @id",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("list_users_shared.sql"),
+        "-- returns: UserRow\nselect id, name from users order by id",
+    )
+    .unwrap();
 
     let config = Config {
         database,
@@ -419,6 +429,28 @@ mod tests {
             app_sql::find_keyword_table_row_one(&conn, 10).unwrap(),
             "keyword"
         );
+    }
+
+    #[test]
+    fn generated_functions_share_return_row_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        app_sql::create_user(&conn, "dana", true, [1_u8], 3.0, None).unwrap();
+        app_sql::create_user(&conn, "erin", false, [2_u8], 4.0, None).unwrap();
+
+        let dana: app_sql::UserRow = app_sql::get_user_shared(&conn, 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(dana.id, 1);
+        assert_eq!(dana.name, "dana");
+
+        let users: Vec<app_sql::UserRow> = app_sql::list_users_shared(&conn).unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[1].id, 2);
+        assert_eq!(users[1].name, "erin");
     }
 }
 "##,
