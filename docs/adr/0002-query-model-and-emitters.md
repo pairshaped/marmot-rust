@@ -30,7 +30,9 @@ The analyzer owns source discovery, SQL loading, SQLite introspection, named par
 
 Emitters consume a language-neutral query model. They should not inspect SQLite directly.
 
-The analyzer should use direct SQLite introspection as its foundation. When SQLite does not expose enough metadata, the analyzer should use parsed SQL structure to recover query facts. That includes table bindings and aliases, expression inference, CTE-derived schema, parameter slot mapping, and nullability overrides.
+The analyzer should use direct SQLite introspection as its foundation. When SQLite does not expose enough metadata, the analyzer should use parsed SQL structure to recover query facts. The parser should model statement skeletons for `SELECT`, `INSERT`, `UPDATE`, and `DELETE`: table bindings, aliases, CTE definitions, source and target tables, clause boundaries, and returning clauses. Expression internals can stay in targeted inference code until a deeper expression model earns its shape.
+
+Analyzer inference also owns CTE-derived schema, parameter slot mapping, nullability overrides, and expression-derived parameter and result types.
 
 SQLx may be used as a reference implementation, test oracle, or optional verification backend, but Marmot should not depend on SQLx for its core runtime output.
 
