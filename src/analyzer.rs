@@ -2289,7 +2289,7 @@ fn infer_coalesce_expression(
     }
 
     Some(ExpressionInference {
-        column_type,
+        column_type: Some(column_type.unwrap_or(ValueType::String)),
         inferred_nullable: Some(nullable),
         nullable_override: None,
     })
@@ -7716,6 +7716,63 @@ mod tests {
                 ("ratio", ValueType::F64, false),
                 ("negative_ratio", ValueType::F64, false),
                 ("greeting", ValueType::String, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_literal_result_expressions_infer_result_types() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table t (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("reports/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("coalesce_values.sql"),
+            "
+            select coalesce(null, 42) as answer,
+                   coalesce(null, 3.14) as ratio,
+                   coalesce(null, 'fallback') as label,
+                   coalesce(null, null) as unknown
+            from t
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("answer", ValueType::I64, false),
+                ("ratio", ValueType::F64, false),
+                ("label", ValueType::String, false),
+                ("unknown", ValueType::String, true),
             ]
         );
     }
