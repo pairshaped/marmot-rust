@@ -3370,6 +3370,52 @@ mod tests {
     }
 
     #[test]
+    fn read_parameter_with_is_not_operator_uses_column_type_and_is_non_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table standings (
+                id integer primary key,
+                season text
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("standings/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_standings.sql"),
+            "select id from standings where season is not @season",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "season".to_string(),
+                sql_names: vec!["@season".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn null_guard_read_parameters_are_non_nullable() {
         for (file_name, sql, expected_name) in [
             (
@@ -3969,6 +4015,42 @@ mod tests {
                 column_type: ValueType::I64,
                 nullable: false,
             }]
+        );
+    }
+
+    #[test]
+    fn with_update_parameters_use_write_target_columns() {
+        let params = analyze_single_query(
+            "
+            create table users (
+                id integer primary key,
+                active boolean not null
+            );
+            ",
+            "
+            with ids as (select 1 as id)
+            update users
+            set active = @active
+            where id = @id
+            ",
+        );
+
+        assert_eq!(
+            params,
+            [
+                Parameter {
+                    name: "active".to_string(),
+                    sql_names: vec!["@active".to_string()],
+                    column_type: ValueType::Bool,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
         );
     }
 
@@ -7708,6 +7790,64 @@ mod tests {
                     column_type: ValueType::I64,
                     nullable: false,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_sorter_preserves_result_column_metadata() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer not null primary key,
+                name_en text not null,
+                name_fr text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let sql_dir = source_root.join("items/sql");
+        fs::create_dir_all(&sql_dir).unwrap();
+        fs::write(
+            sql_dir.join("list_items.sql"),
+            "select id, name_en, name_fr from items order by name_fr",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            sql_dir: None,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        let facts = project.queries[0]
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.field_name.as_str(),
+                    column.column_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            facts,
+            [
+                ("id", ValueType::I64, false),
+                ("name_en", ValueType::String, false),
+                ("name_fr", ValueType::String, false),
             ]
         );
     }

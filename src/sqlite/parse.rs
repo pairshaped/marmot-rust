@@ -76,6 +76,7 @@ pub struct SelectBody {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertStmt {
+    pub ctes: Vec<CteDef>,
     pub conflict_action: InsertConflictAction,
     pub target: TableBinding,
     pub column_list: Option<Vec<String>>,
@@ -96,6 +97,7 @@ pub enum InsertSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateStmt {
+    pub ctes: Vec<CteDef>,
     pub target: TableBinding,
     pub set: Vec<Token>,
     pub from: Vec<FromItem>,
@@ -105,6 +107,7 @@ pub struct UpdateStmt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteStmt {
+    pub ctes: Vec<CteDef>,
     pub target: TableBinding,
     pub where_clause: Option<Vec<Token>>,
     pub returning: Option<Vec<Token>>,
@@ -120,21 +123,20 @@ pub enum InsertConflictAction {
 }
 
 pub fn parse_statement(tokens: &[Token]) -> Statement {
-    match tokens.first() {
-        Some(token) if token_is_word(token, "SELECT") || token_is_word(token, "WITH") => {
-            parse_select(tokens)
-                .map(Statement::Select)
-                .unwrap_or(Statement::Unsupported)
-        }
+    let (ctes, body_tokens) = parse_ctes(tokens);
+    match body_tokens.first() {
+        Some(token) if token_is_word(token, "SELECT") => parse_select_with_ctes(ctes, body_tokens)
+            .map(Statement::Select)
+            .unwrap_or(Statement::Unsupported),
         Some(token) if token_is_word(token, "INSERT") || token_is_word(token, "REPLACE") => {
-            parse_insert(tokens)
+            parse_insert_with_ctes(ctes, body_tokens)
                 .map(Statement::Insert)
                 .unwrap_or(Statement::Unsupported)
         }
-        Some(token) if token_is_word(token, "UPDATE") => parse_update(tokens)
+        Some(token) if token_is_word(token, "UPDATE") => parse_update_with_ctes(ctes, body_tokens)
             .map(Statement::Update)
             .unwrap_or(Statement::Unsupported),
-        Some(token) if token_is_word(token, "DELETE") => parse_delete(tokens)
+        Some(token) if token_is_word(token, "DELETE") => parse_delete_with_ctes(ctes, body_tokens)
             .map(Statement::Delete)
             .unwrap_or(Statement::Unsupported),
         _ => Statement::Unsupported,
@@ -143,6 +145,10 @@ pub fn parse_statement(tokens: &[Token]) -> Statement {
 
 fn parse_select(tokens: &[Token]) -> Option<SelectStmt> {
     let (ctes, body_tokens) = parse_ctes(tokens);
+    parse_select_with_ctes(ctes, body_tokens)
+}
+
+fn parse_select_with_ctes(ctes: Vec<CteDef>, body_tokens: &[Token]) -> Option<SelectStmt> {
     Some(SelectStmt {
         ctes,
         body: parse_select_body(body_tokens)?,
@@ -297,7 +303,7 @@ fn parse_select_body(tokens: &[Token]) -> Option<SelectBody> {
     })
 }
 
-fn parse_insert(tokens: &[Token]) -> Option<InsertStmt> {
+fn parse_insert_with_ctes(ctes: Vec<CteDef>, tokens: &[Token]) -> Option<InsertStmt> {
     let (conflict_action, after_conflict) = parse_insert_conflict_action(tokens);
     if !tokens
         .get(after_conflict)
@@ -314,6 +320,7 @@ fn parse_insert(tokens: &[Token]) -> Option<InsertStmt> {
     let (returning, _) = take_clause(after_upsert, "RETURNING", &[]);
 
     Some(InsertStmt {
+        ctes,
         conflict_action,
         target,
         column_list,
@@ -441,7 +448,7 @@ fn parse_insert_conflict_action(tokens: &[Token]) -> (InsertConflictAction, usiz
     }
 }
 
-fn parse_update(tokens: &[Token]) -> Option<UpdateStmt> {
+fn parse_update_with_ctes(ctes: Vec<CteDef>, tokens: &[Token]) -> Option<UpdateStmt> {
     let after_update = after_update_keyword(tokens)?;
     let (target, after_target) = parse_table_binding(tokens, after_update)?;
     if !tokens
@@ -459,6 +466,7 @@ fn parse_update(tokens: &[Token]) -> Option<UpdateStmt> {
     let (returning, _) = take_clause(after_where, "RETURNING", &[]);
 
     Some(UpdateStmt {
+        ctes,
         target,
         set: set.to_vec(),
         from: from_slice.map(from_items_from_clause).unwrap_or_default(),
@@ -578,7 +586,7 @@ fn from_items_from_clause(tokens: &[Token]) -> Vec<FromItem> {
     from_items(&prefixed)
 }
 
-fn parse_delete(tokens: &[Token]) -> Option<DeleteStmt> {
+fn parse_delete_with_ctes(ctes: Vec<CteDef>, tokens: &[Token]) -> Option<DeleteStmt> {
     if !tokens
         .first()
         .is_some_and(|token| token_is_word(token, "DELETE"))
@@ -594,6 +602,7 @@ fn parse_delete(tokens: &[Token]) -> Option<DeleteStmt> {
     let (returning, _) = take_clause(after_where, "RETURNING", &[]);
 
     Some(DeleteStmt {
+        ctes,
         target,
         where_clause: where_clause.map(<[Token]>::to_vec),
         returning: returning.map(<[Token]>::to_vec),
@@ -978,6 +987,7 @@ mod tests {
         assert_eq!(
             parse_sql("insert into t (a) values (?)"),
             Statement::Insert(InsertStmt {
+                ctes: Vec::new(),
                 conflict_action: InsertConflictAction::Abort,
                 target: TableBinding {
                     table: TableRef {
@@ -1221,6 +1231,49 @@ mod tests {
         };
 
         assert_eq!(stmt.ctes[0].columns, ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parses_with_insert_statement() {
+        let Statement::Insert(stmt) =
+            parse_sql("with source as (select 1 as a) insert into t (a) select a from source")
+        else {
+            panic!("expected insert statement");
+        };
+
+        assert_eq!(stmt.ctes.len(), 1);
+        assert_eq!(stmt.ctes[0].name, "source");
+        assert_eq!(stmt.target.table.name, "t");
+        assert_eq!(stmt.column_list, Some(vec!["a".to_string()]));
+        assert!(matches!(stmt.source, InsertSource::Select(_)));
+    }
+
+    #[test]
+    fn parses_with_update_statement() {
+        let Statement::Update(stmt) = parse_sql(
+            "with source as (select 1 as id) update users set name = 'x' where id in (select id from source)",
+        ) else {
+            panic!("expected update statement");
+        };
+
+        assert_eq!(stmt.ctes.len(), 1);
+        assert_eq!(stmt.ctes[0].name, "source");
+        assert_eq!(stmt.target.table.name, "users");
+        assert!(stmt.where_clause.is_some());
+    }
+
+    #[test]
+    fn parses_with_delete_statement() {
+        let Statement::Delete(stmt) = parse_sql(
+            "with source as (select 1 as id) delete from users where id in (select id from source)",
+        ) else {
+            panic!("expected delete statement");
+        };
+
+        assert_eq!(stmt.ctes.len(), 1);
+        assert_eq!(stmt.ctes[0].name, "source");
+        assert_eq!(stmt.target.table.name, "users");
+        assert!(stmt.where_clause.is_some());
     }
 
     #[test]
