@@ -228,6 +228,19 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     )
     .unwrap();
     fs::write(
+        sql_dir.join("create_event.sql"),
+        "insert into events (name, event_date, starts_at) \
+         values (@name, @event_date, @starts_at) \
+         returning id, event_date, starts_at, created_at",
+    )
+    .unwrap();
+    fs::write(
+        sql_dir.join("list_events_since.sql"),
+        "select id, event_date, starts_at, created_at \
+         from events where starts_at >= @starts_at order by id",
+    )
+    .unwrap();
+    fs::write(
         sql_dir.join("get_user_shared.sql"),
         "-- returns: UserRow\nselect id, name from users where id = @id",
     )
@@ -285,6 +298,13 @@ fn create_runtime_schema(conn: &Connection) {
             id integer primary key,
             "type" text not null
         );
+        create table events (
+            id integer primary key,
+            name text not null,
+            event_date date not null,
+            starts_at datetime not null,
+            created_at timestamp not null default current_timestamp
+        );
         "#,
     )
     .unwrap();
@@ -336,6 +356,13 @@ mod tests {
             create table typed_things (
                 id integer primary key,
                 "type" text not null
+            );
+            create table events (
+                id integer primary key,
+                name text not null,
+                event_date date not null,
+                starts_at datetime not null,
+                created_at timestamp not null default current_timestamp
             );
             "#,
         )
@@ -486,6 +513,30 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].type_, "primary");
+    }
+
+    #[test]
+    fn generated_functions_treat_sqlite_temporal_types_as_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        let created = app_sql::create_event(
+            &conn,
+            "launch",
+            "2026-06-11",
+            "2026-06-11 09:30:00",
+        )
+        .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].event_date, "2026-06-11");
+        assert_eq!(created[0].starts_at, "2026-06-11 09:30:00");
+        assert!(created[0].created_at.len() >= 19);
+
+        let rows = app_sql::list_events_since(&conn, "2026-06-11 00:00:00").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_date, "2026-06-11");
+        assert_eq!(rows[0].starts_at, "2026-06-11 09:30:00");
+        assert_eq!(rows[0].created_at, created[0].created_at);
     }
 
     #[test]
