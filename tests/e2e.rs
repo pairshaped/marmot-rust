@@ -5,10 +5,10 @@ use std::process::Command;
 use marmot::{Config, Target, analyze_project, emit_project};
 use rusqlite::Connection;
 
-fn write_sql_file(module_dir: &Path, file_name: &str, sql: impl AsRef<str>) {
-    fs::create_dir_all(module_dir).unwrap();
-    fs::write(module_dir.join("mod.rs"), "").unwrap();
-    let companion = module_dir.join("mod.sql");
+fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
+    fs::create_dir_all(module_path.parent().unwrap()).unwrap();
+    fs::write(module_path.with_extension("rs"), "").unwrap();
+    let companion = module_path.with_extension("sql");
     let existing = fs::read_to_string(&companion).unwrap_or_default();
     let separator = if existing.trim().is_empty() {
         ""
@@ -51,6 +51,8 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     fs::create_dir_all(&source_root).unwrap();
     fs::write(source_root.join("users.rs"), "").unwrap();
     fs::write(source_root.join("items.rs"), "").unwrap();
+    fs::create_dir_all(source_root.join("admin/items")).unwrap();
+    fs::write(source_root.join("admin/items/index.rs"), "").unwrap();
     fs::write(
         source_root.join("users.sql"),
         "
@@ -59,6 +61,14 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 
         -- func: list_users
         select id, name from users order by id;
+        ",
+    )
+    .unwrap();
+    fs::write(
+        source_root.join("admin/items/index.sql"),
+        "
+        -- func: list_admin_items
+        select id, title from items order by id;
         ",
     )
     .unwrap();
@@ -83,19 +93,30 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     emit_project(&config, &project).unwrap();
 
     let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
-    assert_eq!(mod_rs, "pub mod items_sql;\npub mod users_sql;\n");
+    assert_eq!(mod_rs, "pub mod admin;\npub mod items;\npub mod users;\n");
 
-    let users_output = fs::read_to_string(config.output.join("users_sql.rs")).unwrap();
+    let admin_mod_rs = fs::read_to_string(config.output.join("admin/mod.rs")).unwrap();
+    assert_eq!(admin_mod_rs, "pub mod items;\n");
+
+    let admin_items_mod_rs = fs::read_to_string(config.output.join("admin/items/mod.rs")).unwrap();
+    assert_eq!(admin_items_mod_rs, "pub mod index;\n");
+
+    let users_output = fs::read_to_string(config.output.join("users.rs")).unwrap();
     assert!(users_output.contains("pub struct FindUserRow"));
     assert!(users_output.contains("pub fn find_user(conn: &Connection, param: i64)"));
     assert!(users_output.contains("pub struct ListUsersRow"));
     assert!(users_output.contains("pub fn list_users(conn: &Connection)"));
 
-    let items_output = fs::read_to_string(config.output.join("items_sql.rs")).unwrap();
+    let items_output = fs::read_to_string(config.output.join("items.rs")).unwrap();
     assert!(items_output.contains("pub struct ListItemsRow"));
     assert!(items_output.contains("pub fn list_items(conn: &Connection, owner_id: i64)"));
     assert!(items_output.contains("where owner_id = ?1"));
     assert!(items_output.contains("params![owner_id]"));
+
+    let admin_items_output =
+        fs::read_to_string(config.output.join("admin/items/index.rs")).unwrap();
+    assert!(admin_items_output.contains("pub struct ListAdminItemsRow"));
+    assert!(admin_items_output.contains("pub fn list_admin_items(conn: &Connection)"));
 }
 
 #[test]
@@ -294,7 +315,7 @@ pub mod generated;
 
 #[cfg(test)]
 mod tests {
-    use super::generated::sql::app_sql;
+    use super::generated::sql::app;
     use rusqlite::Connection;
 
     fn create_schema(conn: &Connection) {
@@ -333,7 +354,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app_sql::create_user(
+        let created = app::create_user(
             &conn,
             "alice",
             true,
@@ -350,19 +371,19 @@ mod tests {
         assert_eq!(created[0].score, 9.5);
         assert_eq!(created[0].nickname.as_deref(), Some("ally"));
 
-        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 1);
+        assert_eq!(app::count_users_one(&conn).unwrap(), 1);
 
-        let active = app_sql::list_active_users(&conn, true).unwrap();
+        let active = app::list_active_users(&conn, true).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "alice");
 
-        let renamed = app_sql::rename_user(&conn, None, 1).unwrap();
+        let renamed = app::rename_user(&conn, None, 1).unwrap();
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].id, 1);
         assert_eq!(renamed[0].nickname, None);
 
-        assert_eq!(app_sql::delete_user(&conn, 1).unwrap(), 1);
-        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 0);
+        assert_eq!(app::delete_user(&conn, 1).unwrap(), 1);
+        assert_eq!(app::count_users_one(&conn).unwrap(), 0);
     }
 
     #[test]
@@ -370,7 +391,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app_sql::create_user_positional(
+        let created = app::create_user_positional(
             &conn,
             "bob",
             true,
@@ -385,28 +406,28 @@ mod tests {
         assert_eq!(created[0].avatar, vec![4, 5, 6]);
         assert_eq!(created[0].nickname, None);
 
-        assert_eq!(app_sql::set_score_positional(&conn, 2.5, 1).unwrap(), 1);
-        let active = app_sql::list_active_users(&conn, true).unwrap();
+        assert_eq!(app::set_score_positional(&conn, 2.5, 1).unwrap(), 1);
+        let active = app::list_active_users(&conn, true).unwrap();
         assert_eq!(active[0].score, 2.5);
 
         assert_eq!(
-            app_sql::find_name_numbered_one(&conn, 1, true).unwrap(),
+            app::find_name_numbered_one(&conn, 1, true).unwrap(),
             "bob"
         );
         assert_eq!(
-            app_sql::find_name_numbered_leading_zero_one(&conn, 1, true).unwrap(),
+            app::find_name_numbered_leading_zero_one(&conn, 1, true).unwrap(),
             "bob"
         );
         assert_eq!(
-            app_sql::find_active_sparse_numbered_one(&conn, true).unwrap(),
+            app::find_active_sparse_numbered_one(&conn, true).unwrap(),
             "bob"
         );
         assert_eq!(
-            app_sql::find_name_mixed_positional_one(&conn, 1, true).unwrap(),
+            app::find_name_mixed_positional_one(&conn, 1, true).unwrap(),
             "bob"
         );
         assert_eq!(
-            app_sql::find_name_named_numbered_same_slot_one(&conn, 1).unwrap(),
+            app::find_name_named_numbered_same_slot_one(&conn, 1).unwrap(),
             "bob"
         );
     }
@@ -416,9 +437,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        assert_eq!(app_sql::list_active_users(&conn, true).unwrap(), vec![]);
+        assert_eq!(app::list_active_users(&conn, true).unwrap(), vec![]);
 
-        let created = app_sql::create_user_returning_star(
+        let created = app::create_user_returning_star(
             &conn,
             "carol",
             false,
@@ -435,11 +456,11 @@ mod tests {
         assert_eq!(created[0].score, 4.75);
         assert_eq!(created[0].nickname.as_deref(), Some("c"));
 
-        let deleted = app_sql::delete_user_returning(&conn, 1).unwrap();
+        let deleted = app::delete_user_returning(&conn, 1).unwrap();
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].id, 1);
         assert_eq!(deleted[0].name, "carol");
-        assert_eq!(app_sql::count_users_one(&conn).unwrap(), 0);
+        assert_eq!(app::count_users_one(&conn).unwrap(), 0);
     }
 
     #[test]
@@ -447,12 +468,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app_sql::create_keyword_table_row(&conn, 10, "keyword").unwrap();
+        let created = app::create_keyword_table_row(&conn, 10, "keyword").unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].id, 10);
         assert_eq!(created[0].name, "keyword");
         assert_eq!(
-            app_sql::find_keyword_table_row_one(&conn, 10).unwrap(),
+            app::find_keyword_table_row_one(&conn, 10).unwrap(),
             "keyword"
         );
     }
@@ -468,7 +489,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = app_sql::find_typed_thing(&conn, "primary").unwrap();
+        let rows = app::find_typed_thing(&conn, "primary").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].type_, "primary");
@@ -479,7 +500,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app_sql::create_event(
+        let created = app::create_event(
             &conn,
             "launch",
             "2026-06-11",
@@ -491,7 +512,7 @@ mod tests {
         assert_eq!(created[0].starts_at, "2026-06-11 09:30:00");
         assert!(created[0].created_at.len() >= 19);
 
-        let rows = app_sql::list_events_since(&conn, "2026-06-11 00:00:00").unwrap();
+        let rows = app::list_events_since(&conn, "2026-06-11 00:00:00").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_date, "2026-06-11");
         assert_eq!(rows[0].starts_at, "2026-06-11 09:30:00");

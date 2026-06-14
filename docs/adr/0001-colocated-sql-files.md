@@ -11,6 +11,8 @@ Application code should keep SQL close to the workflow that owns it. The source 
 ```text
 src/items.rs
 src/items.sql
+src/registrations/index.rs
+src/registrations/index.sql
 src/orders.rs
 src/orders.sql
 ```
@@ -27,6 +29,8 @@ companion SQL file has the same stem as a Rust module:
 ```text
 src/items.rs
 src/items.sql
+src/registrations/index.rs
+src/registrations/index.sql
 ```
 
 Each companion SQL file contains one or more `-- func:` blocks. The block name
@@ -40,22 +44,20 @@ select id, name from items where id = @id;
 select id, name from items order by name;
 ```
 
-The companion file stem becomes the generated module name:
+The companion SQL path becomes the generated module path under the generated
+SQL namespace:
 
 ```text
-src/items.sql -> items_sql
+src/items.sql -> src/generated/sql/items.rs
+src/registrations/index.sql -> src/generated/sql/registrations/index.rs
+src/registrations/form.sql -> src/generated/sql/registrations/form.rs
 ```
 
-`mod.rs` may have a `mod.sql` companion. In that case, the owning directory name
-becomes the generated module stem:
+Generated `mod.rs` files mirror the directory tree needed for those generated
+modules.
 
-```text
-src/items/mod.rs
-src/items/mod.sql -> items_sql
-```
-
-SQL files under directories named `sql` are rejected. Query names come from
-`-- func:` blocks, not filenames.
+`mod.sql` is rejected. SQL files under directories named `sql` are rejected.
+Query names come from `-- func:` blocks, not filenames.
 
 Generated code belongs outside the hand-written domain module, initially under:
 
@@ -69,8 +71,9 @@ Hand-written application code maps generated rows into domain types. Generated r
 
 SQL review stays local to the feature or page being changed.
 
-The generator does not need a global query directory. `-- func:` names partition
-multi-query companion files without requiring shared row names.
+The generator does not need a global query directory or per-query SQL files.
+`-- func:` names partition multi-query companion files without requiring shared
+row names.
 
 Moving a domain module should move its SQL files with it.
 

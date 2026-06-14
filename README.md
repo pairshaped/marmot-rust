@@ -10,6 +10,8 @@ The goal is to keep Marmot's source layout:
 ```text
 src/items.rs
 src/items.sql
+src/registrations/index.rs
+src/registrations/index.sql
 src/orders.rs
 src/orders.sql
 ```
@@ -37,7 +39,7 @@ It currently:
 - finds module companion SQL files like `src/items.rs` plus `src/items.sql`
 - supports multiple `-- func:` blocks per companion SQL file
 - derives generated function names from `-- func:` blocks
-- derives generated module names from the owning module
+- derives generated module paths from the companion SQL path
 - extracts named parameters like `@org_id`
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
@@ -107,6 +109,18 @@ select id, name from items where id = @id;
 -- func: list_items
 select id, name from items order by name;
 ```
+
+The generated module mirrors the companion SQL file path under the generated
+SQL namespace:
+
+```text
+src/items.sql                       -> src/generated/sql/items.rs
+src/registrations/index.sql         -> src/generated/sql/registrations/index.rs
+src/registrations/form.sql          -> src/generated/sql/registrations/form.rs
+```
+
+Each `-- func:` block in one companion file becomes a function in the generated
+module for that file.
 
 Check generated files without writing:
 

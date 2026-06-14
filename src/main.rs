@@ -206,13 +206,28 @@ fn ensure_generated_outputs_do_not_collide(
 }
 
 fn generated_output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
-    let mut paths = project
-        .queries
-        .iter()
-        .map(|query| config.output.join(format!("{}.rs", query.module_name)))
-        .collect::<BTreeSet<_>>();
+    let mut paths = BTreeSet::new();
+    for query in &project.queries {
+        paths.insert(generated_module_path(&config.output, &query.module_name));
+        let mut prefix = config.output.clone();
+        paths.insert(prefix.join("mod.rs"));
+        let segments = query.module_name.split('/').collect::<Vec<_>>();
+        for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+            prefix.push(segment);
+            paths.insert(prefix.join("mod.rs"));
+        }
+    }
     paths.insert(config.output.join("mod.rs"));
     paths
+}
+
+fn generated_module_path(output: &Path, module: &str) -> PathBuf {
+    let mut path = output.to_path_buf();
+    for segment in module.split('/') {
+        path.push(segment);
+    }
+    path.set_extension("rs");
+    path
 }
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigError> {

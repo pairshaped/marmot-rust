@@ -44,6 +44,10 @@ pub enum Error {
         path: PathBuf,
     },
 
+    ModSqlFile {
+        path: PathBuf,
+    },
+
     OpenDatabase {
         path: PathBuf,
         source: rusqlite::Error,
@@ -127,6 +131,13 @@ impl std::fmt::Display for Error {
                 write!(
                     f,
                     "SQL query files under directories named `sql` are no longer supported: {}. Use a Rust module companion SQL file with `-- func:` blocks.",
+                    path.display()
+                )
+            }
+            Self::ModSqlFile { path } => {
+                write!(
+                    f,
+                    "mod.sql is not supported: {}. Put SQL beside the Rust file that owns it, such as index.sql, form.sql, or common.sql.",
                     path.display()
                 )
             }

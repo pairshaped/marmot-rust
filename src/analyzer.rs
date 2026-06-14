@@ -2627,10 +2627,10 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    fn write_sql_file(module_dir: &Path, file_name: &str, sql: impl AsRef<str>) {
-        fs::create_dir_all(module_dir).unwrap();
-        fs::write(module_dir.join("mod.rs"), "").unwrap();
-        let companion = module_dir.join("mod.sql");
+    fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
+        fs::create_dir_all(module_path.parent().unwrap()).unwrap();
+        fs::write(module_path.with_extension("rs"), "").unwrap();
+        let companion = module_path.with_extension("sql");
         let existing = fs::read_to_string(&companion).unwrap_or_default();
         let separator = if existing.trim().is_empty() {
             ""
@@ -6860,7 +6860,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(project.queries.len(), 2);
-        assert_eq!(project.queries[0].module_name, "index_sql");
+        assert_eq!(project.queries[0].module_name, "orgs/index");
         assert_eq!(project.queries[0].name, "find_org");
         assert_eq!(project.queries[0].return_type, ReturnType::Rows);
         assert_eq!(

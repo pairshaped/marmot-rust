@@ -1,6 +1,4 @@
-use std::path::Path;
-
-use heck::ToSnakeCase;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
@@ -33,7 +31,7 @@ pub fn discover_sql_files(source_root: &Path) -> Result<Vec<SqlFile>> {
                 path: path.to_path_buf(),
             });
         }
-        let Some(module_name) = companion_module_name(path, stem) else {
+        let Some(module_name) = companion_module_name(source_root, path, stem)? else {
             continue;
         };
 
@@ -46,19 +44,38 @@ pub fn discover_sql_files(source_root: &Path) -> Result<Vec<SqlFile>> {
     Ok(files)
 }
 
-fn companion_module_name(path: &Path, stem: &str) -> Option<String> {
-    let parent = path.parent()?;
-    if stem == "mod" && parent.join("mod.rs").exists() {
-        let owner_dir = parent.file_name().and_then(|name| name.to_str())?;
-        return Some(format!("{}_sql", owner_dir.to_snake_case()));
+fn companion_module_name(source_root: &Path, path: &Path, stem: &str) -> Result<Option<String>> {
+    if stem == "mod" {
+        return Err(Error::ModSqlFile {
+            path: path.to_path_buf(),
+        });
     }
 
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
     let rust_module = parent.join(format!("{stem}.rs"));
     if rust_module.exists() {
-        return Some(format!("{}_sql", stem.to_snake_case()));
+        let Some(module_name) = generated_module_name(source_root, path) else {
+            return Ok(None);
+        };
+        return Ok(Some(module_name));
     }
 
-    None
+    Ok(None)
+}
+
+fn generated_module_name(source_root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(source_root).ok()?;
+    let without_extension = relative.with_extension("");
+    Some(path_to_module_name(without_extension))
+}
+
+fn path_to_module_name(path: PathBuf) -> String {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -79,23 +96,21 @@ mod tests {
         let files = discover_sql_files(&temp.path().join("src")).unwrap();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].module_name, "show_sql");
+        assert_eq!(files[0].module_name, "items/show");
     }
 
     #[test]
-    fn derives_module_names_from_companion_filenames() {
+    fn derives_module_names_from_relative_sql_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let source_root = temp.path().join("src/items");
-        fs::create_dir_all(&source_root).unwrap();
-        for filename in [
-            "get-users.sql",
-            "Find_User.sql",
-            "fix_sql_injection.sql",
-            "sql_backup.sql",
-        ] {
-            let stem = filename.trim_end_matches(".sql");
-            fs::write(source_root.join(format!("{stem}.rs")), "").unwrap();
-            fs::write(source_root.join(filename), "-- func: query\nselect 1").unwrap();
+        let items_root = temp.path().join("src/admin/items");
+        fs::create_dir_all(&items_root).unwrap();
+        for stem in ["index", "form", "sql_backup"] {
+            fs::write(items_root.join(format!("{stem}.rs")), "").unwrap();
+            fs::write(
+                items_root.join(format!("{stem}.sql")),
+                "-- func: query\nselect 1",
+            )
+            .unwrap();
         }
 
         let names = discover_sql_files(&temp.path().join("src"))
@@ -107,10 +122,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                "find_user_sql",
-                "fix_sql_injection_sql",
-                "get_users_sql",
-                "sql_backup_sql",
+                "admin/items/form",
+                "admin/items/index",
+                "admin/items/sql_backup",
             ]
         );
     }
@@ -128,26 +142,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_mod_sql_to_owning_directory_module() {
+    fn rejects_mod_sql_files() {
         let temp = tempfile::tempdir().unwrap();
         let source_root = temp.path().join("src/items");
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("mod.rs"), "").unwrap();
         fs::write(source_root.join("mod.sql"), "-- func: query\nselect 1").unwrap();
-        fs::write(source_root.join("find_user.rs"), "").unwrap();
-        fs::write(
-            source_root.join("find_user.sql"),
-            "-- func: query\nselect 1",
-        )
-        .unwrap();
 
-        let files = discover_sql_files(&temp.path().join("src")).unwrap();
+        let error = discover_sql_files(&temp.path().join("src")).unwrap_err();
 
-        let modules = files
-            .iter()
-            .map(|file| file.module_name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(modules, ["find_user_sql", "items_sql"]);
+        assert!(matches!(error, Error::ModSqlFile { .. }));
     }
 
     #[test]
@@ -164,6 +168,6 @@ mod tests {
         let files = discover_sql_files(&temp.path().join("src")).unwrap();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].module_name, "find_user_sql");
+        assert_eq!(files[0].module_name, "items/find_user");
     }
 }

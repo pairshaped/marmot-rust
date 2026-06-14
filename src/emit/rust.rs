@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use heck::ToPascalCase;
 
@@ -22,7 +23,13 @@ pub fn emit(config: &Config, project: &Project) -> Result<()> {
     let modules = by_module.keys().copied().collect::<Vec<_>>();
 
     for (module, queries) in by_module {
-        let path = config.output.join(format!("{module}.rs"));
+        let path = generated_module_path(&config.output, module);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let content = render_module(queries)?;
         if config.check {
             ensure_file_current(&path, &content)?;
@@ -34,25 +41,68 @@ pub fn emit(config: &Config, project: &Project) -> Result<()> {
         })?;
     }
 
-    emit_mod_rs(config, modules)
+    emit_mod_rs(&config.output, modules, config.check)
 }
 
-fn emit_mod_rs(config: &Config, modules: Vec<&str>) -> Result<()> {
-    let path = config.output.join("mod.rs");
-    let content = modules
-        .into_iter()
+fn generated_module_path(output: &Path, module: &str) -> PathBuf {
+    let mut path = output.to_path_buf();
+    for segment in module.split('/') {
+        path.push(segment);
+    }
+    path.set_extension("rs");
+    path
+}
+
+fn emit_mod_rs(output: &Path, modules: Vec<&str>, check: bool) -> Result<()> {
+    let mut tree = ModuleTree::default();
+    for module in modules {
+        tree.insert(module);
+    }
+    write_module_tree(output, &tree, check)
+}
+
+#[derive(Debug, Default)]
+struct ModuleTree {
+    children: BTreeMap<String, ModuleTree>,
+}
+
+impl ModuleTree {
+    fn insert(&mut self, module: &str) {
+        let mut current = self;
+        for segment in module.split('/') {
+            current = current.children.entry(segment.to_string()).or_default();
+        }
+    }
+}
+
+fn write_module_tree(path: &Path, tree: &ModuleTree, check: bool) -> Result<()> {
+    fs::create_dir_all(path).map_err(|source| Error::CreateDir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mod_path = path.join("mod.rs");
+    let content = tree
+        .children
+        .keys()
         .map(|module| format!("pub mod {module};\n"))
         .collect::<String>();
 
-    if config.check {
-        ensure_file_current(&path, &content)?;
-        return Ok(());
+    if check {
+        ensure_file_current(&mod_path, &content)?;
+    } else {
+        fs::write(&mod_path, content).map_err(|source| Error::WriteFile {
+            path: mod_path.clone(),
+            source,
+        })?;
     }
 
-    fs::write(&path, content).map_err(|source| Error::WriteFile {
-        path: path.clone(),
-        source,
-    })
+    for (module, child) in &tree.children {
+        if !child.children.is_empty() {
+            write_module_tree(&path.join(module), child, check)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_file_current(path: &std::path::Path, content: &str) -> Result<()> {
@@ -472,7 +522,7 @@ mod tests {
     fn render_named_params_as_positional_slots() {
         let query = Query {
             source_path: PathBuf::from("src/posts/sql/search.sql"),
-            module_name: "posts_sql".to_string(),
+            module_name: "posts".to_string(),
             name: "search".to_string(),
             return_type: ReturnType::Execute,
             sql: "update posts set viewed = 1 where user_id = @user_id and created_at >= :since and title like $pattern or owner_id = :user_id".to_string(),
@@ -513,7 +563,7 @@ mod tests {
     fn render_positional_params_uses_params_macro() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set name = ? where id = ?".to_string(),
@@ -543,7 +593,7 @@ mod tests {
     fn render_dense_numbered_params_positionally() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set name = ?2 where id = ?1 or parent_id = ?1".to_string(),
@@ -574,7 +624,7 @@ mod tests {
     fn render_sparse_numbered_params_as_dense_positional_params() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set name = ?2".to_string(),
@@ -597,7 +647,7 @@ mod tests {
     fn render_dense_mixed_numbered_and_anonymous_params_positionally() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "delete from users where id = ?1 and name = ?".to_string(),
@@ -627,7 +677,7 @@ mod tests {
     fn render_module_supports_anonymous_mixed_with_named_parameters() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set name = ? where id = @id".to_string(),
@@ -658,7 +708,7 @@ mod tests {
     fn render_module_supports_anonymous_mixed_with_numbered_parameters() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set name = ? where id = ?2".to_string(),
@@ -703,7 +753,7 @@ mod tests {
     fn render_query_uses_inferred_parameter_types() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "update users set bio = @bio where id = @id".to_string(),
@@ -735,7 +785,7 @@ mod tests {
     fn render_query_uses_common_rust_types_for_fields_and_params() {
         let row_query = Query {
             source_path: PathBuf::from("src/files/sql/list.sql"),
-            module_name: "files_sql".to_string(),
+            module_name: "files".to_string(),
             name: "list".to_string(),
             return_type: ReturnType::Rows,
             sql: "select active, price, avatar, metadata, deleted from files".to_string(),
@@ -775,7 +825,7 @@ mod tests {
         };
         let execute_query = Query {
             source_path: PathBuf::from("src/files/sql/update.sql"),
-            module_name: "files_sql".to_string(),
+            module_name: "files".to_string(),
             name: "update".to_string(),
             return_type: ReturnType::Execute,
             sql: "update files set active = ?, price = ?, avatar = ?, maybe_avatar = ?".to_string(),
@@ -826,7 +876,7 @@ mod tests {
     fn render_query_preserves_sql_quotes_and_raw_string_terminators() {
         let query = Query {
             source_path: PathBuf::from("src/users/sql/find.sql"),
-            module_name: "users_sql".to_string(),
+            module_name: "users".to_string(),
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             sql: "select 'it''s fine', \"quoted\", r#\"raw\"#".to_string(),
@@ -846,7 +896,7 @@ mod tests {
         let project = Project {
             queries: vec![Query {
                 source_path: PathBuf::from("src/users/sql/list_users.sql"),
-                module_name: "users_sql".to_string(),
+                module_name: "users".to_string(),
                 name: "list_users".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select id, name from users".to_string(),
@@ -887,7 +937,7 @@ mod tests {
         emit(&write_config, &project).unwrap();
         emit(&check_config, &project).unwrap();
 
-        fs::write(output.join("users_sql.rs"), "stale").unwrap();
+        fs::write(output.join("users.rs"), "stale").unwrap();
         assert!(matches!(
             emit(&check_config, &project),
             Err(Error::StaleGeneratedFile { .. })
@@ -899,7 +949,7 @@ mod tests {
         let queries = [
             Query {
                 source_path: PathBuf::from("src/users/sql/find-user.sql"),
-                module_name: "users_sql".to_string(),
+                module_name: "users".to_string(),
                 name: "find_user".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select 1 as value".to_string(),
@@ -913,7 +963,7 @@ mod tests {
             },
             Query {
                 source_path: PathBuf::from("src/users/sql/find_user.sql"),
-                module_name: "users_sql".to_string(),
+                module_name: "users".to_string(),
                 name: "find_user".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select 2 as value".to_string(),
@@ -939,7 +989,7 @@ mod tests {
         let queries = [
             Query {
                 source_path: PathBuf::from("src/users/sql/find.sql"),
-                module_name: "users_sql".to_string(),
+                module_name: "users".to_string(),
                 name: "find".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select 1 as value".to_string(),
@@ -953,7 +1003,7 @@ mod tests {
             },
             Query {
                 source_path: PathBuf::from("src/users/sql/find_one.sql"),
-                module_name: "users_sql".to_string(),
+                module_name: "users".to_string(),
                 name: "find_one".to_string(),
                 return_type: ReturnType::Execute,
                 sql: "delete from users where id = ?".to_string(),
@@ -993,7 +1043,7 @@ mod tests {
         let queries = [
             Query {
                 source_path: PathBuf::from("src/orgs/orgs.sql"),
-                module_name: "orgs_sql".to_string(),
+                module_name: "orgs".to_string(),
                 name: "list_orgs".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select id, name from orgs".to_string(),
@@ -1002,7 +1052,7 @@ mod tests {
             },
             Query {
                 source_path: PathBuf::from("src/orgs/orgs.sql"),
-                module_name: "orgs_sql".to_string(),
+                module_name: "orgs".to_string(),
                 name: "list__orgs".to_string(),
                 return_type: ReturnType::Rows,
                 sql: "select id, name from orgs where id = ?".to_string(),

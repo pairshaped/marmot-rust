@@ -21,7 +21,7 @@ A typical call shape should look like:
 ```rust
 state
     .db
-    .run(|conn| items_sql::get_item_by_id(conn, &id, &org_id))
+    .run(|conn| items::get_item_by_id(conn, &id, &org_id))
     .await
 ```
 
