@@ -12,9 +12,9 @@ pub enum Error {
         reason: crate::sql_text::SqlValidationError,
     },
 
-    InvalidReturnsAnnotation {
+    InvalidSqlBlock {
         path: PathBuf,
-        reason: crate::sqlite::annotation::ReturnsAnnotationError,
+        reason: crate::sqlite::blocks::SqlBlockError,
     },
 
     WriteFile {
@@ -71,11 +71,6 @@ pub enum Error {
         columns: Vec<String>,
     },
 
-    SharedRowTypeMismatch {
-        row_type: String,
-        paths: Vec<PathBuf>,
-    },
-
     DuplicateQueryNames {
         names: Vec<String>,
     },
@@ -106,12 +101,8 @@ impl std::fmt::Display for Error {
             Self::InvalidSql { path, reason } => {
                 write!(f, "invalid SQL in {}: {reason}", path.display())
             }
-            Self::InvalidReturnsAnnotation { path, reason } => {
-                write!(
-                    f,
-                    "invalid -- returns: annotation in {}: {reason}",
-                    path.display()
-                )
+            Self::InvalidSqlBlock { path, reason } => {
+                write!(f, "invalid SQL block in {}: {reason}", path.display())
             }
             Self::WriteFile { path, source } => {
                 write!(f, "could not write {}: {source}", path.display())
@@ -168,13 +159,6 @@ impl std::fmt::Display for Error {
                     "generated result column names collide in {}: {columns:?}",
                     path.display()
                 )
-            }
-            Self::SharedRowTypeMismatch { row_type, paths } => {
-                write!(f, "shared row type {row_type} has mismatched column shapes")?;
-                for path in paths {
-                    write!(f, "\n  {}", path.display())?;
-                }
-                Ok(())
             }
             Self::DuplicateQueryNames { names } => {
                 write!(f, "duplicate generated query names: {names:?}")

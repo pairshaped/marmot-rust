@@ -38,27 +38,36 @@ fn discover_colocated_sql_files(source_root: &Path) -> Result<Vec<SqlFile>> {
         if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
             continue;
         }
-        if path.parent().and_then(|parent| parent.file_name()) != Some("sql".as_ref()) {
-            continue;
-        }
-
-        let owner_dir = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .unwrap_or("queries");
+        let parent_is_sql =
+            path.parent().and_then(|parent| parent.file_name()) == Some("sql".as_ref());
         let stem = path
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("query");
-        let Some(query_name) = query_name_from_filename(stem) else {
-            continue;
+        let (module_name, query_name) = if parent_is_sql {
+            let owner_dir = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("queries");
+            let Some(query_name) = query_name_from_filename(stem) else {
+                continue;
+            };
+            (
+                format!("{}_sql", owner_dir.to_snake_case()),
+                Some(query_name),
+            )
+        } else {
+            let Some(module_name) = companion_module_name(path, stem) else {
+                continue;
+            };
+            (module_name, None)
         };
 
         files.push(SqlFile {
             path: path.to_path_buf(),
-            module_name: format!("{}_sql", owner_dir.to_snake_case()),
+            module_name,
             query_name,
         });
     }
@@ -87,11 +96,11 @@ fn discover_configured_sql_files(sql_dir: &Path) -> Result<Vec<SqlFile>> {
             continue;
         }
 
-        let stem = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("query");
-        let Some(query_name) = query_name_from_filename(stem) else {
+        let Some(query_name) = query_name_from_filename(
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("query"),
+        ) else {
             continue;
         };
         let module_name = configured_sql_module_name(sql_dir, path);
@@ -99,7 +108,7 @@ fn discover_configured_sql_files(sql_dir: &Path) -> Result<Vec<SqlFile>> {
         files.push(SqlFile {
             path: path.to_path_buf(),
             module_name,
-            query_name,
+            query_name: Some(query_name),
         });
     }
 
@@ -122,6 +131,21 @@ fn validate_configured_sql_dir(sql_dir: &Path) -> Result<()> {
             source,
         }),
     }
+}
+
+fn companion_module_name(path: &Path, stem: &str) -> Option<String> {
+    let parent = path.parent()?;
+    if stem == "mod" && parent.join("mod.rs").exists() {
+        let owner_dir = parent.file_name().and_then(|name| name.to_str())?;
+        return Some(format!("{}_sql", owner_dir.to_snake_case()));
+    }
+
+    let rust_module = parent.join(format!("{stem}.rs"));
+    if rust_module.exists() {
+        return Some(format!("{}_sql", stem.to_snake_case()));
+    }
+
+    None
 }
 
 fn configured_sql_module_name(sql_dir: &Path, path: &Path) -> String {
@@ -148,86 +172,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_colocated_sql_files() {
+    fn finds_colocated_sql_companion_files() {
         let temp = tempfile::tempdir().unwrap();
-        let items_sql = temp.path().join("src/items/sql");
-        fs::create_dir_all(&items_sql).unwrap();
-        fs::write(items_sql.join("get_by_id.sql"), "select 1").unwrap();
+        let source_root = temp.path().join("src/items");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("show.rs"), "").unwrap();
+        fs::write(source_root.join("show.sql"), "-- func: get_by_id\nselect 1").unwrap();
         fs::write(temp.path().join("src/ignored.sql"), "select 1").unwrap();
 
         let files = discover_sql_files(&temp.path().join("src")).unwrap();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].module_name, "items_sql");
-        assert_eq!(files[0].query_name, "get_by_id");
+        assert_eq!(files[0].module_name, "show_sql");
+        assert_eq!(files[0].query_name, None);
     }
 
     #[test]
-    fn derives_query_names_like_gleam_marmot() {
+    fn derives_module_names_from_companion_filenames() {
         let temp = tempfile::tempdir().unwrap();
-        let sql_dir = temp.path().join("src/items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
+        let source_root = temp.path().join("src/items");
+        fs::create_dir_all(&source_root).unwrap();
         for filename in [
             "get-users.sql",
-            "1-get-users.sql",
-            "my query.sql",
             "Find_User.sql",
-            "find@user!.sql",
             "fix_sql_injection.sql",
             "sql_backup.sql",
         ] {
-            fs::write(sql_dir.join(filename), "select 1").unwrap();
+            let stem = filename.trim_end_matches(".sql");
+            fs::write(source_root.join(format!("{stem}.rs")), "").unwrap();
+            fs::write(source_root.join(filename), "-- func: query\nselect 1").unwrap();
         }
 
         let names = discover_sql_files(&temp.path().join("src"))
             .unwrap()
             .into_iter()
-            .map(|file| file.query_name)
+            .map(|file| file.module_name)
             .collect::<Vec<_>>();
 
         assert_eq!(
             names,
             [
-                "_1_get_users",
-                "find_user",
-                "finduser",
-                "fix_sql_injection",
-                "get_users",
-                "my_query",
-                "sql_backup",
+                "find_user_sql",
+                "fix_sql_injection_sql",
+                "get_users_sql",
+                "sql_backup_sql",
             ]
         );
     }
 
     #[test]
-    fn ignores_sql_files_that_sanitize_to_empty_query_names() {
+    fn keeps_legacy_sql_directory_query_names() {
         let temp = tempfile::tempdir().unwrap();
         let sql_dir = temp.path().join("src/items/sql");
         fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(sql_dir.join("@#$.sql"), "select 1").unwrap();
-        fs::write(sql_dir.join(".sql"), "select 1").unwrap();
-        fs::write(sql_dir.join("find_user.sql"), "select 1").unwrap();
-
-        let files = discover_sql_files(&temp.path().join("src")).unwrap();
-
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].query_name, "find_user");
-    }
-
-    #[test]
-    fn ignores_generated_sql_directories() {
-        let temp = tempfile::tempdir().unwrap();
-        let items_sql = temp.path().join("src/items/sql");
-        let generated_sql = temp.path().join("src/generated/sql");
-        fs::create_dir_all(&items_sql).unwrap();
-        fs::create_dir_all(&generated_sql).unwrap();
-        fs::write(items_sql.join("find_user.sql"), "select 1").unwrap();
-        fs::write(generated_sql.join("stale.sql"), "select 1").unwrap();
+        fs::write(sql_dir.join("get_by_id.sql"), "select 1").unwrap();
 
         let files = discover_sql_files(&temp.path().join("src")).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].module_name, "items_sql");
+        assert_eq!(files[0].query_name.as_deref(), Some("get_by_id"));
+    }
+
+    #[test]
+    fn maps_mod_sql_to_owning_directory_module() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("src/items");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("mod.rs"), "").unwrap();
+        fs::write(source_root.join("mod.sql"), "-- func: query\nselect 1").unwrap();
+        fs::write(source_root.join("find_user.rs"), "").unwrap();
+        fs::write(
+            source_root.join("find_user.sql"),
+            "-- func: query\nselect 1",
+        )
+        .unwrap();
+
+        let files = discover_sql_files(&temp.path().join("src")).unwrap();
+
+        let modules = files
+            .iter()
+            .map(|file| file.module_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(modules, ["find_user_sql", "items_sql"]);
+    }
+
+    #[test]
+    fn ignores_generated_sql_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let items_sql = temp.path().join("src/items");
+        let generated_sql = temp.path().join("src/generated/sql");
+        fs::create_dir_all(&items_sql).unwrap();
+        fs::create_dir_all(&generated_sql).unwrap();
+        fs::write(items_sql.join("find_user.rs"), "").unwrap();
+        fs::write(items_sql.join("find_user.sql"), "-- func: query\nselect 1").unwrap();
+        fs::write(generated_sql.join("stale.sql"), "select 1").unwrap();
+
+        let files = discover_sql_files(&temp.path().join("src")).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].module_name, "find_user_sql");
     }
 
     #[test]
@@ -246,15 +290,15 @@ mod tests {
             discover_sql_files_with_sql_dir(&temp.path().join("src"), Some(&sql_dir)).unwrap();
         let modules = files
             .iter()
-            .map(|file| (file.module_name.as_str(), file.query_name.as_str()))
+            .map(|file| (file.module_name.as_str(), file.query_name.as_deref()))
             .collect::<Vec<_>>();
 
         assert_eq!(
             modules,
             [
-                ("articles_sql", "get_articles"),
-                ("sql", "get_settings"),
-                ("likes_sql", "get_likes"),
+                ("articles_sql", Some("get_articles")),
+                ("sql", Some("get_settings")),
+                ("likes_sql", Some("get_likes")),
             ]
         );
     }
@@ -271,7 +315,7 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].module_name, "likes_sql");
-        assert_eq!(files[0].query_name, "get_likes");
+        assert_eq!(files[0].query_name.as_deref(), Some("get_likes"));
     }
 
     #[test]
@@ -287,6 +331,6 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].module_name, "likes_sql");
-        assert_eq!(files[0].query_name, "get_likes");
+        assert_eq!(files[0].query_name.as_deref(), Some("get_likes"));
     }
 }

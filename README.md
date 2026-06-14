@@ -9,9 +9,9 @@ The goal is to keep Marmot's source layout:
 
 ```text
 src/items.rs
-src/items/sql/get_item_by_id.sql
+src/items.sql
 src/orders.rs
-src/orders/sql/list_orders_by_account.sql
+src/orders.sql
 ```
 
 and generate direct database code from those colocated SQL files.
@@ -34,10 +34,12 @@ This is an active Rust port, not a complete replacement for Gleam Marmot yet.
 
 It currently:
 
-- finds `src/**/sql/*.sql`
+- finds module companion SQL files like `src/items.rs` plus `src/items.sql`
+- supports multiple `-- func:` blocks per companion SQL file
+- supports legacy `src/**/sql/*.sql` query files
 - supports a configured SQL root with `--sql-dir`
-- derives query names from filenames
-- derives generated module names from the owner directory
+- derives generated function names from `-- func:` blocks or legacy filenames
+- derives generated module names from the owning module
 - extracts named parameters like `@org_id`
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
@@ -97,6 +99,16 @@ cargo run -- generate \
   --database path/to/app.db \
   --source-root path/to/src \
   --output path/to/src/generated/sql
+```
+
+A companion SQL file contains named blocks:
+
+```sql
+-- func: get_item_by_id
+select id, name from items where id = @id;
+
+-- func: list_items
+select id, name from items order by name;
 ```
 
 Generate from a configured SQL root:

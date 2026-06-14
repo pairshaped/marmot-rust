@@ -26,18 +26,26 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     drop(conn);
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
-    let items_sql = source_root.join("items/sql");
-    fs::create_dir_all(&users_sql).unwrap();
-    fs::create_dir_all(&items_sql).unwrap();
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(source_root.join("users.rs"), "").unwrap();
+    fs::write(source_root.join("items.rs"), "").unwrap();
     fs::write(
-        users_sql.join("find_user.sql"),
-        "select id, name from users where id = ?",
+        source_root.join("users.sql"),
+        "
+        -- func: find_user
+        select id, name from users where id = ?;
+
+        -- func: list_users
+        select id, name from users order by id;
+        ",
     )
     .unwrap();
     fs::write(
-        items_sql.join("list_items.sql"),
-        "select id, title from items where owner_id = @owner_id",
+        source_root.join("items.sql"),
+        "
+        -- func: list_items
+        select id, title from items where owner_id = @owner_id;
+        ",
     )
     .unwrap();
 
@@ -59,6 +67,8 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let users_output = fs::read_to_string(config.output.join("users_sql.rs")).unwrap();
     assert!(users_output.contains("pub struct FindUserRow"));
     assert!(users_output.contains("pub fn find_user(conn: &Connection, param: i64)"));
+    assert!(users_output.contains("pub struct ListUsersRow"));
+    assert!(users_output.contains("pub fn list_users(conn: &Connection)"));
 
     let items_output = fs::read_to_string(config.output.join("items_sql.rs")).unwrap();
     assert!(items_output.contains("pub struct ListItemsRow"));
@@ -241,17 +251,6 @@ fn generated_rust_functions_round_trip_against_sqlite() {
          from events where starts_at >= @starts_at order by id",
     )
     .unwrap();
-    fs::write(
-        sql_dir.join("get_user_shared.sql"),
-        "-- returns: UserRow\nselect id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("list_users_shared.sql"),
-        "-- returns: UserRow\nselect id, name from users order by id",
-    )
-    .unwrap();
-
     let config = Config {
         database,
         source_root,
@@ -262,19 +261,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     };
 
     let project = analyze_project(&config).unwrap();
-    let shared_query = project
-        .queries
-        .iter()
-        .find(|query| query.name == "get_user_shared")
-        .unwrap();
-    assert_eq!(
-        shared_query.sql,
-        "select id, name from users where id = @id"
-    );
-
     emit_project(&config, &project).unwrap();
-    let app_sql = fs::read_to_string(config.output.join("app_sql.rs")).unwrap();
-    assert!(!app_sql.contains("-- returns:"));
 
     write_runtime_crate(dir.path());
 
@@ -553,27 +540,6 @@ mod tests {
         assert_eq!(rows[0].created_at, created[0].created_at);
     }
 
-    #[test]
-    fn generated_functions_share_return_row_types() {
-        let conn = Connection::open_in_memory().unwrap();
-        create_schema(&conn);
-
-        app_sql::create_user(&conn, "dana", true, [1_u8], 3.0, None).unwrap();
-        app_sql::create_user(&conn, "erin", false, [2_u8], 4.0, None).unwrap();
-
-        let dana: app_sql::UserRow = app_sql::get_user_shared(&conn, 1)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(dana.id, 1);
-        assert_eq!(dana.name, "dana");
-
-        let users: Vec<app_sql::UserRow> = app_sql::list_users_shared(&conn).unwrap();
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[1].id, 2);
-        assert_eq!(users[1].name, "erin");
-    }
 }
 "##,
     )

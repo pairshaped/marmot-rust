@@ -9,7 +9,7 @@ use crate::discovery::discover_sql_files_with_sql_dir;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
-use crate::sqlite::annotation::{parse_returns_annotation, strip_returns_annotation};
+use crate::sqlite::blocks::parse_sql_blocks;
 use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
@@ -19,41 +19,57 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
     })?;
     let schema = load_schema(&conn)?;
     let files = discover_sql_files_with_sql_dir(&config.source_root, config.sql_dir.as_deref())?;
-    let mut queries = Vec::with_capacity(files.len());
+    let mut queries = Vec::new();
 
     for file in files {
         let sql = fs::read_to_string(&file.path).map_err(|source| Error::ReadFile {
             path: file.path.clone(),
             source,
         })?;
-        let sql = validate_sql(&sql).map_err(|reason| Error::InvalidSql {
-            path: file.path.clone(),
-            reason,
-        })?;
-        let row_type =
-            parse_returns_annotation(&sql).map_err(|reason| Error::InvalidReturnsAnnotation {
+        let blocks = match parse_sql_blocks(&sql) {
+            Ok(blocks) => blocks,
+            Err(crate::sqlite::blocks::SqlBlockError::MissingFunc)
+            | Err(crate::sqlite::blocks::SqlBlockError::SqlBeforeFirstFunc)
+                if file.query_name.is_some() =>
+            {
+                vec![crate::sqlite::blocks::SqlBlock {
+                    function_name: file.query_name.clone().expect("checked query name"),
+                    sql,
+                }]
+            }
+            Err(reason) => {
+                return Err(Error::InvalidSqlBlock {
+                    path: file.path.clone(),
+                    reason,
+                });
+            }
+        };
+
+        for block in blocks {
+            let sql = validate_sql(&block.sql).map_err(|reason| Error::InvalidSql {
                 path: file.path.clone(),
                 reason,
             })?;
-        let sqlite_sql = strip_nullability_overrides(&strip_returns_annotation(&sql));
-        validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
-        let parameters = parameters(&sqlite_sql, &schema);
-        let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
-        let return_type = if columns.is_empty() {
-            ReturnType::Execute
-        } else {
-            ReturnType::Rows { row_type }
-        };
+            let sqlite_sql = strip_nullability_overrides(&sql);
+            validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
+            let parameters = parameters(&sqlite_sql, &schema);
+            let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
+            let return_type = if columns.is_empty() {
+                ReturnType::Execute
+            } else {
+                ReturnType::Rows
+            };
 
-        queries.push(Query {
-            source_path: file.path,
-            module_name: file.module_name,
-            name: file.query_name,
-            return_type,
-            sql: sqlite_sql,
-            parameters,
-            columns,
-        });
+            queries.push(Query {
+                source_path: file.path.clone(),
+                module_name: file.module_name.clone(),
+                name: block.function_name,
+                return_type,
+                sql: sqlite_sql,
+                parameters,
+                columns,
+            });
+        }
     }
 
     Ok(Project { queries })
@@ -5618,10 +5634,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(matches!(
-            project.queries[0].return_type,
-            ReturnType::Rows { row_type: None }
-        ));
+        assert!(matches!(project.queries[0].return_type, ReturnType::Rows));
         assert_eq!(
             project.queries[0].parameters,
             [
@@ -6874,7 +6887,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_returns_annotation_as_row_type_name() {
+    fn analyzes_func_blocks_from_module_companion_sql() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
         let conn = Connection::open(&database).unwrap();
@@ -6883,11 +6896,18 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orgs/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
+        let orgs_dir = source_root.join("orgs");
+        fs::create_dir_all(&orgs_dir).unwrap();
+        fs::write(orgs_dir.join("index.rs"), "").unwrap();
         fs::write(
-            sql_dir.join("find_org.sql"),
-            "-- returns: OrgRow\nselect id, name from orgs",
+            orgs_dir.join("index.sql"),
+            "
+            -- func: find_org
+            select id, name from orgs where id = @id;
+
+            -- func: delete_org
+            delete from orgs where id = @id;
+            ",
         )
         .unwrap();
 
@@ -6901,17 +6921,20 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(project.queries.len(), 2);
+        assert_eq!(project.queries[0].module_name, "index_sql");
+        assert_eq!(project.queries[0].name, "find_org");
+        assert_eq!(project.queries[0].return_type, ReturnType::Rows);
         assert_eq!(
-            project.queries[0].return_type,
-            ReturnType::Rows {
-                row_type: Some("OrgRow".to_string())
-            }
+            project.queries[0].sql,
+            "select id, name from orgs where id = @id"
         );
-        assert_eq!(project.queries[0].sql, "select id, name from orgs");
+        assert_eq!(project.queries[1].name, "delete_org");
+        assert_eq!(project.queries[1].return_type, ReturnType::Execute);
     }
 
     #[test]
-    fn rejects_invalid_returns_annotation() {
+    fn rejects_invalid_func_blocks_in_companion_sql() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
         let conn = Connection::open(&database).unwrap();
@@ -6920,11 +6943,12 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orgs/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
+        let orgs_dir = source_root.join("orgs");
+        fs::create_dir_all(&orgs_dir).unwrap();
+        fs::write(orgs_dir.join("index.rs"), "").unwrap();
         fs::write(
-            sql_dir.join("find_org.sql"),
-            "-- returns: Org\nselect id from orgs",
+            orgs_dir.join("index.sql"),
+            "-- func: find-org\nselect id from orgs",
         )
         .unwrap();
 
@@ -6937,10 +6961,7 @@ mod tests {
             check: false,
         });
 
-        assert!(matches!(
-            result,
-            Err(Error::InvalidReturnsAnnotation { .. })
-        ));
+        assert!(matches!(result, Err(Error::InvalidSqlBlock { .. })));
     }
 
     #[test]

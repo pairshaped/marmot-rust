@@ -4,7 +4,7 @@ use std::path::PathBuf;
 pub struct SqlFile {
     pub path: PathBuf,
     pub module_name: String,
-    pub query_name: String,
+    pub query_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub struct Project {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnType {
     Execute,
-    Rows { row_type: Option<String> },
+    Rows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

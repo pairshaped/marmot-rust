@@ -210,12 +210,12 @@ mod tests {
         assert_eq!(validate_sql("SELECT 1; -- comment").unwrap(), "SELECT 1");
         assert_eq!(validate_sql("SELECT 1; /* comment */").unwrap(), "SELECT 1");
         assert_eq!(
-            validate_sql("-- returns: Foo\nSELECT 1; -- comment").unwrap(),
-            "-- returns: Foo\nSELECT 1"
+            validate_sql("-- func: query\nSELECT 1; -- comment").unwrap(),
+            "-- func: query\nSELECT 1"
         );
         assert_eq!(
-            validate_sql("-- returns: Foo\nSELECT 1;\n-- comment").unwrap(),
-            "-- returns: Foo\nSELECT 1"
+            validate_sql("-- func: query\nSELECT 1;\n-- comment").unwrap(),
+            "-- func: query\nSELECT 1"
         );
     }
 

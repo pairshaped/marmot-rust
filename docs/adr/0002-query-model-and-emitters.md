@@ -49,7 +49,6 @@ The query model should describe database-facing facts:
 - result columns
 - column types
 - nullability
-- shared return row name
 
 Language-specific concepts belong in emitters.
 
