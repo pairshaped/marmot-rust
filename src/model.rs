@@ -4,7 +4,6 @@ use std::path::PathBuf;
 pub struct SqlFile {
     pub path: PathBuf,
     pub module_name: String,
-    pub query_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,12 +221,6 @@ fn is_rust_reserved_word(name: &str) -> bool {
     )
 }
 
-pub fn query_name_from_filename(filename: &str) -> Option<String> {
-    let base = filename.strip_suffix(".sql").unwrap_or(filename);
-    let name = sanitize_identifier(base);
-    (!name.is_empty()).then_some(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,35 +344,5 @@ mod tests {
         assert_eq!(sanitize_identifier("fn"), "fn_");
         assert_eq!(sanitize_identifier("use"), "use_");
         assert_eq!(sanitize_identifier("match"), "match_");
-    }
-
-    #[test]
-    fn derives_query_names_from_filenames_like_gleam_marmot() {
-        assert_eq!(
-            query_name_from_filename("find_user.sql").as_deref(),
-            Some("find_user")
-        );
-        assert_eq!(
-            query_name_from_filename("get-users.sql").as_deref(),
-            Some("get_users")
-        );
-        assert_eq!(
-            query_name_from_filename("1-get-users.sql").as_deref(),
-            Some("_1_get_users")
-        );
-        assert_eq!(
-            query_name_from_filename("my query.sql").as_deref(),
-            Some("my_query")
-        );
-        assert_eq!(
-            query_name_from_filename("Find_User.sql").as_deref(),
-            Some("find_user")
-        );
-        assert_eq!(
-            query_name_from_filename("find@user!.sql").as_deref(),
-            Some("finduser")
-        );
-        assert_eq!(query_name_from_filename("@#$.sql"), None);
-        assert_eq!(query_name_from_filename(".sql"), None);
     }
 }

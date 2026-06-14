@@ -40,6 +40,10 @@ pub enum Error {
         path: PathBuf,
     },
 
+    SqlDirectoryQueryFile {
+        path: PathBuf,
+    },
+
     OpenDatabase {
         path: PathBuf,
         source: rusqlite::Error,
@@ -118,6 +122,13 @@ impl std::fmt::Display for Error {
             }
             Self::SqlPathNotDirectory { path } => {
                 write!(f, "SQL path is not a directory: {}", path.display())
+            }
+            Self::SqlDirectoryQueryFile { path } => {
+                write!(
+                    f,
+                    "SQL query files under directories named `sql` are no longer supported: {}. Use a Rust module companion SQL file with `-- func:` blocks.",
+                    path.display()
+                )
             }
             Self::OpenDatabase { path, source } => {
                 write!(

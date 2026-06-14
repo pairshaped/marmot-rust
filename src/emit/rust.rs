@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn emit_check_reports_missing_or_changed_files_as_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("src/generated/sql");
+        let output = dir.path().join("src/generated");
         let project = Project {
             queries: vec![Query {
                 source_path: PathBuf::from("src/users/sql/list_users.sql"),
@@ -870,7 +870,6 @@ mod tests {
         let check_config = Config {
             database: dir.path().join("app.sqlite3"),
             source_root: dir.path().join("src"),
-            sql_dir: None,
             output: output.clone(),
             target: crate::config::Target::Rust,
             check: true,

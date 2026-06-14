@@ -5,7 +5,7 @@ use heck::ToSnakeCase;
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::discovery::discover_sql_files_with_sql_dir;
+use crate::discovery::discover_sql_files;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
 use crate::sql_text::validate_sql;
@@ -18,7 +18,7 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
         source,
     })?;
     let schema = load_schema(&conn)?;
-    let files = discover_sql_files_with_sql_dir(&config.source_root, config.sql_dir.as_deref())?;
+    let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
 
     for file in files {
@@ -26,24 +26,10 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
             path: file.path.clone(),
             source,
         })?;
-        let blocks = match parse_sql_blocks(&sql) {
-            Ok(blocks) => blocks,
-            Err(crate::sqlite::blocks::SqlBlockError::MissingFunc)
-            | Err(crate::sqlite::blocks::SqlBlockError::SqlBeforeFirstFunc)
-                if file.query_name.is_some() =>
-            {
-                vec![crate::sqlite::blocks::SqlBlock {
-                    function_name: file.query_name.clone().expect("checked query name"),
-                    sql,
-                }]
-            }
-            Err(reason) => {
-                return Err(Error::InvalidSqlBlock {
-                    path: file.path.clone(),
-                    reason,
-                });
-            }
-        };
+        let blocks = parse_sql_blocks(&sql).map_err(|reason| Error::InvalidSqlBlock {
+            path: file.path.clone(),
+            reason,
+        })?;
 
         for block in blocks {
             let sql = validate_sql(&block.sql).map_err(|reason| Error::InvalidSql {
@@ -2638,7 +2624,29 @@ mod tests {
     use super::*;
     use crate::config::Target;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn write_sql_file(module_dir: &Path, file_name: &str, sql: impl AsRef<str>) {
+        fs::create_dir_all(module_dir).unwrap();
+        fs::write(module_dir.join("mod.rs"), "").unwrap();
+        let companion = module_dir.join("mod.sql");
+        let existing = fs::read_to_string(&companion).unwrap_or_default();
+        let separator = if existing.trim().is_empty() {
+            ""
+        } else {
+            "\n\n"
+        };
+        let function_name = file_name.trim_end_matches(".sql");
+        fs::write(
+            companion,
+            format!(
+                "{existing}{separator}-- func: {function_name}\n{}",
+                sql.as_ref()
+            ),
+        )
+        .unwrap();
+    }
 
     fn analyze_single_query(schema_sql: &str, query_sql: &str) -> Vec<Parameter> {
         let dir = tempdir().unwrap();
@@ -2648,14 +2656,13 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("queries/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(sql_dir.join("query.sql"), query_sql).unwrap();
+        let module_dir = source_root.join("queries");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(&module_dir, "query.sql", query_sql);
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2843,22 +2850,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_items.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_items.sql",
             "
             select id, org_id, name, description, active, price, payload
             from items
             where org_id = @org_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2909,18 +2915,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id from users where name = ? and age > ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -2971,18 +2976,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id, username, email, age from users where email = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3018,18 +3022,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id from users where id = ?1 or parent_id = ?1 or name = ?2",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3075,18 +3078,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id from users where id = ?1 and name = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3125,18 +3127,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("update_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "update_user.sql",
             "update users set name=? where id=?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3183,10 +3184,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("participants/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("update_participant.sql"),
+        let module_dir = source_root.join("participants");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "update_participant.sql",
             "
             update participants
             set gender = coalesce(@gender, gender),
@@ -3194,13 +3196,11 @@ mod tests {
                 updated_at = @updated_at
             where id = @id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3347,10 +3347,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("waitlist/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("claim_registration.sql"),
+        let module_dir = source_root.join("waitlist");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "claim_registration.sql",
             "
             update waitlist_registrations
             set claimed_at = @claimed_at, updated_at = @updated_at
@@ -3367,13 +3368,11 @@ mod tests {
                 limit 1
             )
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3421,18 +3420,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tasks/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_tasks.sql"),
+        let module_dir = source_root.join("tasks");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_tasks.sql",
             "select id from tasks where account_id = @account_id",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3467,18 +3465,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("standings/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_standings.sql"),
+        let module_dir = source_root.join("standings");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_standings.sql",
             "select id from standings where season is @season",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3513,18 +3510,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("standings/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_standings.sql"),
+        let module_dir = source_root.join("standings");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_standings.sql",
             "select id from standings where season is not @season",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3582,14 +3578,13 @@ mod tests {
             drop(conn);
 
             let source_root = dir.path().join("src");
-            let sql_dir = source_root.join("tasks/sql");
-            fs::create_dir_all(&sql_dir).unwrap();
-            fs::write(sql_dir.join(file_name), sql).unwrap();
+            let module_dir = source_root.join("tasks");
+            fs::create_dir_all(&module_dir).unwrap();
+            write_sql_file(&module_dir, file_name, sql);
 
             let project = analyze_project(&Config {
                 database,
                 source_root,
-                sql_dir: None,
                 output: dir.path().join("generated"),
                 target: Target::Rust,
                 check: false,
@@ -3626,18 +3621,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tasks/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("delete_tasks.sql"),
+        let module_dir = source_root.join("tasks");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "delete_tasks.sql",
             "delete from tasks where account_id = @account_id",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3673,22 +3667,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tasks/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("soft_delete_tasks.sql"),
+        let module_dir = source_root.join("tasks");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "soft_delete_tasks.sql",
             "
             update tasks
             set deleted_at = @deleted_at
             where account_id = @account_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3735,10 +3728,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("feature_requests/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_feature_requests.sql"),
+        let module_dir = source_root.join("feature_requests");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_feature_requests.sql",
             "
             select (
                 select count(*)
@@ -3747,13 +3741,11 @@ mod tests {
             ) as vote_count
             from feature_requests
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -3987,23 +3979,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("recent_orders.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "recent_orders.sql",
             "
             with recent as (
                 select id from orders where org_id = @org_id
             )
             select id from recent
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4037,10 +4028,11 @@ mod tests {
         Connection::open(&database).unwrap().close().unwrap();
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("reports/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("count_to_limit.sql"),
+        let module_dir = source_root.join("reports");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "count_to_limit.sql",
             "
             with recursive counter(n) as (
                 select 1
@@ -4049,13 +4041,11 @@ mod tests {
             )
             select n from counter
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4099,10 +4089,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_order_ids.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_order_ids.sql",
             "
             with filtered(id) as (
                 select id from orders where org_id = @org_id
@@ -4112,13 +4103,11 @@ mod tests {
             )
             select id from ids
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4285,10 +4274,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("questions/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("update_question_names.sql"),
+        let module_dir = source_root.join("questions");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "update_question_names.sql",
             "
             update line_item_question_values
             set question_name = @question_name
@@ -4300,13 +4290,11 @@ mod tests {
                 where o.org_id = @org_id
               )
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4356,18 +4344,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_order.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_order.sql",
             "select u.email from users u join orders o on o.user_id = u.id where o.id = @order_id",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4402,18 +4389,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_by_type.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_by_type.sql",
             r#"select id from things where "type" = @type"#,
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4449,18 +4435,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_by_types.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_by_types.sql",
             r#"select id from things where "type" = @type and type_ = @type_"#,
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4505,18 +4490,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users (username, bio, created_at) values (@username, @bio, @created_at)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4565,21 +4549,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("entries/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_entry.sql"),
+        let module_dir = source_root.join("entries");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_entry.sql",
             "
             insert into entries (order_id, kind, item_id, description, amount)
             values (@order_id, 'adjustment', null, @description, @amount)
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4626,23 +4609,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("notes/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_note.sql"),
+        let module_dir = source_root.join("notes");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_note.sql",
             "insert into notes (id, title, body) values (?, 'hello, world', ?)",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("insert_quoted_note.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "insert_quoted_note.sql",
             "insert into notes (id, title, body) values (?, 'it''s, complicated', ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4693,23 +4675,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("features/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("copy_features.sql"),
+        let module_dir = source_root.join("features");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "copy_features.sql",
             "
             insert into item_features (item_id, field_key, created_at)
             select @item_id, lf.field_key, @created_at
             from item_features lf
             where lf.item_id = @source_item_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4762,23 +4743,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("logs/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_login_logs.sql"),
+        let module_dir = source_root.join("logs");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_login_logs.sql",
             "
             insert into logs (user_id, action)
             select id, 'login'
             from users
             where name = ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4814,18 +4794,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users values (?, ?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4872,18 +4851,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("metrics/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_metric.sql"),
+        let module_dir = source_root.join("metrics");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_metric.sql",
             "insert into metrics values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4928,18 +4906,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("line_items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_line_items.sql"),
+        let module_dir = source_root.join("line_items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_line_items.sql",
             "insert into line_items values (1, ?), (?, 'second')",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -4984,18 +4961,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5036,18 +5012,17 @@ mod tests {
             drop(conn);
 
             let source_root = dir.path().join("src");
-            let sql_dir = source_root.join("items/sql");
-            fs::create_dir_all(&sql_dir).unwrap();
-            fs::write(
-                sql_dir.join("insert_item.sql"),
+            let module_dir = source_root.join("items");
+            fs::create_dir_all(&module_dir).unwrap();
+            write_sql_file(
+                &module_dir,
+                "insert_item.sql",
                 format!("insert into {table_name} (id, name) values (?, ?)"),
-            )
-            .unwrap();
+            );
 
             let project = analyze_project(&Config {
                 database,
                 source_root,
-                sql_dir: None,
                 output: dir.path().join("generated"),
                 target: Target::Rust,
                 check: false,
@@ -5093,18 +5068,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("memberships/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_membership.sql"),
+        let module_dir = source_root.join("memberships");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_membership.sql",
             "insert into memberships values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5149,18 +5123,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_events.sql",
             "insert into events values (?, ?), (?)",
-        )
-        .unwrap();
+        );
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5195,18 +5168,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_events.sql",
             "insert into events (id, label) values (?, ?, ?)",
-        )
-        .unwrap();
+        );
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5230,18 +5202,17 @@ mod tests {
         Connection::open(&database).unwrap();
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_events.sql",
             "insert into missing values (?)",
-        )
-        .unwrap();
+        );
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5268,18 +5239,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_event.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_event.sql",
             "insert into events (id, name, created_at) values (?, default, ?)",
-        )
-        .unwrap();
+        );
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5305,18 +5275,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("replace_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "replace_user.sql",
             "insert or replace into users (id, name) values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5361,33 +5330,32 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_ignore.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_ignore.sql",
             "insert or ignore into users (id, name) values (?, ?)",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("insert_fail.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "insert_fail.sql",
             "insert or fail into users (id, name) values (?, ?)",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("insert_rollback.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "insert_rollback.sql",
             "insert or rollback into users (id, name) values (?, ?)",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("insert_abort.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "insert_abort.sql",
             "insert or abort into users (id, name) values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5444,18 +5412,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("create_event.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "create_event.sql",
             "insert into events default values",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5487,18 +5454,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("replace_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "replace_user.sql",
             "replace into users (id, name) values (?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5544,10 +5510,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("upsert_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "upsert_thing.sql",
             "
             insert into t (id, val, version)
             values (?, ?, ?)
@@ -5556,13 +5523,11 @@ mod tests {
             where version < ?
             returning id, val, version
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5611,23 +5576,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_thing.sql",
             "
             insert into t (id, val)
             values (?, ?)
             on conflict(id) do nothing
             returning id, val
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5688,22 +5652,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_thing.sql",
             "
             insert into t (id, val)
             values (?, ?)
             on conflict(id) do nothing
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5752,23 +5715,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("upsert_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "upsert_thing.sql",
             "
             insert into t (id, val, counter)
             values (@id, @val, @counter)
             on conflict(id) do update
             set val = @val, counter = @counter
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5821,23 +5783,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("copy_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "copy_things.sql",
             "
             insert into t (id, val)
             select id, val from src where true
             on conflict(id) do update set val = excluded.val
             returning id, val
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5874,18 +5835,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "select id from users limit @limit offset @offset",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5923,18 +5883,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "select id, name from users where name = ? order by id limit ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -5977,18 +5936,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id, name from users where name like ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6016,18 +5974,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_users.sql",
             "select id from users where name not like ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6055,18 +6012,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("accounts/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_accounts.sql"),
+        let module_dir = source_root.join("accounts");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_accounts.sql",
             "select id, email from accounts where lower(email) like @prefix || '%'",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6104,23 +6060,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select id, name
             from users
             where id not in (select user_id from deleted)
               and name = ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6160,10 +6115,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select id, name
             from users
@@ -6171,13 +6127,11 @@ mod tests {
                 select user_id from orders where total > ?
             )
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6205,18 +6159,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_thing.sql",
             "select \"what?\", val from t where val = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6263,18 +6216,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select \"my\"\"col\", name from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6310,18 +6262,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_thing.sql",
             "select id from t where \"AND\" = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6357,23 +6308,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select id, last_name, first_name
             from users
             where id > @min_id
             order by last_name collate nocase, first_name collate nocase
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6409,18 +6359,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "select id from users where status in (?, ?, ?)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6468,10 +6417,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select id
             from users
@@ -6479,13 +6429,11 @@ mod tests {
               and email != 'yes or no'
               and status = ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6513,18 +6461,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_thing.sql",
             "select id from t where name != 'it''s' and id = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6560,18 +6507,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("fees/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("count_fees.sql"),
+        let module_dir = source_root.join("fees");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "count_fees.sql",
             "select count(*) from fees where club_id in (@club_id, @parent_id, @grandparent_id) and active = @active",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6618,18 +6564,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_events.sql",
             "select id from events where created_at between @from_ts and @to_ts",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6674,18 +6619,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_events.sql",
             "select id from events where created_at not between @start and @end",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6731,23 +6675,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("region_totals.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "region_totals.sql",
             "
             select region, sum(amount) as total
             from orders
             group by region
             having sum(amount) > @min_amount
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6775,18 +6718,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("events/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_events.sql"),
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_events.sql",
             "select id from events where cast(@season as integer) = 0",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6811,14 +6753,13 @@ mod tests {
         Connection::open(&database).unwrap();
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(sql_dir.join("bad.sql"), "select 1; select 2").unwrap();
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(&module_dir, "bad.sql", "select 1; select 2");
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6837,14 +6778,13 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(sql_dir.join("bad.sql"), "select id, id from users").unwrap();
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(&module_dir, "bad.sql", "select id, id from users");
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6863,18 +6803,17 @@ mod tests {
         Connection::open(&database).unwrap();
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("bad.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "bad.sql",
             r#"select 1 as "foo-bar", 2 as foo_bar"#,
-        )
-        .unwrap();
+        );
 
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6914,7 +6853,6 @@ mod tests {
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6955,7 +6893,6 @@ mod tests {
         let result = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -6986,22 +6923,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select u.id, u.name, p.bio
             from users u
             left join profiles p on p.user_id = u.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7039,22 +6975,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select u.name, p.bio
             from users u
             left join profiles p on p.user_name = u.name
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7092,22 +7027,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_org_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_org_users.sql",
             "
             select u.id, o.org_name
             from users u
             right join orgs o on u.org_id = o.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7145,22 +7079,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select u.id as user_id, p.bio
             from users u
             full outer join profiles p on p.user_id = u.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7198,22 +7131,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select u.name, p.bio
             from users u
             join profiles p on p.user_id = u.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7244,18 +7176,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select a.id, b.id as b_id from a cross join b",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7287,23 +7218,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "
             select a.a_val, b.b_val, c.c_val
             from a
             left join b on b.a_id = a.id
             left join c on c.b_id = b.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7335,23 +7265,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "
             select a.a_val, b.b_val, c.c_val
             from a
             join b on b.a_id = a.id
             left join c on c.b_id = b.id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7382,18 +7311,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select a.id, a.val_a from a natural join b",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7434,18 +7362,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select a.id, a.val_a from a natural left join b",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7494,18 +7421,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_orders.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_orders.sql",
             "select o.total, l.product from orders o join line_items l using (org_id)",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7553,23 +7479,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "
             select p.bio
             from users u
             left join profiles p on p.user_id = u.id
             where p.bio = 'x'
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7604,21 +7529,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("ranked_items.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "ranked_items.sql",
             "
             select id, row_number() over (order by created_at) as position
             from items
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7663,21 +7587,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("ranked_items.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "ranked_items.sql",
             "
             select id, rank() over (order by score desc) as rk
             from items
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7721,10 +7644,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("ranked_items.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "ranked_items.sql",
             "
             select
                 id,
@@ -7732,13 +7656,11 @@ mod tests {
                 ntile(4) over (order by created_at) as quartile
             from items
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7783,21 +7705,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("payments/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("sum_payments.sql"),
+        let module_dir = source_root.join("payments");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "sum_payments.sql",
             "
             select sum(amount) as total
             from payments
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7835,21 +7756,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("scores/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("summarize_scores.sql"),
+        let module_dir = source_root.join("scores");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "summarize_scores.sql",
             "
             select avg(score) as avg_score, min(score) as min_score, max(score) as max_score
             from scores
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7888,10 +7808,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("reports/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("literal_values.sql"),
+        let module_dir = source_root.join("reports");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "literal_values.sql",
             "
             select 42 as answer,
                    -5 as debt,
@@ -7900,13 +7821,11 @@ mod tests {
                    'hello' as greeting
             from t
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -7947,10 +7866,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("reports/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("coalesce_values.sql"),
+        let module_dir = source_root.join("reports");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "coalesce_values.sql",
             "
             select coalesce(null, 42) as answer,
                    coalesce(null, 3.14) as ratio,
@@ -7958,13 +7878,11 @@ mod tests {
                    coalesce(null, null) as unknown
             from t
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8011,18 +7929,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("names.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "names.sql",
             "select coalesce(name, '') from users",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8057,18 +7974,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("unique_customers.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "unique_customers.sql",
             "select count(distinct customer_id) as unique_customers from orders",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8101,21 +8017,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("user_flags.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "user_flags.sql",
             "
             select exists(select 1 from events where events.user_id = users.id) as has_events
             from users
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8143,21 +8058,20 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("cast_value.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "cast_value.sql",
             "
             select cast(sub.val as integer) as v
             from (select val from t) sub
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8185,18 +8099,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("display_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "display_user.sql",
             "select coalesce(name, 'unknown, unnamed') as display_name from users where id = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8233,18 +8146,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("display_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "display_thing.sql",
             "select coalesce(name, 'default)value') as display from t where id = ?",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8288,18 +8200,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tickets/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_statuses.sql"),
+        let module_dir = source_root.join("tickets");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_statuses.sql",
             "select distinct status from tickets where id > ? order by status",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8344,22 +8255,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tickets/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_ticket_states.sql"),
+        let module_dir = source_root.join("tickets");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_ticket_states.sql",
             "
             select distinct status, priority
             from tickets
             order by status, priority
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8403,18 +8313,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_items.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_items.sql",
             "select id, name_en, name_fr from items order by name_fr",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8461,10 +8370,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("measurements/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("summarize.sql"),
+        let module_dir = source_root.join("measurements");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "summarize.sql",
             "
             select
                 grp,
@@ -8474,13 +8384,11 @@ mod tests {
             from measurements
             group by grp
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8535,22 +8443,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tickets/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("count_by_status.sql"),
+        let module_dir = source_root.join("tickets");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "count_by_status.sql",
             "
             select status, count(*) as cnt
             from tickets
             group by status
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8595,22 +8502,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("region_category_totals.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "region_category_totals.sql",
             "
             select region, category, sum(amount) as total
             from orders
             group by region, category
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8660,23 +8566,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tickets/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("status_totals.sql"),
+        let module_dir = source_root.join("tickets");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "status_totals.sql",
             "
             select status, sum(count) as total
             from tickets
             where status = ?
             group by status
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8729,23 +8634,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("tickets/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("large_status_totals.sql"),
+        let module_dir = source_root.join("tickets");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "large_status_totals.sql",
             "
             select status, sum(count) as total
             from tickets
             group by status
             having sum(count) > ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8801,10 +8705,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_all.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_all.sql",
             "
             select id, name
             from (
@@ -8814,13 +8719,11 @@ mod tests {
             )
             where name = ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8876,22 +8779,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("find_matching_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_matching_users.sql",
             "
             select id, name from active_users where name = ?
             union
             select id, name from archived_users where name = ?
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -8955,31 +8857,30 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_all_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_all_users.sql",
             "
             select id, name from active_users
             union
             select id, name from archived_users
             ",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("list_all_users_with_duplicates.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "list_all_users_with_duplicates.sql",
             "
             select id, name from active_users
             union all
             select id, name from archived_users
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9028,23 +8929,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("common_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "common_things.sql",
             "select id from t1 intersect select id from t2",
-        )
-        .unwrap();
-        fs::write(
-            sql_dir.join("remaining_things.sql"),
+        );
+        write_sql_file(
+            &module_dir,
+            "remaining_things.sql",
             "select id from t1 except select id from t2",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9088,23 +8988,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("filtered_totals.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "filtered_totals.sql",
             "
             select
                 count(*) filter(where status = 'active') as active_count,
                 sum(amount) filter(where status = @status) as total
             from orders
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9149,18 +9048,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("count_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "count_things.sql",
             "select cast(count(*) as integer) as count from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9195,18 +9093,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("sum_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "sum_things.sql",
             "select cast(coalesce(sum(amount_cents), 0) as integer) as total from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9241,18 +9138,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("convert_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "convert_things.sql",
             "select cast(cast(val as integer) as text) as converted from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9280,18 +9176,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_thing.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_thing.sql",
             "insert into t (val) values (?) returning cast(id as text) as id_text",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9328,18 +9223,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users (name) values (?) returning id as userId, name as userName",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9383,18 +9277,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users (username, created_at) values (?, ?) returning id, created_at",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9455,18 +9348,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("update_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "update_user.sql",
             "update users set name = ?, updated_at = ? where id = ? returning id, updated_at",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9532,23 +9424,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("credits/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("add_credit.sql"),
+        let module_dir = source_root.join("credits");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "add_credit.sql",
             "
             update credits
             set balance = balance + @delta
             where id = @id and balance + @min_delta >= 0
             returning id, balance
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9595,18 +9486,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("line_items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("expensive_items.sql"),
+        let module_dir = source_root.join("line_items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "expensive_items.sql",
             "select id from line_items where quantity * unit_price >= quantity * @threshold",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9641,23 +9531,22 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("count_filtered.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "count_filtered.sql",
             "
             with filtered as (
                 select id from orders where org_id = @org_id
             )
             select count(*) from filtered
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9696,22 +9585,21 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_all_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_all_users.sql",
             "
             select id from users
             union all
             select id from archived_users where org_id = @org_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9750,10 +9638,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("participants/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_participants.sql"),
+        let module_dir = source_root.join("participants");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_participants.sql",
             "
             select p.id
             from participants p
@@ -9761,13 +9650,11 @@ mod tests {
               on li.participant_id = p.id
              and li.org_id = @org_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9807,10 +9694,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("participants/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("rename_participants.sql"),
+        let module_dir = source_root.join("participants");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "rename_participants.sql",
             "
             update participants
             set name = @name
@@ -9818,13 +9706,11 @@ mod tests {
             where li.participant_id = participants.id
               and li.org_id = @org_id
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9870,10 +9756,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_actor_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_actor_users.sql",
             "
             select *
             from users u
@@ -9881,13 +9768,11 @@ mod tests {
                 select 1 from audit_logs u where u.actor_id = @actor_id
             )
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9926,10 +9811,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("participants/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("without_status.sql"),
+        let module_dir = source_root.join("participants");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "without_status.sql",
             "
             select p.id, p.name
             from participants p
@@ -9940,13 +9826,11 @@ mod tests {
                   and li.status = @status
             )
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -9982,10 +9866,9 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("payments/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_payments.sql"),
+        let module_dir = source_root.join("payments");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(&module_dir, "list_payments.sql",
             "
             select id, created_at, deposited_on
             from payments
@@ -9993,13 +9876,11 @@ mod tests {
                or (@by_date = 'deposited_on' and deposited_on is not null and deposited_on >= @from_ts)
             order by case when @by_date = 'deposited_on' then deposited_on end desc, created_at desc
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10042,10 +9923,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("orders/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("ranked_orders.sql"),
+        let module_dir = source_root.join("orders");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "ranked_orders.sql",
             "
             select id
             from orders
@@ -10054,13 +9936,11 @@ mod tests {
                 else @rank
             end = status_rank
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10088,18 +9968,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("delete_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "delete_user.sql",
             "delete from users where id = ? returning id, name",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10152,18 +10031,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("insert_user.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "insert_user.sql",
             "insert into users (name, email) values (?, ?) returning *",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10232,10 +10110,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("items/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("next_position.sql"),
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "next_position.sql",
             "
             select coalesce(max(position), 0) + 1 as next_position
             from items
@@ -10243,13 +10122,11 @@ mod tests {
               and item_type = @item_type
               and season is @season
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10297,18 +10174,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "select name as name! from users",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10337,18 +10213,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("users/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_users.sql"),
+        let module_dir = source_root.join("users");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_users.sql",
             "select name as name? from users",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10377,18 +10252,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 1 else 0 end as registered from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10416,18 +10290,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 1.5 else 2.5 end as score from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10455,18 +10328,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then null else null end as unknown from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10505,10 +10377,11 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("seasons/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_seasons.sql"),
+        let module_dir = source_root.join("seasons");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_seasons.sql",
             "
             select
               case
@@ -10518,13 +10391,11 @@ mod tests {
               end as registered
             from seasons
             ",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10552,18 +10423,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 'yes' else 'no' end as label from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10591,18 +10461,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 'THE END' else 'no END here' end as label from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10630,18 +10499,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 1 end as maybe_val from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10669,18 +10537,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 1 else null end as maybe_val from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10708,18 +10575,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when active then 1 else 'a' end as mixed from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10755,18 +10621,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when a then case when b then 1 else 0 end else 2 end as val from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10794,18 +10659,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case status when 1 then 'active' when 2 then 'inactive' else 'unknown' end as label from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
@@ -10841,18 +10705,17 @@ mod tests {
         drop(conn);
 
         let source_root = dir.path().join("src");
-        let sql_dir = source_root.join("things/sql");
-        fs::create_dir_all(&sql_dir).unwrap();
-        fs::write(
-            sql_dir.join("list_things.sql"),
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_things.sql",
             "select case when id > 0 then a else b end as val from t",
-        )
-        .unwrap();
+        );
 
         let project = analyze_project(&Config {
             database,
             source_root,
-            sql_dir: None,
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,

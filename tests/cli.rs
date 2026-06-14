@@ -1,7 +1,29 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use rusqlite::Connection;
+
+fn write_sql_file(module_dir: &Path, file_name: &str, sql: impl AsRef<str>) {
+    fs::create_dir_all(module_dir).unwrap();
+    fs::write(module_dir.join("mod.rs"), "").unwrap();
+    let companion = module_dir.join("mod.sql");
+    let existing = fs::read_to_string(&companion).unwrap_or_default();
+    let separator = if existing.trim().is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    let function_name = file_name.trim_end_matches(".sql");
+    fs::write(
+        companion,
+        format!(
+            "{existing}{separator}-- func: {function_name}\n{}",
+            sql.as_ref()
+        ),
+    )
+    .unwrap();
+}
 
 #[test]
 fn help_does_not_require_database_configuration() {
@@ -151,13 +173,13 @@ fn generate_command_uses_marmot_toml_defaults() {
     drop(conn);
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(
-        users_sql.join("find_user.sql"),
+    write_sql_file(
+        &users_sql,
+        "find_user.sql",
         "select id, name from users where id = @id",
-    )
-    .unwrap();
+    );
 
     let config = dir.path().join("marmot.toml");
     fs::write(
@@ -171,7 +193,7 @@ output = "{}"
 "#,
             database.display(),
             source_root.display(),
-            source_root.join("generated/sql").display(),
+            source_root.join("generated").display(),
         ),
     )
     .unwrap();
@@ -189,7 +211,7 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(source_root.join("generated/sql/users_sql.rs").exists());
+    assert!(source_root.join("generated/users_sql.rs").exists());
 }
 
 #[test]
@@ -202,15 +224,15 @@ fn generate_command_cli_flags_override_marmot_toml() {
 
     let config_source_root = dir.path().join("config_src");
     let cli_source_root = dir.path().join("cli_src");
-    let config_sql = config_source_root.join("users/sql");
-    let cli_sql = cli_source_root.join("users/sql");
+    let config_sql = config_source_root.join("users");
+    let cli_sql = cli_source_root.join("users");
     fs::create_dir_all(&config_sql).unwrap();
     fs::create_dir_all(&cli_sql).unwrap();
-    fs::write(config_sql.join("from_config.sql"), "select name from users").unwrap();
-    fs::write(cli_sql.join("from_cli.sql"), "select name from users").unwrap();
+    write_sql_file(&config_sql, "from_config.sql", "select name from users");
+    write_sql_file(&cli_sql, "from_cli.sql", "select name from users");
 
-    let config_output = config_source_root.join("generated/sql");
-    let cli_output = cli_source_root.join("generated/sql");
+    let config_output = config_source_root.join("generated");
+    let cli_output = cli_source_root.join("generated");
     let config = dir.path().join("marmot.toml");
     fs::write(
         &config,
@@ -262,10 +284,10 @@ fn generate_command_database_url_overrides_marmot_toml_database() {
     create_users_database(&env_database, "env_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
-    let output_dir = source_root.join("generated/sql");
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
+    let output_dir = source_root.join("generated");
     fs::write(
         dir.path().join("marmot.toml"),
         format!(
@@ -308,10 +330,10 @@ fn generate_command_cli_database_overrides_database_url() {
     create_users_database(&cli_database, "cli_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
-    let output_dir = source_root.join("generated/sql");
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
+    let output_dir = source_root.join("generated");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .env("DATABASE_URL", &env_database)
@@ -341,9 +363,9 @@ fn generate_command_rejects_output_outside_source_root() {
     create_users_database(&database, "app_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
     let output_dir = dir.path().join("generated/sql");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
@@ -372,9 +394,9 @@ fn generate_command_accepts_output_with_current_dir_segments() {
     let database = dir.path().join("app.sqlite3");
     create_users_database(&database, "app_name");
 
-    let users_sql = dir.path().join("src/users/sql");
+    let users_sql = dir.path().join("src/users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .current_dir(dir.path())
@@ -403,9 +425,9 @@ fn generate_command_rejects_output_that_escapes_source_root_with_parent_segments
     let database = dir.path().join("app.sqlite3");
     create_users_database(&database, "app_name");
 
-    let users_sql = dir.path().join("src/users/sql");
+    let users_sql = dir.path().join("src/users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .current_dir(dir.path())
@@ -633,14 +655,10 @@ fn generate_command_check_reports_missing_generated_files_without_writing() {
     create_users_database(&database, "check_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(
-        users_sql.join("find_user.sql"),
-        "select id, name from users",
-    )
-    .unwrap();
-    let generated = source_root.join("generated/sql");
+    write_sql_file(&users_sql, "find_user.sql", "select id, name from users");
+    let generated = source_root.join("generated");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .arg("generate")
@@ -670,14 +688,10 @@ fn generate_command_check_passes_after_generation_and_fails_after_changes() {
     create_users_database(&database, "check_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(
-        users_sql.join("find_user.sql"),
-        "select id, name from users",
-    )
-    .unwrap();
-    let generated = source_root.join("generated/sql");
+    write_sql_file(&users_sql, "find_user.sql", "select id, name from users");
+    let generated = source_root.join("generated");
 
     let generate = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .arg("generate")
@@ -715,8 +729,8 @@ fn generate_command_check_passes_after_generation_and_fails_after_changes() {
     );
 
     fs::write(
-        users_sql.join("find_user.sql"),
-        "select id, name from users where id = @id",
+        source_root.join("users/mod.sql"),
+        "-- func: find_user\nselect id, name from users where id = @id",
     )
     .unwrap();
     let stale_check = Command::new(env!("CARGO_BIN_EXE_marmot"))
@@ -740,152 +754,34 @@ fn generate_command_check_passes_after_generation_and_fails_after_changes() {
 }
 
 #[test]
-fn generate_command_rejects_missing_configured_sql_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let database = dir.path().join("app.sqlite3");
-    create_users_database(&database, "missing_sql_dir");
-    fs::write(
-        dir.path().join("marmot.toml"),
-        format!(
-            r#"
-[tools.marmot]
-database = "{}"
-source_root = "src"
-sql_dir = "src/sql"
-output = "src/generated/sql"
-"#,
-            database.display()
-        ),
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
-        .current_dir(dir.path())
-        .arg("generate")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("missing SQL directory"),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn generate_command_rejects_configured_sql_dir_that_is_a_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let database = dir.path().join("app.sqlite3");
-    create_users_database(&database, "bad_sql_dir");
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    fs::write(dir.path().join("src/sql"), "not a directory").unwrap();
-    fs::write(
-        dir.path().join("marmot.toml"),
-        format!(
-            r#"
-[tools.marmot]
-database = "{}"
-source_root = "src"
-sql_dir = "src/sql"
-output = "src/generated/sql"
-"#,
-            database.display()
-        ),
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
-        .current_dir(dir.path())
-        .arg("generate")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("SQL path is not a directory"),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn generate_command_uses_parent_entity_for_nested_sql_directories() {
-    let dir = tempfile::tempdir().unwrap();
-    let database = dir.path().join("app.sqlite3");
-    create_users_database(&database, "nested_sql_dir");
-
-    let sql_dir = dir.path().join("src/sql");
-    fs::create_dir_all(sql_dir.join("likes/sql")).unwrap();
-    fs::write(
-        sql_dir.join("likes/sql/get_likes.sql"),
-        "select id, name from users",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("marmot.toml"),
-        format!(
-            r#"
-[tools.marmot]
-database = "{}"
-source_root = "src"
-sql_dir = "src/sql"
-output = "src/generated/sql"
-"#,
-            database.display()
-        ),
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
-        .current_dir(dir.path())
-        .arg("generate")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "generate failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(dir.path().join("src/generated/sql/likes_sql.rs").exists());
-    assert!(!dir.path().join("src/generated/sql/sql.rs").exists());
-}
-
-#[test]
 fn generate_command_uses_named_database_config() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("db/app.db");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
     create_users_database(&database, "app_name");
 
-    let source_root = dir.path().join("src");
-    let sql_dir = dir.path().join("src/sql/app");
-    fs::create_dir_all(&sql_dir).unwrap();
-    fs::write(
-        sql_dir.join("find_user.sql"),
+    let source_root = dir.path().join("src/app");
+    let users_sql = source_root.join("users");
+    fs::create_dir_all(&users_sql).unwrap();
+    write_sql_file(
+        &users_sql,
+        "find_user.sql",
         "select id, name from users where id = @id",
-    )
-    .unwrap();
+    );
 
     let config = dir.path().join("marmot.toml");
     fs::write(
         &config,
         format!(
             r#"
-[tools.marmot]
-source_root = "{}"
-
 [tools.marmot.databases.app]
 path = "{}"
-sql_dir = "{}"
+source_root = "{}"
 output = "{}"
 "#,
-            source_root.display(),
             database.display(),
-            sql_dir.display(),
-            dir.path().join("src/generated/sql/app").display(),
+            source_root.display(),
+            source_root.join("generated").display(),
         ),
     )
     .unwrap();
@@ -905,40 +801,54 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/generated/sql/app/sql.rs").exists());
+    assert!(dir.path().join("src/app/generated/users_sql.rs").exists());
 }
 
 #[test]
-fn generate_command_appends_named_database_to_global_dirs() {
+fn generate_command_cli_source_root_overrides_named_database_source_root() {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path().join("db")).unwrap();
-    create_users_database(&dir.path().join("db/primary.sqlite"), "primary_name");
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
 
-    let sql_dir = dir.path().join("src/database_sql/primary");
-    fs::create_dir_all(&sql_dir).unwrap();
-    fs::write(
-        sql_dir.join("find_user.sql"),
-        "select id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("marmot.toml"),
-        r#"
-[tools.marmot]
-sql_dir = "src/database_sql"
-output = "src/generated/database_sql"
+    let config_source_root = dir.path().join("config_src/app");
+    let config_users = config_source_root.join("users");
+    write_sql_file(
+        &config_users,
+        "find_user.sql",
+        "select 'FROM_CONFIG_SQL' as name from users",
+    );
 
-[[tools.marmot.databases]]
-name = "primary"
+    let cli_source_root = dir.path().join("cli_src");
+    let cli_users = cli_source_root.join("app/users");
+    write_sql_file(
+        &cli_users,
+        "find_user.sql",
+        "select 'FROM_CLI_SQL' as name from users",
+    );
+
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot.databases.app]
+path = "{}"
+source_root = "{}"
 "#,
+            database.display(),
+            config_source_root.display(),
+        ),
     )
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
-        .current_dir(dir.path())
+        .arg("--config")
+        .arg(&config)
         .arg("generate")
         .arg("--database-name")
-        .arg("primary")
+        .arg("app")
+        .arg("--source-root")
+        .arg(&cli_source_root)
         .output()
         .unwrap();
 
@@ -948,59 +858,10 @@ name = "primary"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        dir.path()
-            .join("src/generated/database_sql/primary/sql.rs")
-            .exists()
-    );
-}
-
-#[test]
-fn generate_command_does_not_double_named_database_global_dirs() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path().join("db")).unwrap();
-    create_users_database(&dir.path().join("db/curling.sqlite"), "curling_name");
-
-    let sql_dir = dir.path().join("src/sql/curling");
-    fs::create_dir_all(&sql_dir).unwrap();
-    fs::write(
-        sql_dir.join("find_user.sql"),
-        "select id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("marmot.toml"),
-        r#"
-[tools.marmot]
-sql_dir = "src/sql/curling"
-output = "src/generated/sql/curling"
-
-[[tools.marmot.databases]]
-name = "curling"
-"#,
-    )
-    .unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
-        .current_dir(dir.path())
-        .arg("generate")
-        .arg("--database-name")
-        .arg("curling")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "generate failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(dir.path().join("src/generated/sql/curling/sql.rs").exists());
-    assert!(
-        !dir.path()
-            .join("src/generated/sql/curling/curling/sql.rs")
-            .exists()
-    );
+    let generated_path = cli_source_root.join("app/generated/sql/users_sql.rs");
+    let generated = fs::read_to_string(generated_path).unwrap();
+    assert!(generated.contains("FROM_CLI_SQL"));
+    assert!(!generated.contains("FROM_CONFIG_SQL"));
 }
 
 #[test]
@@ -1021,20 +882,20 @@ fn generate_command_runs_all_named_database_configs() {
         .unwrap();
     drop(analytics);
 
-    let app_sql = dir.path().join("src/sql/app");
-    let analytics_sql = dir.path().join("src/sql/analytics");
+    let app_sql = dir.path().join("src/app/users");
+    let analytics_sql = dir.path().join("src/analytics/events");
     fs::create_dir_all(&app_sql).unwrap();
     fs::create_dir_all(&analytics_sql).unwrap();
-    fs::write(
-        app_sql.join("find_user.sql"),
+    write_sql_file(
+        &app_sql,
+        "find_user.sql",
         "select id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        analytics_sql.join("list_events.sql"),
+    );
+    write_sql_file(
+        &analytics_sql,
+        "list_events.sql",
         "select id, title from events",
-    )
-    .unwrap();
+    );
 
     fs::write(
         dir.path().join("marmot.toml"),
@@ -1060,10 +921,14 @@ name = "analytics"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/generated/sql/app/sql.rs").exists());
     assert!(
         dir.path()
-            .join("src/generated/sql/analytics/sql.rs")
+            .join("src/app/generated/sql/users_sql.rs")
+            .exists()
+    );
+    assert!(
+        dir.path()
+            .join("src/analytics/generated/sql/events_sql.rs")
             .exists()
     );
 }
@@ -1087,20 +952,20 @@ fn generate_command_runs_named_database_configs_when_database_url_is_set() {
         .unwrap();
     drop(analytics);
 
-    let app_sql = dir.path().join("src/sql/app");
-    let analytics_sql = dir.path().join("src/sql/analytics");
+    let app_sql = dir.path().join("src/app/users");
+    let analytics_sql = dir.path().join("src/analytics/events");
     fs::create_dir_all(&app_sql).unwrap();
     fs::create_dir_all(&analytics_sql).unwrap();
-    fs::write(
-        app_sql.join("find_user.sql"),
+    write_sql_file(
+        &app_sql,
+        "find_user.sql",
         "select id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        analytics_sql.join("list_events.sql"),
+    );
+    write_sql_file(
+        &analytics_sql,
+        "list_events.sql",
         "select id, title from events",
-    )
-    .unwrap();
+    );
 
     fs::write(
         dir.path().join("marmot.toml"),
@@ -1127,10 +992,14 @@ name = "analytics"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/generated/sql/app/sql.rs").exists());
     assert!(
         dir.path()
-            .join("src/generated/sql/analytics/sql.rs")
+            .join("src/app/generated/sql/users_sql.rs")
+            .exists()
+    );
+    assert!(
+        dir.path()
+            .join("src/analytics/generated/sql/events_sql.rs")
             .exists()
     );
 }
@@ -1140,42 +1009,24 @@ fn generate_command_rejects_named_database_output_collisions() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("db")).unwrap();
     create_users_database(&dir.path().join("db/app.sqlite"), "app_name");
-    let analytics = Connection::open(dir.path().join("db/analytics.sqlite")).unwrap();
-    analytics
-        .execute_batch(
-            "
-            create table events (
-                id integer primary key,
-                title text not null
-            );
-            ",
-        )
-        .unwrap();
-    drop(analytics);
+    create_users_database(&dir.path().join("db/analytics.sqlite"), "analytics_name");
 
-    let app_sql = dir.path().join("src/sql/app");
-    let analytics_sql = dir.path().join("src/sql/analytics");
-    fs::create_dir_all(&app_sql).unwrap();
-    fs::create_dir_all(&analytics_sql).unwrap();
-    fs::write(app_sql.join("find.sql"), "select id, name from users").unwrap();
-    fs::write(
-        analytics_sql.join("find.sql"),
-        "select id, title from events",
-    )
-    .unwrap();
+    let shared_sql = dir.path().join("src/shared/users");
+    fs::create_dir_all(&shared_sql).unwrap();
+    write_sql_file(&shared_sql, "find.sql", "select id, name from users");
 
     fs::write(
         dir.path().join("marmot.toml"),
         r#"
 [tools.marmot.databases.app]
 path = "db/app.sqlite"
-sql_dir = "src/sql/app"
-output = "src/generated/sql"
+source_root = "src/shared"
+output = "src/shared/generated/sql"
 
 [tools.marmot.databases.analytics]
 path = "db/analytics.sqlite"
-sql_dir = "src/sql/analytics"
-output = "src/generated/sql"
+source_root = "src/shared"
+output = "src/shared/generated/sql"
 "#,
     )
     .unwrap();
@@ -1192,7 +1043,11 @@ output = "src/generated/sql"
         "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!dir.path().join("src/generated/sql/sql.rs").exists());
+    assert!(
+        !dir.path()
+            .join("src/shared/generated/sql/users_sql.rs")
+            .exists()
+    );
 }
 
 #[test]
@@ -1213,20 +1068,20 @@ fn inspect_command_runs_all_named_database_configs() {
         .unwrap();
     drop(analytics);
 
-    let app_sql = dir.path().join("src/sql/app");
-    let analytics_sql = dir.path().join("src/sql/analytics");
+    let app_sql = dir.path().join("src/app/users");
+    let analytics_sql = dir.path().join("src/analytics/events");
     fs::create_dir_all(&app_sql).unwrap();
     fs::create_dir_all(&analytics_sql).unwrap();
-    fs::write(
-        app_sql.join("find_user.sql"),
+    write_sql_file(
+        &app_sql,
+        "find_user.sql",
         "select id, name from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        analytics_sql.join("list_events.sql"),
+    );
+    write_sql_file(
+        &analytics_sql,
+        "list_events.sql",
         "select id, title from events",
-    )
-    .unwrap();
+    );
 
     fs::write(
         dir.path().join("marmot.toml"),
@@ -1253,8 +1108,8 @@ name = "analytics"
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("sql::find_user params=1 columns=2"));
-    assert!(stdout.contains("sql::list_events params=0 columns=2"));
+    assert!(stdout.contains("users_sql::find_user params=1 columns=2"));
+    assert!(stdout.contains("events_sql::list_events params=0 columns=2"));
 }
 
 #[test]
@@ -1264,9 +1119,9 @@ fn inspect_command_does_not_validate_generated_output() {
     create_users_database(&database, "app_name");
 
     let source_root = dir.path().join("src");
-    let users_sql = source_root.join("users/sql");
+    let users_sql = source_root.join("users");
     fs::create_dir_all(&users_sql).unwrap();
-    fs::write(users_sql.join("find_user.sql"), "select name from users").unwrap();
+    write_sql_file(&users_sql, "find_user.sql", "select name from users");
     let output_dir = dir.path().join("generated/sql");
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))

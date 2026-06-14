@@ -44,9 +44,6 @@ struct Args {
     source_root: Option<PathBuf>,
 
     #[arg(long)]
-    sql_dir: Option<PathBuf>,
-
-    #[arg(long)]
     output: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = Target::Rust)]
@@ -220,48 +217,48 @@ fn generated_output_paths(config: &Config, project: &Project) -> BTreeSet<PathBu
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigError> {
     let targets = database_targets(args.database, args.database_name, file_config)?;
-    let source_root = args
+    let cli_source_root = args.source_root;
+    let source_root = file_config
         .source_root
-        .or_else(|| file_config.source_root.clone())
+        .clone()
         .unwrap_or_else(|| PathBuf::from("src"));
-    let sql_dir = args.sql_dir;
     let output = args.output;
     let target = args.target;
     let check = args.check;
 
     Ok(targets
         .into_iter()
-        .map(|database_target| Config {
-            database: database_target.database,
-            source_root: source_root.clone(),
-            sql_dir: sql_dir.clone().or(database_target.sql_dir).or_else(|| {
+        .map(|database_target| {
+            let config_source_root = if let Some(cli_source_root) = cli_source_root.clone() {
                 database_target
-                    .name
-                    .as_ref()
-                    .map(|name| source_root.join("sql").join(name))
-            }),
-            output: output
-                .clone()
-                .or(database_target.output)
-                .unwrap_or_else(|| {
-                    let output = source_root.join("generated/sql");
-                    if let Some(name) = database_target.name {
-                        output.join(name)
-                    } else {
-                        output
-                    }
-                }),
-            target,
-            check,
+                    .source_root_namespace
+                    .as_deref()
+                    .map(|name| join_namespace(cli_source_root.clone(), name))
+                    .unwrap_or(cli_source_root)
+            } else {
+                database_target
+                    .source_root
+                    .unwrap_or_else(|| source_root.clone())
+            };
+            Config {
+                database: database_target.database,
+                source_root: config_source_root.clone(),
+                output: output
+                    .clone()
+                    .or(database_target.output)
+                    .unwrap_or_else(|| config_source_root.join("generated/sql")),
+                target,
+                check,
+            }
         })
         .collect())
 }
 
 #[derive(Debug)]
 struct DatabaseTarget {
-    name: Option<String>,
     database: PathBuf,
-    sql_dir: Option<PathBuf>,
+    source_root: Option<PathBuf>,
+    source_root_namespace: Option<String>,
     output: Option<PathBuf>,
     migrations_dir: Option<PathBuf>,
     seeds_dir: Option<PathBuf>,
@@ -302,9 +299,9 @@ fn database_targets(
 
     if let Some(database) = explicit_database_path(cli_database, file_config) {
         return Ok(vec![DatabaseTarget {
-            name: None,
             database,
-            sql_dir: file_config.sql_dir.clone(),
+            source_root: None,
+            source_root_namespace: None,
             output: file_config.output.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
@@ -320,9 +317,9 @@ fn simple_database_target(
 ) -> Result<DatabaseTarget, ConfigError> {
     explicit_database_path(cli_database, file_config)
         .map(|database| DatabaseTarget {
-            name: None,
             database,
-            sql_dir: file_config.sql_dir.clone(),
+            source_root: None,
+            source_root_namespace: None,
             output: file_config.output.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
@@ -346,23 +343,24 @@ fn named_database_target(
     file_config: &FileConfig,
 ) -> DatabaseTarget {
     DatabaseTarget {
-        name: Some(name.to_string()),
         database: reference
             .path
             .clone()
             .unwrap_or_else(|| PathBuf::from("db").join(format!("{name}.sqlite"))),
-        sql_dir: reference.sql_dir.clone().or_else(|| {
-            file_config
-                .sql_dir
+        source_root: Some(
+            reference
+                .source_root
                 .clone()
-                .map(|base| join_namespace(base, name))
-        }),
-        output: reference.output.clone().or_else(|| {
-            file_config
-                .output
-                .clone()
-                .map(|base| join_namespace(base, name))
-        }),
+                .or_else(|| {
+                    file_config
+                        .source_root
+                        .clone()
+                        .map(|base| join_namespace(base, name))
+                })
+                .unwrap_or_else(|| PathBuf::from("src").join(name)),
+        ),
+        source_root_namespace: Some(name.to_string()),
+        output: reference.output.clone(),
         migrations_dir: Some(
             reference
                 .migrations_dir

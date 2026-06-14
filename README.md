@@ -36,9 +36,7 @@ It currently:
 
 - finds module companion SQL files like `src/items.rs` plus `src/items.sql`
 - supports multiple `-- func:` blocks per companion SQL file
-- supports legacy `src/**/sql/*.sql` query files
-- supports a configured SQL root with `--sql-dir`
-- derives generated function names from `-- func:` blocks or legacy filenames
+- derives generated function names from `-- func:` blocks
 - derives generated module names from the owning module
 - extracts named parameters like `@org_id`
 - prepares each statement with SQLite and records result columns
@@ -64,7 +62,6 @@ Project defaults can live in `marmot.toml`:
 [tools.marmot]
 database = "path/to/app.db"
 source_root = "path/to/src"
-sql_dir = "path/to/src/sql"
 output = "path/to/src/generated/sql"
 migrations_dir = "db/migrations"
 seeds_dir = "db/seeds"
@@ -77,20 +74,20 @@ Multi-database projects can use named references:
 ```toml
 [tools.marmot.databases.app]
 path = "db/app.sqlite"
-sql_dir = "src/sql/app"
-output = "src/generated/sql/app"
+source_root = "src/app"
+output = "src/app/generated/sql"
 migrations_dir = "db/migrations/app"
 seeds_dir = "db/seeds/app"
 
 [tools.marmot.databases.analytics]
 path = "db/analytics.sqlite"
-sql_dir = "src/sql/analytics"
-output = "src/generated/sql/analytics"
+source_root = "src/analytics"
+output = "src/analytics/generated/sql"
 migrations_dir = "db/migrations/analytics"
 seeds_dir = "db/seeds/analytics"
 ```
 
-Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Ambient `DATABASE_URL` does not replace named database paths in that mode. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/sql/NAME`, `src/generated/sql/NAME`, `db/migrations/NAME`, and `db/seeds/NAME`.
+Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Ambient `DATABASE_URL` does not replace named database paths in that mode. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/NAME`, `src/NAME/generated/sql`, `db/migrations/NAME`, and `db/seeds/NAME`.
 
 Generate Rust files:
 
@@ -109,16 +106,6 @@ select id, name from items where id = @id;
 
 -- func: list_items
 select id, name from items order by name;
-```
-
-Generate from a configured SQL root:
-
-```sh
-cargo run -- generate \
-  --database path/to/app.db \
-  --source-root path/to/src \
-  --sql-dir path/to/src/sql \
-  --output path/to/src/generated/sql
 ```
 
 Check generated files without writing:

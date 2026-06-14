@@ -1,8 +1,30 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use marmot::{Config, Target, analyze_project, emit_project};
 use rusqlite::Connection;
+
+fn write_sql_file(module_dir: &Path, file_name: &str, sql: impl AsRef<str>) {
+    fs::create_dir_all(module_dir).unwrap();
+    fs::write(module_dir.join("mod.rs"), "").unwrap();
+    let companion = module_dir.join("mod.sql");
+    let existing = fs::read_to_string(&companion).unwrap_or_default();
+    let separator = if existing.trim().is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    let function_name = file_name.trim_end_matches(".sql");
+    fs::write(
+        companion,
+        format!(
+            "{existing}{separator}-- func: {function_name}\n{}",
+            sql.as_ref()
+        ),
+    )
+    .unwrap();
+}
 
 #[test]
 fn analyzes_and_emits_multiple_colocated_sql_modules() {
@@ -52,8 +74,7 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let config = Config {
         database,
         source_root,
-        sql_dir: None,
-        output: dir.path().join("src/generated/sql"),
+        output: dir.path().join("src/generated"),
         target: Target::Rust,
         check: false,
     };
@@ -78,64 +99,6 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 }
 
 #[test]
-fn analyzes_and_emits_from_configured_sql_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let database = dir.path().join("app.sqlite3");
-    let conn = Connection::open(&database).unwrap();
-    conn.execute_batch(
-        "
-        create table settings (
-            name text primary key,
-            value text not null
-        );
-        create table likes (
-            id integer primary key,
-            user_id integer not null
-        );
-        ",
-    )
-    .unwrap();
-    drop(conn);
-
-    let source_root = dir.path().join("src");
-    let sql_dir = source_root.join("sql");
-    let likes_sql = sql_dir.join("likes");
-    fs::create_dir_all(&likes_sql).unwrap();
-    fs::write(
-        sql_dir.join("get_settings.sql"),
-        "select name, value from settings order by name",
-    )
-    .unwrap();
-    fs::write(
-        likes_sql.join("get_likes.sql"),
-        "select id from likes where user_id = @user_id",
-    )
-    .unwrap();
-
-    let config = Config {
-        database,
-        source_root,
-        sql_dir: Some(sql_dir),
-        output: dir.path().join("src/generated/sql"),
-        target: Target::Rust,
-        check: false,
-    };
-
-    let project = analyze_project(&config).unwrap();
-    emit_project(&config, &project).unwrap();
-
-    let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
-    assert_eq!(mod_rs, "pub mod likes_sql;\npub mod sql;\n");
-
-    let settings_output = fs::read_to_string(config.output.join("sql.rs")).unwrap();
-    assert!(settings_output.contains("pub struct GetSettingsRow"));
-    assert!(settings_output.contains("pub fn get_settings(conn: &Connection)"));
-
-    let likes_output = fs::read_to_string(config.output.join("likes_sql.rs")).unwrap();
-    assert!(likes_output.contains("pub fn get_likes(conn: &Connection, user_id: i64)"));
-}
-
-#[test]
 fn generated_rust_functions_round_trip_against_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
@@ -144,117 +107,112 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     drop(conn);
 
     let source_root = dir.path().join("fixture/src");
-    let sql_dir = source_root.join("app/sql");
-    fs::create_dir_all(&sql_dir).unwrap();
-    fs::write(
-        sql_dir.join("create_user.sql"),
+    let module_dir = source_root.join("app");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "create_user.sql",
         "insert into users (name, active, avatar, score, nickname) \
          values (@name, @active, @avatar, @score, @nickname) \
          returning id, name, active, avatar, score, nickname",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("list_active_users.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "list_active_users.sql",
         "select id, name, active, avatar, score, nickname \
          from users where active = @active order by id",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("count_users.sql"),
-        "select count(*) from users",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("rename_user.sql"),
+    );
+    write_sql_file(&module_dir, "count_users.sql", "select count(*) from users");
+    write_sql_file(
+        &module_dir,
+        "rename_user.sql",
         "update users set nickname = @nickname where id = @id returning id, nickname",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("delete_user.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "delete_user.sql",
         "delete from users where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("create_user_positional.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "create_user_positional.sql",
         "insert into users (name, active, avatar, score, nickname) \
          values (?, ?, ?, ?, ?) \
          returning id, name, active, avatar, score, nickname",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("set_score_positional.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "set_score_positional.sql",
         "update users set score = ? where id = ?",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_name_numbered.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_name_numbered.sql",
         "select name from users where id = ?1 and active = ?2",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_name_numbered_leading_zero.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_name_numbered_leading_zero.sql",
         "select name from users where id = ?01 and active = ?02",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_active_sparse_numbered.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_active_sparse_numbered.sql",
         "select name from users where active = ?2 order by id",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_name_mixed_positional.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_name_mixed_positional.sql",
         "select name from users where id = ?1 and active = ?",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_name_named_numbered_same_slot.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_name_named_numbered_same_slot.sql",
         "select name from users where id = @id and id = ?1",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("create_user_returning_star.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "create_user_returning_star.sql",
         "insert into users (name, active, avatar, score, nickname) \
          values (@name, @active, @avatar, @score, @nickname) \
          returning *",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("delete_user_returning.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "delete_user_returning.sql",
         "delete from users where id = @id returning id, name",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("create_keyword_table_row.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "create_keyword_table_row.sql",
         "insert into \"returning\" (id, name) values (@id, @name) returning id, name",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_keyword_table_row.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_keyword_table_row.sql",
         "select name from \"returning\" where id = @id",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("find_typed_thing.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "find_typed_thing.sql",
         r#"select id, "type" from typed_things where "type" = @type"#,
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("create_event.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "create_event.sql",
         "insert into events (name, event_date, starts_at) \
          values (@name, @event_date, @starts_at) \
          returning id, event_date, starts_at, created_at",
-    )
-    .unwrap();
-    fs::write(
-        sql_dir.join("list_events_since.sql"),
+    );
+    write_sql_file(
+        &module_dir,
+        "list_events_since.sql",
         "select id, event_date, starts_at, created_at \
          from events where starts_at >= @starts_at order by id",
-    )
-    .unwrap();
+    );
     let config = Config {
         database,
         source_root,
-        sql_dir: None,
         output: dir.path().join("runtime/src/generated/sql"),
         target: Target::Rust,
         check: false,

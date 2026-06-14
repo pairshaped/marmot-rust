@@ -54,26 +54,8 @@ src/items/mod.rs
 src/items/mod.sql -> items_sql
 ```
 
-Applications may configure a specific SQL root when colocating under each domain directory is not the right shape:
-
-```text
-src/sql/get_settings.sql
-src/sql/articles/get_articles.sql
-src/sql/likes/get_likes.sql
-```
-
-When a SQL root is configured, Marmot recursively discovers `.sql` files under
-that root. Files directly under the configured root belong to the generated
-`sql` module. Files under child directories use the child directory name as the
-module stem:
-
-```text
-src/sql/get_settings.sql -> sql::get_settings
-src/sql/articles/get_articles.sql -> articles_sql::get_articles
-```
-
-Legacy `*/sql/*.sql` query files and configured SQL roots remain supported.
-Their filename becomes the generated function name.
+SQL files under directories named `sql` are rejected. Query names come from
+`-- func:` blocks, not filenames.
 
 Generated code belongs outside the hand-written domain module, initially under:
 

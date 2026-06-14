@@ -18,7 +18,6 @@ The supported table is:
 [tools.marmot]
 database = "app.sqlite3"
 source_root = "src"
-sql_dir = "src/sql"
 output = "src/generated/sql"
 migrations_dir = "db/migrations"
 seeds_dir = "db/seeds"
@@ -31,8 +30,8 @@ Named database references live under `[tools.marmot.databases.NAME]`:
 ```toml
 [tools.marmot.databases.app]
 path = "db/app.sqlite"
-sql_dir = "src/sql/app"
-output = "src/generated/sql/app"
+source_root = "src/app"
+output = "src/app/generated/sql"
 migrations_dir = "db/migrations/app"
 seeds_dir = "db/seeds/app"
 ```
@@ -53,15 +52,17 @@ Named references can omit paths. Marmot derives defaults from the database name:
 
 ```text
 database       db/NAME.sqlite
-sql_dir        src/sql/NAME
-output         src/generated/sql/NAME
+source_root    src/NAME
+output         src/NAME/generated/sql
 migrations_dir db/migrations/NAME
 seeds_dir      db/seeds/NAME
 ```
 
-If `source_root` is changed, default `sql_dir` and `output` are derived from that resolved source root. For example, `source_root = "app/src"` gives `app/src/sql/NAME` and `app/src/generated/sql/NAME` for named database references that omit those paths.
+If a named reference sets `source_root`, its default output is derived from that source root. For example, `source_root = "src/app"` gives `src/app/generated/sql` when the named reference omits `output`.
 
-If a global `sql_dir`, `output`, `migrations_dir`, or `seeds_dir` is configured, named references without their own value append the database name to that global path. If the global path already ends with the database name, it is used as-is.
+If a global `migrations_dir` or `seeds_dir` is configured, named references without their own value append the database name to that global path. If the global path already ends with the database name, it is used as-is.
+
+Global `output` applies only to unnamed generation. Named references use their own `output` value or the default derived from their source root.
 
 `[tools.marmot].database` cannot be combined with named database references. Use a single top-level database config or named references, not both.
 
