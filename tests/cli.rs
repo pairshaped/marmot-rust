@@ -215,6 +215,67 @@ output = "{}"
 }
 
 #[test]
+fn generate_command_runs_init_sql_before_introspection() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let init_sql = dir.path().join("db/marmot_init.sql");
+    fs::create_dir_all(init_sql.parent().unwrap()).unwrap();
+    fs::write(
+        &init_sql,
+        "
+        create table users (
+            id integer primary key,
+            name text not null
+        );
+        ",
+    )
+    .unwrap();
+
+    let source_root = dir.path().join("src");
+    let users = source_root.join("users");
+    fs::create_dir_all(&users).unwrap();
+    write_sql_file(
+        &users,
+        "find_user.sql",
+        "select id, name from users where id = @id",
+    );
+
+    let config = dir.path().join("marmot.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[tools.marmot]
+database = "{}"
+source_root = "{}"
+output = "{}"
+init_sql = "{}"
+"#,
+            database.display(),
+            source_root.display(),
+            source_root.join("generated").display(),
+            init_sql.display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("--config")
+        .arg(&config)
+        .arg("generate")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(source_root.join("generated/users.rs").exists());
+}
+
+#[test]
 fn generate_command_cli_flags_override_marmot_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_database = dir.path().join("config.sqlite3");

@@ -53,6 +53,16 @@ pub enum Error {
         source: rusqlite::Error,
     },
 
+    ReadInitSql {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    RunInitSql {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+
     InspectDatabase {
         source: rusqlite::Error,
     },
@@ -148,6 +158,12 @@ impl std::fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::ReadInitSql { path, source } => {
+                write!(f, "could not read init_sql {}: {source}", path.display())
+            }
+            Self::RunInitSql { path, source } => {
+                write!(f, "could not run init_sql {}: {source}", path.display())
+            }
             Self::InspectDatabase { source } => {
                 write!(f, "could not inspect sqlite schema: {source}")
             }
@@ -210,10 +226,12 @@ impl std::error::Error for Error {
         match self {
             Self::ReadFile { source, .. }
             | Self::WriteFile { source, .. }
-            | Self::CreateDir { source, .. } => Some(source),
+            | Self::CreateDir { source, .. }
+            | Self::ReadInitSql { source, .. } => Some(source),
             Self::WalkDir { source, .. } => Some(source),
             Self::OpenDatabase { source, .. }
             | Self::InspectDatabase { source }
+            | Self::RunInitSql { source, .. }
             | Self::PrepareSql { source, .. } => Some(source),
             _ => None,
         }

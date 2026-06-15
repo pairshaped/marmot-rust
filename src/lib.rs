@@ -11,7 +11,7 @@ mod sql_files;
 pub mod sql_text;
 pub mod sqlite;
 
-pub use analyzer::analyze_project;
+pub use analyzer::{analyze_project, analyze_project_with_init_sql};
 pub use config::{Config, FileConfig, Target};
 pub use discovery::discover_sql_files;
 pub use emit::emit_project;

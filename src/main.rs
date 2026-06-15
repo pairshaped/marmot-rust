@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use marmot::{
-    Config, Error as MarmotError, FileConfig, Target, analyze_project,
+    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
     config::{ConfigError, DatabaseReference},
     emit_project, migrations,
     model::Project,
@@ -104,8 +104,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let file_config = FileConfig::read_optional(&cli.config)?;
     match cli.command {
         Command::Inspect(args) => {
-            for config in configs(args, &file_config)? {
-                let project = analyze_project(&config)?;
+            for target in configs(args, &file_config)? {
+                let project =
+                    analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
                 for query in project.queries {
                     println!(
                         "{}::{} params={} columns={} source={}",
@@ -121,12 +122,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Generate(args) => {
             let mut analyzed = Vec::new();
             let configs = configs(args, &file_config)?;
-            for config in &configs {
-                validate_output_under_source_root(&config.source_root, &config.output)?;
+            for target in &configs {
+                validate_output_under_source_root(
+                    &target.config.source_root,
+                    &target.config.output,
+                )?;
             }
-            for config in configs {
-                let project = analyze_project(&config)?;
-                analyzed.push((config, project));
+            for target in configs {
+                let project =
+                    analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
+                analyzed.push((target.config, project));
             }
             ensure_generated_outputs_do_not_collide(&analyzed)?;
             for (config, project) in analyzed {
@@ -230,7 +235,13 @@ fn generated_module_path(output: &Path, module: &str) -> PathBuf {
     path
 }
 
-fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigError> {
+#[derive(Debug)]
+struct AnalysisTarget {
+    config: Config,
+    init_sql: Option<PathBuf>,
+}
+
+fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, ConfigError> {
     let targets = database_targets(args.database, args.database_name, file_config)?;
     let cli_source_root = args.source_root;
     let source_root = file_config
@@ -255,15 +266,18 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<Config>, ConfigEr
                     .source_root
                     .unwrap_or_else(|| source_root.clone())
             };
-            Config {
-                database: database_target.database,
-                source_root: config_source_root.clone(),
-                output: output
-                    .clone()
-                    .or(database_target.output)
-                    .unwrap_or_else(|| config_source_root.join("generated/sql")),
-                target,
-                check,
+            AnalysisTarget {
+                config: Config {
+                    database: database_target.database,
+                    source_root: config_source_root.clone(),
+                    output: output
+                        .clone()
+                        .or(database_target.output)
+                        .unwrap_or_else(|| config_source_root.join("generated/sql")),
+                    target,
+                    check,
+                },
+                init_sql: database_target.init_sql,
             }
         })
         .collect())
@@ -275,6 +289,7 @@ struct DatabaseTarget {
     source_root: Option<PathBuf>,
     source_root_namespace: Option<String>,
     output: Option<PathBuf>,
+    init_sql: Option<PathBuf>,
     migrations_dir: Option<PathBuf>,
     seeds_dir: Option<PathBuf>,
 }
@@ -318,6 +333,7 @@ fn database_targets(
             source_root: None,
             source_root_namespace: None,
             output: file_config.output.clone(),
+            init_sql: file_config.init_sql.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
         }]);
@@ -336,6 +352,7 @@ fn simple_database_target(
             source_root: None,
             source_root_namespace: None,
             output: file_config.output.clone(),
+            init_sql: file_config.init_sql.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
         })
@@ -376,6 +393,10 @@ fn named_database_target(
         ),
         source_root_namespace: Some(name.to_string()),
         output: reference.output.clone(),
+        init_sql: reference
+            .init_sql
+            .clone()
+            .or_else(|| file_config.init_sql.clone()),
         migrations_dir: Some(
             reference
                 .migrations_dir

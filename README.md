@@ -65,6 +65,7 @@ Project defaults can live in `marmot.toml`:
 database = "path/to/app.db"
 source_root = "path/to/src"
 output = "path/to/src/generated/sql"
+init_sql = "db/marmot_init.sql"
 migrations_dir = "db/migrations"
 seeds_dir = "db/seeds"
 ```
@@ -78,6 +79,7 @@ Multi-database projects can use named references:
 path = "db/app.sqlite"
 source_root = "src/app"
 output = "src/app/generated/sql"
+init_sql = "db/app_marmot_init.sql"
 migrations_dir = "db/migrations/app"
 seeds_dir = "db/seeds/app"
 
@@ -90,6 +92,18 @@ seeds_dir = "db/seeds/analytics"
 ```
 
 Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Ambient `DATABASE_URL` does not replace named database paths in that mode. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/NAME`, `src/NAME/generated/sql`, `db/migrations/NAME`, and `db/seeds/NAME`.
+
+`init_sql` is optional setup for Marmot's analysis connection. Marmot runs the
+file after opening SQLite and before reading schema metadata or preparing query
+blocks. Named databases inherit `[tools.marmot].init_sql` unless they set their
+own `init_sql`.
+
+Warning: `init_sql` is an escape hatch. Marmot does not sandbox it, roll it
+back, or check whether it mutates schema or data. It is not a migration system,
+and it only runs during `inspect` and `generate`, not when your application
+starts. Use it for setup the analyzer needs, such as `ATTACH`, temporary tables,
+PRAGMAs, or native SQLite extension loading when your SQLite build and driver
+support it.
 
 Generate Rust files:
 

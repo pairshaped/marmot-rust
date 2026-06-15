@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 
 use heck::ToSnakeCase;
 use rusqlite::Connection;
@@ -13,10 +14,25 @@ use crate::sqlite::blocks::parse_sql_blocks;
 use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
+    analyze_project_with_init_sql(config, None)
+}
+
+pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -> Result<Project> {
     let conn = Connection::open(&config.database).map_err(|source| Error::OpenDatabase {
         path: config.database.clone(),
         source,
     })?;
+    if let Some(init_sql) = init_sql {
+        let sql = fs::read_to_string(init_sql).map_err(|source| Error::ReadInitSql {
+            path: init_sql.to_path_buf(),
+            source,
+        })?;
+        conn.execute_batch(&sql)
+            .map_err(|source| Error::RunInitSql {
+                path: init_sql.to_path_buf(),
+                source,
+            })?;
+    }
     let schema = load_schema(&conn)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();

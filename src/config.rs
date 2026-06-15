@@ -21,6 +21,7 @@ pub struct FileConfig {
     pub database: Option<PathBuf>,
     pub source_root: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    pub init_sql: Option<PathBuf>,
     pub migrations_dir: Option<PathBuf>,
     pub seeds_dir: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
@@ -32,6 +33,7 @@ pub struct DatabaseReference {
     pub source_root: Option<PathBuf>,
     pub migrations_dir: Option<PathBuf>,
     pub seeds_dir: Option<PathBuf>,
+    pub init_sql: Option<PathBuf>,
     pub output: Option<PathBuf>,
 }
 
@@ -89,6 +91,7 @@ impl FileConfig {
             database: toml_path(marmot, "database"),
             source_root: toml_path(marmot, "source_root"),
             output: toml_path(marmot, "output"),
+            init_sql: toml_path(marmot, "init_sql"),
             migrations_dir: toml_path(marmot, "migrations_dir"),
             seeds_dir: toml_path(marmot, "seeds_dir"),
             databases: toml_database_references(marmot)?,
@@ -161,6 +164,7 @@ fn database_reference_from_table(table: &toml::map::Map<String, toml::Value>) ->
         source_root: table_path(table, "source_root"),
         migrations_dir: table_path(table, "migrations_dir"),
         seeds_dir: table_path(table, "seeds_dir"),
+        init_sql: table_path(table, "init_sql"),
         output: table_path(table, "output"),
     }
 }
@@ -190,6 +194,7 @@ mod tests {
             database = "dev.sqlite"
             source_root = "src"
             output = "src/generated"
+            init_sql = "db/marmot_init.sql"
             migrations_dir = "db/migrations/app"
             seeds_dir = "db/seeds/app"
             "#,
@@ -199,6 +204,7 @@ mod tests {
         assert_eq!(config.database, Some(PathBuf::from("dev.sqlite")));
         assert_eq!(config.source_root, Some(PathBuf::from("src")));
         assert_eq!(config.output, Some(PathBuf::from("src/generated")));
+        assert_eq!(config.init_sql, Some(PathBuf::from("db/marmot_init.sql")));
         assert_eq!(
             config.migrations_dir,
             Some(PathBuf::from("db/migrations/app"))
@@ -229,6 +235,7 @@ mod tests {
             path = "db/app.db"
             source_root = "src/app"
             migrations_dir = "db/migrations/app"
+            init_sql = "db/app_init.sql"
 
             [tools.marmot.databases.analytics]
             path = "db/analytics.db"
@@ -248,6 +255,10 @@ mod tests {
         assert_eq!(
             config.databases["app"].migrations_dir,
             Some(PathBuf::from("db/migrations/app"))
+        );
+        assert_eq!(
+            config.databases["app"].init_sql,
+            Some(PathBuf::from("db/app_init.sql"))
         );
         assert_eq!(
             config.databases["analytics"].path,
