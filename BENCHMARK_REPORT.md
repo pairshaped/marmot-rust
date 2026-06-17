@@ -26,28 +26,35 @@ for the complete cross-runtime comparison.
 
 ## Results
 
-These are median rows from a five-run benchmark with 10,000 simulated requests
-per run.
+These are median results from five-run benchmarks. Each timing value is the
+average request time from a 10,000-request benchmark run.
 
-| Runner | Case | Median Time | Median us/item | Relative Notes |
-| --- | --- | ---: | ---: | --- |
-| Rust `rusqlite` | `rust_rusqlite/app_request/admin_item_edit` | 591,459us | 59 | low-level SQLite baseline |
-| Rust `rusqlite` | `rust_rusqlite/app_request/admin_item_update` | 284,919us | 28 | low-level SQLite baseline |
-| Rust Marmot | `rust_marmot/app_request/admin_item_edit` | 776,036us | 77 | generated `rusqlite` calls |
-| Rust Marmot | `rust_marmot/app_request/admin_item_update` | 218,269us | 21 | generated `rusqlite` calls |
-| Rust SQLx pool 5 | `rust_sqlx/app_request/admin_item_edit` | 1,826,036us | 182 | default SQLx pool-shaped path |
-| Rust SQLx pool 5 | `rust_sqlx/app_request/admin_item_update` | 574,538us | 57 | default SQLx pool-shaped path |
-| Rust SQLx pool 1 | `rust_sqlx_pool1/app_request/admin_item_edit` | 2,777,851us | 277 | single pooled connection capacity |
-| Rust SQLx pool 1 | `rust_sqlx_pool1/app_request/admin_item_update` | 512,644us | 51 | single pooled connection capacity |
-| Rust SQLx acquired connection | `rust_sqlx_conn/app_request/admin_item_edit` | 1,129,149us | 112 | one acquired connection held for the loop |
-| Rust SQLx acquired connection | `rust_sqlx_conn/app_request/admin_item_update` | 499,218us | 49 | one acquired connection held for the loop |
-| Rust SQLx direct connection | `rust_sqlx_direct/app_request/admin_item_edit` | 1,134,108us | 113 | direct `SqliteConnection` |
-| Rust SQLx direct connection | `rust_sqlx_direct/app_request/admin_item_update` | 487,329us | 48 | direct `SqliteConnection` |
-| Rust SQLx tuned direct connection | `rust_sqlx_direct_tuned/app_request/admin_item_edit` | 1,077,739us | 107 | direct connection with SQLx tuning knobs |
-| Rust SQLx tuned direct connection | `rust_sqlx_direct_tuned/app_request/admin_item_update` | 504,356us | 50 | direct connection with SQLx tuning knobs |
-| Rust SQLx manual transaction | `rust_sqlx_manual_tx/app_request/admin_item_update` | 475,469us | 47 | explicit transaction SQL |
-| Ruby ActiveRecord SQLite | `active_record/app_request/admin_item_edit` | 12,732,861us | 1,273 | ORM reference |
-| Ruby ActiveRecord SQLite | `active_record/app_request/admin_item_update` | 4,230,022us | 423 | ORM reference |
+### `app_request/admin_item_edit`
+
+| Runner | Time (us/item) | vs `rusqlite` | req/sec |
+| --- | ---: | ---: | ---: |
+| `rusqlite` | 59 | 1.0x | 16,907 |
+| Rust Marmot | 77 | 1.3x | 12,886 |
+| Rust SQLx pool 5 | 182 | 3.1x | 5,476 |
+| Rust SQLx pool 1 | 277 | 4.7x | 3,600 |
+| Rust SQLx acquired connection | 112 | 1.9x | 8,856 |
+| Rust SQLx direct connection | 113 | 1.9x | 8,818 |
+| Rust SQLx tuned direct connection | 107 | 1.8x | 9,279 |
+| Ruby ActiveRecord SQLite | 1,273 | 21.5x | 785 |
+
+### `app_request/admin_item_update`
+
+| Runner | Time (us/item) | vs `rusqlite` | req/sec |
+| --- | ---: | ---: | ---: |
+| `rusqlite` | 28 | 1.0x | 35,098 |
+| Rust Marmot | 21 | 0.8x | 45,815 |
+| Rust SQLx pool 5 | 57 | 2.0x | 17,405 |
+| Rust SQLx pool 1 | 51 | 1.8x | 19,507 |
+| Rust SQLx acquired connection | 49 | 1.8x | 20,031 |
+| Rust SQLx direct connection | 48 | 1.7x | 20,520 |
+| Rust SQLx tuned direct connection | 50 | 1.8x | 19,827 |
+| Rust SQLx manual transaction | 47 | 1.7x | 21,032 |
+| Ruby ActiveRecord SQLite | 423 | 14.8x | 2,364 |
 
 ## Methodology
 
