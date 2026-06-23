@@ -810,6 +810,9 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     for (key, inference) in comparison_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
+    for (key, inference) in numeric_literal_parameter_inferences(&tokens) {
+        inferences.insert(key, inference);
+    }
     for (key, inference) in case_result_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
     }
@@ -824,6 +827,15 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     }
     for (key, inference) in update_set_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
+    }
+    for key in null_guard_parameter_keys(&tokens) {
+        inferences
+            .entry(key)
+            .and_modify(|inference| inference.nullable = true)
+            .or_insert(ParameterInference {
+                column_type: ValueType::String,
+                nullable: true,
+            });
     }
 
     inferences
@@ -1135,6 +1147,117 @@ fn comparison_parameter_inferences(
     }
 
     inferences
+}
+
+fn numeric_literal_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut inferences = BTreeMap::new();
+
+    for (index, _) in tokens.iter().enumerate() {
+        let Some(key) = parameter_keys.get(&index) else {
+            continue;
+        };
+        let literal_after = comparison_operator_after(tokens, index).and_then(|literal_start| {
+            numeric_literal_starting_at(tokens, literal_start).map(|column_type| {
+                ParameterInference {
+                    column_type,
+                    nullable: false,
+                }
+            })
+        });
+        let literal_before = comparison_operator_before(tokens, index).and_then(|literal_end| {
+            numeric_literal_ending_at(tokens, literal_end).map(|column_type| ParameterInference {
+                column_type,
+                nullable: false,
+            })
+        });
+
+        if let Some(inference) = literal_after.or(literal_before) {
+            inferences.insert(key.clone(), inference);
+        }
+    }
+
+    inferences
+}
+
+fn numeric_literal_starting_at(tokens: &[Token], index: usize) -> Option<ValueType> {
+    match tokens.get(index)? {
+        Token::Number(number) => Some(number_value_type(number)),
+        Token::Minus | Token::Plus => {
+            let Token::Number(number) = tokens.get(index + 1)? else {
+                return None;
+            };
+            Some(number_value_type(number))
+        }
+        _ => None,
+    }
+}
+
+fn numeric_literal_ending_at(tokens: &[Token], index: usize) -> Option<ValueType> {
+    let Token::Number(number) = tokens.get(index)? else {
+        return None;
+    };
+    Some(number_value_type(number))
+}
+
+fn null_guard_parameter_keys(tokens: &[Token]) -> BTreeSet<String> {
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut keys = BTreeSet::new();
+
+    for (index, _) in tokens.iter().enumerate() {
+        let Some(key) = parameter_keys.get(&index) else {
+            continue;
+        };
+        if parameter_is_checked_against_null(tokens, index) {
+            keys.insert(key.clone());
+        }
+    }
+
+    keys
+}
+
+fn parameter_is_checked_against_null(tokens: &[Token], param_index: usize) -> bool {
+    if tokens
+        .get(param_index + 1)
+        .is_some_and(|token| token_is_word(token, "IS"))
+    {
+        let value_index = if tokens
+            .get(param_index + 2)
+            .is_some_and(|token| token_is_word(token, "NOT"))
+        {
+            param_index + 3
+        } else {
+            param_index + 2
+        };
+        if tokens
+            .get(value_index)
+            .is_some_and(|token| token_is_word(token, "NULL"))
+        {
+            return true;
+        }
+    }
+
+    if param_index >= 2
+        && tokens
+            .get(param_index - 1)
+            .is_some_and(|token| token_is_word(token, "IS"))
+        && tokens
+            .get(param_index - 2)
+            .is_some_and(|token| token_is_word(token, "NULL"))
+    {
+        return true;
+    }
+
+    param_index >= 3
+        && tokens
+            .get(param_index - 1)
+            .is_some_and(|token| token_is_word(token, "NOT"))
+        && tokens
+            .get(param_index - 2)
+            .is_some_and(|token| token_is_word(token, "IS"))
+        && tokens
+            .get(param_index - 3)
+            .is_some_and(|token| token_is_word(token, "NULL"))
 }
 
 fn in_list_parameter_inferences(
@@ -3770,27 +3893,37 @@ mod tests {
     }
 
     #[test]
-    fn null_guard_read_parameters_are_non_nullable() {
-        for (file_name, sql, expected_name) in [
+    fn null_guard_read_parameters_are_nullable() {
+        for (file_name, sql, expected_name, expected_type) in [
             (
                 "prefix_null_guard.sql",
                 "select id from tasks where (@account_id is null or account_id = @account_id)",
                 "account_id",
+                ValueType::I64,
             ),
             (
                 "suffix_null_guard.sql",
                 "select id from tasks where account_id = @account_id or @account_id is null",
                 "account_id",
+                ValueType::I64,
             ),
             (
                 "not_null_guard.sql",
                 "select id from tasks where @account_id is not null and account_id = @account_id",
                 "account_id",
+                ValueType::I64,
             ),
             (
                 "range_null_guard.sql",
                 "select id from tasks where @from_date is null or created_at >= @from_date",
                 "from_date",
+                ValueType::I64,
+            ),
+            (
+                "string_null_guard.sql",
+                "select id from tasks where @status is null or status = @status",
+                "status",
+                ValueType::String,
             ),
         ] {
             let dir = tempdir().unwrap();
@@ -3801,7 +3934,8 @@ mod tests {
                 create table tasks (
                     id integer primary key,
                     account_id integer not null,
-                    created_at integer not null
+                    created_at integer not null,
+                    status text not null
                 );
                 ",
             )
@@ -3827,8 +3961,8 @@ mod tests {
                 [Parameter {
                     name: expected_name.to_string(),
                     sql_names: vec![format!("@{expected_name}")],
-                    column_type: ValueType::I64,
-                    nullable: false,
+                    column_type: expected_type,
+                    nullable: true,
                 }],
                 "{file_name}"
             );
@@ -6971,6 +7105,51 @@ mod tests {
             [Parameter {
                 name: "season".to_string(),
                 sql_names: vec!["@season".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn numeric_sentinel_filter_against_boolean_column_stays_integer() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table waiver_responses (
+                id integer primary key,
+                accepted boolean not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("waivers");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_responses.sql",
+            "select id from waiver_responses where ?1 = -1 or accepted = ?1",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "param".to_string(),
+                sql_names: vec!["?1".to_string()],
                 column_type: ValueType::I64,
                 nullable: false,
             }]

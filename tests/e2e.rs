@@ -179,6 +179,56 @@ fn scalar_subquery_outputs_generate_nullable_rust_fields() {
 }
 
 #[test]
+fn optional_and_sentinel_filters_generate_expected_parameter_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table tasks (
+            id integer primary key,
+            account_id integer not null,
+            status text not null,
+            accepted boolean not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("tasks");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_tasks.sql",
+        "
+        select id
+        from tasks
+        where (?1 is null or account_id = ?1)
+          and (?2 is null or status = ?2)
+          and (?3 = -1 or accepted = ?3)
+        ",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("tasks.rs")).unwrap();
+    assert!(output.contains(
+        "pub fn list_tasks(conn: &Connection, param: Option<i64>, param_2: Option<&str>, param_3: i64)"
+    ));
+}
+
+#[test]
 fn generated_rust_functions_round_trip_against_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
