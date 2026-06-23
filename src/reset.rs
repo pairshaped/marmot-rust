@@ -31,6 +31,8 @@ pub fn reset_from(
     seeds_dir: impl AsRef<Path>,
 ) -> Result<(Vec<String>, Vec<String>), ResetError> {
     let database_path = database_path.as_ref();
+    // Reset is a dev-only command: dropping first keeps stale SQLite sidecar files
+    // out of the rebuild path, and callers should not point it at valuable data.
     drop_database(database_path)?;
     let applied_migrations = migrations::migrate_from(database_path, migrations_dir)?;
     let applied_seeds = seeds::seed_from(database_path, seeds_dir)?;

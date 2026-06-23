@@ -70,6 +70,9 @@ pub enum ConfigError {
     #[error("missing or empty name in [[tools.marmot.databases]]")]
     MalformedDatabaseArrayEntry,
 
+    #[error("malformed [tools.marmot.databases] entry")]
+    MalformedDatabaseReference,
+
     #[error("output path must be under source root: output {output}, source root {source_root}")]
     OutputOutsideSourceRoot {
         output: PathBuf,
@@ -130,18 +133,19 @@ fn toml_database_references(
     };
 
     if let Some(table) = databases.as_table() {
-        Ok(table
-            .iter()
-            .filter_map(|(name, value)| {
-                let table = value.as_table()?;
-                Some((name.clone(), database_reference_from_table(table)))
-            })
-            .collect())
+        let mut references = BTreeMap::new();
+        for (name, value) in table {
+            let Some(table) = value.as_table() else {
+                return Err(ConfigError::MalformedDatabaseReference);
+            };
+            references.insert(name.clone(), database_reference_from_table(table));
+        }
+        Ok(references)
     } else if let Some(array) = databases.as_array() {
         let mut references = BTreeMap::new();
         for value in array {
             let Some(table) = value.as_table() else {
-                continue;
+                return Err(ConfigError::MalformedDatabaseArrayEntry);
             };
             let Some(name) = table.get("name").and_then(|value| value.as_str()) else {
                 return Err(ConfigError::MalformedDatabaseArrayEntry);
@@ -154,7 +158,7 @@ fn toml_database_references(
         }
         Ok(references)
     } else {
-        Ok(BTreeMap::new())
+        Err(ConfigError::MalformedDatabaseReference)
     }
 }
 
@@ -307,6 +311,35 @@ mod tests {
             [[tools.marmot.databases]]
             name = ""
             path = "db/primary.sqlite"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConfigError::MalformedDatabaseArrayEntry));
+    }
+
+    #[test]
+    fn rejects_named_database_table_entry_that_is_not_a_table() {
+        let error = FileConfig::from_toml_str(
+            r#"
+            [tools.marmot.databases]
+            app = "db/app.sqlite"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConfigError::MalformedDatabaseReference));
+    }
+
+    #[test]
+    fn rejects_named_database_array_value_that_is_not_a_table() {
+        let error = FileConfig::from_toml_str(
+            r#"
+            [tools.marmot]
+            databases = [
+              { name = "primary", path = "db/primary.sqlite" },
+              "db/analytics.sqlite",
+            ]
             "#,
         )
         .unwrap_err();

@@ -342,12 +342,12 @@ fn derived_table_bodies(tokens: &[Token]) -> Vec<(String, &[Token])> {
             index = collect_derived_from_sequence(tokens, index + 1, &mut bodies);
             continue;
         }
-        if token_is_word(&tokens[index], "JOIN") {
-            if let Some((alias, body, after_alias)) = derived_table_at(tokens, index + 1) {
-                bodies.push((alias, body));
-                index = after_alias;
-                continue;
-            }
+        if token_is_word(&tokens[index], "JOIN")
+            && let Some((alias, body, after_alias)) = derived_table_at(tokens, index + 1)
+        {
+            bodies.push((alias, body));
+            index = after_alias;
+            continue;
         }
         index += 1;
     }
@@ -1073,11 +1073,11 @@ fn cast_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInfe
         }
 
         let (inside, after_cast) = collect_balanced_parens(tokens, index + 1);
-        let Some(as_index) = inside.iter().position(|token| token_is_word(token, "AS")) else {
+        let Some(as_index) = top_level_as_index(inside) else {
             index = after_cast;
             continue;
         };
-        let Some(declared_type) = inside.get(as_index + 1).and_then(identifier_from_token) else {
+        let Some(declared_type) = cast_declared_type(inside, as_index) else {
             index = after_cast;
             continue;
         };
@@ -1087,7 +1087,7 @@ fn cast_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInfe
                 inferences.insert(
                     key.clone(),
                     ParameterInference {
-                        column_type: ValueType::from_sqlite_type(declared_type),
+                        column_type: ValueType::from_sqlite_type(&declared_type),
                         nullable: false,
                     },
                 );
@@ -2662,16 +2662,25 @@ fn infer_cast_expression(
     }
     let (inside, _) = collect_balanced_parens(tokens, 1);
     let as_index = top_level_as_index(inside)?;
-    let declared_type = inside.get(as_index + 1).and_then(identifier_from_token)?;
+    let declared_type = cast_declared_type(inside, as_index)?;
     let nullable = infer_expression_tokens(&inside[..as_index], context)
         .and_then(|inference| inference.inferred_nullable)
         .unwrap_or(true);
 
     Some(ExpressionInference {
-        column_type: Some(ValueType::from_sqlite_type(declared_type)),
+        column_type: Some(ValueType::from_sqlite_type(&declared_type)),
         inferred_nullable: Some(nullable),
         nullable_override: None,
     })
+}
+
+fn cast_declared_type(tokens: &[Token], as_index: usize) -> Option<String> {
+    let parts = tokens
+        .iter()
+        .skip(as_index + 1)
+        .map_while(identifier_from_token)
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn top_level_as_index(tokens: &[Token]) -> Option<usize> {
@@ -7112,6 +7121,44 @@ mod tests {
     }
 
     #[test]
+    fn infers_parameter_type_from_multi_token_cast_target() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("create table events (id integer primary key);")
+            .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("events");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "find_events.sql",
+            "select id from events where cast(@season as unsigned big int) = 0",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [Parameter {
+                name: "season".to_string(),
+                sql_names: vec!["@season".to_string()],
+                column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
     fn numeric_sentinel_filter_against_boolean_column_stays_integer() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -9636,6 +9683,51 @@ mod tests {
                 field_name: "converted".to_string(),
                 column_type: ValueType::I64,
                 nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn multi_token_cast_target_returns_affinity_type() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "convert_things.sql",
+            "select cast(val as unsigned big int) as converted from t",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "converted".to_string(),
+                field_name: "converted".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
             }]
         );
     }
