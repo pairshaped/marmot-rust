@@ -202,6 +202,12 @@ fn schema_with_ctes(tokens: &[Token], schema: &Schema) -> Schema {
     schema
 }
 
+fn schema_with_derived_tables(tokens: &[Token], schema: &Schema) -> Schema {
+    let mut schema = schema.clone();
+    add_derived_tables_to_schema(tokens, &mut schema);
+    schema
+}
+
 fn add_ctes_to_schema(tokens: &[Token], schema: &mut Schema) {
     if !tokens
         .first()
@@ -264,10 +270,11 @@ fn infer_cte_columns(
     schema: &Schema,
 ) -> Option<BTreeMap<String, SchemaColumn>> {
     let select_list = first_select_list(body_tokens)?;
-    let table_refs = table_references(body_tokens);
+    let schema = schema_with_derived_tables(body_tokens, schema);
+    let table_refs = table_references_with_derived_tables(body_tokens);
     let nullable_tables = BTreeSet::new();
     let context = ExpressionContext {
-        schema,
+        schema: &schema,
         table_refs: &table_refs,
         nullable_tables: &nullable_tables,
     };
@@ -308,6 +315,107 @@ fn infer_cte_columns(
     }
 
     Some(columns)
+}
+
+fn add_derived_tables_to_schema(tokens: &[Token], schema: &mut Schema) {
+    for (alias, body) in derived_table_bodies(tokens) {
+        if let Some(columns) = infer_cte_columns(body, &[], schema) {
+            schema.tables.insert(alias, columns);
+        }
+    }
+}
+
+fn table_references_with_derived_tables(tokens: &[Token]) -> BTreeMap<String, String> {
+    let mut refs = table_references(tokens);
+    for (alias, _) in derived_table_bodies(tokens) {
+        refs.insert(alias.clone(), alias);
+    }
+    refs
+}
+
+fn derived_table_bodies(tokens: &[Token]) -> Vec<(String, &[Token])> {
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if token_is_word(&tokens[index], "FROM") {
+            index = collect_derived_from_sequence(tokens, index + 1, &mut bodies);
+            continue;
+        }
+        if token_is_word(&tokens[index], "JOIN") {
+            if let Some((alias, body, after_alias)) = derived_table_at(tokens, index + 1) {
+                bodies.push((alias, body));
+                index = after_alias;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    bodies
+}
+
+fn collect_derived_from_sequence<'a>(
+    tokens: &'a [Token],
+    mut index: usize,
+    bodies: &mut Vec<(String, &'a [Token])>,
+) -> usize {
+    while index < tokens.len() {
+        if matches!(tokens.get(index), Some(Token::Comma)) {
+            index += 1;
+            continue;
+        }
+        if tokens.get(index).is_some_and(from_sequence_boundary)
+            || tokens.get(index).is_some_and(join_keyword)
+        {
+            break;
+        }
+
+        if let Some((alias, body, after_alias)) = derived_table_at(tokens, index) {
+            bodies.push((alias, body));
+            index = after_alias;
+        } else {
+            index += 1;
+        }
+
+        while index < tokens.len()
+            && !matches!(tokens.get(index), Some(Token::Comma))
+            && !tokens.get(index).is_some_and(from_sequence_boundary)
+            && !tokens.get(index).is_some_and(join_keyword)
+        {
+            index += 1;
+        }
+    }
+
+    index
+}
+
+fn derived_table_at(tokens: &[Token], index: usize) -> Option<(String, &[Token], usize)> {
+    if !matches!(tokens.get(index), Some(Token::OpenParen)) {
+        return None;
+    }
+    let (body, after_body) = collect_balanced_parens(tokens, index);
+    if !body
+        .iter()
+        .any(|token| token_is_word(token, "SELECT") || token_is_word(token, "WITH"))
+    {
+        return None;
+    }
+
+    let alias_index = if tokens
+        .get(after_body)
+        .is_some_and(|token| token_is_word(token, "AS"))
+    {
+        after_body + 1
+    } else {
+        after_body
+    };
+    let alias = tokens.get(alias_index).and_then(identifier_from_token)?;
+    if alias_stop_word(alias) {
+        return None;
+    }
+
+    Some((alias.to_ascii_lowercase(), body, alias_index + 1))
 }
 
 fn first_select_list(tokens: &[Token]) -> Option<&[Token]> {
@@ -1747,8 +1855,8 @@ fn result_columns(
         let nullable = expression_inference
             .and_then(|inference| inference.nullable_override)
             .or(table_nullable)
-            .or_else(|| schema_column.map(|column| column.nullable))
             .or_else(|| expression_inference.and_then(|inference| inference.inferred_nullable))
+            .or_else(|| schema_column.map(|column| column.nullable))
             .unwrap_or_else(|| infer_expression_nullability(&name));
         columns.push(Column {
             name,
@@ -2049,9 +2157,10 @@ fn select_expression_inferences(
     else {
         return SelectExpressionInferences::default();
     };
-    let table_refs = table_references(&tokens);
+    let schema = schema_with_derived_tables(&tokens, schema);
+    let table_refs = table_references_with_derived_tables(&tokens);
     let context = ExpressionContext {
-        schema,
+        schema: &schema,
         table_refs: &table_refs,
         nullable_tables,
     };
@@ -2218,6 +2327,9 @@ fn infer_expression_tokens(
     tokens: &[Token],
     context: &ExpressionContext<'_>,
 ) -> Option<ExpressionInference> {
+    if let Some(inference) = infer_scalar_subquery_expression(tokens, context) {
+        return Some(inference);
+    }
     if let Some(inference) = infer_top_level_numeric_binary_expression(tokens, context) {
         return Some(inference);
     }
@@ -2231,7 +2343,7 @@ fn infer_expression_tokens(
         .first()
         .is_some_and(|token| token_is_word(token, "CAST"))
     {
-        return infer_cast_expression(tokens);
+        return infer_cast_expression(tokens, context);
     }
     if let [Token::Minus | Token::Plus, Token::Number(number)] = tokens {
         return Some(ExpressionInference {
@@ -2295,6 +2407,48 @@ fn infer_expression_tokens(
         "coalesce" => infer_coalesce_expression(tokens, context),
         _ => None,
     }
+}
+
+fn infer_scalar_subquery_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
+    if !matches!(tokens.first(), Some(Token::OpenParen)) {
+        return None;
+    }
+
+    let (inside, after_inside) = collect_balanced_parens(tokens, 0);
+    if after_inside != tokens.len()
+        || !inside
+            .iter()
+            .any(|token| token_is_word(token, "SELECT") || token_is_word(token, "WITH"))
+    {
+        return None;
+    }
+
+    let select_list = first_select_list(inside)?;
+    let selected_expression = split_top_level_commas(select_list).into_iter().next()?;
+    let selected_expression = expression_without_alias(selected_expression);
+    let schema = schema_with_ctes(inside, context.schema);
+    let schema = schema_with_derived_tables(inside, &schema);
+    let table_refs = table_references_with_derived_tables(inside);
+    let nullable_tables = BTreeSet::new();
+    let inner_context = ExpressionContext {
+        schema: &schema,
+        table_refs: &table_refs,
+        nullable_tables: &nullable_tables,
+    };
+    let mut inference = infer_expression_tokens(selected_expression, &inner_context).unwrap_or(
+        ExpressionInference {
+            column_type: None,
+            inferred_nullable: None,
+            nullable_override: None,
+        },
+    );
+    inference.inferred_nullable = Some(true);
+    inference.nullable_override = None;
+
+    Some(inference)
 }
 
 fn infer_top_level_numeric_binary_expression(
@@ -2376,17 +2530,23 @@ fn infer_min_max_expression(
     Some(inference)
 }
 
-fn infer_cast_expression(tokens: &[Token]) -> Option<ExpressionInference> {
+fn infer_cast_expression(
+    tokens: &[Token],
+    context: &ExpressionContext<'_>,
+) -> Option<ExpressionInference> {
     if !matches!(tokens.get(1), Some(Token::OpenParen)) {
         return None;
     }
     let (inside, _) = collect_balanced_parens(tokens, 1);
     let as_index = top_level_as_index(inside)?;
     let declared_type = inside.get(as_index + 1).and_then(identifier_from_token)?;
+    let nullable = infer_expression_tokens(&inside[..as_index], context)
+        .and_then(|inference| inference.inferred_nullable)
+        .unwrap_or(true);
 
     Some(ExpressionInference {
         column_type: Some(ValueType::from_sqlite_type(declared_type)),
-        inferred_nullable: Some(false),
+        inferred_nullable: Some(nullable),
         nullable_override: None,
     })
 }
@@ -2602,6 +2762,61 @@ fn is_nullability_override(token: &SpannedToken) -> bool {
 
 fn token_is_word(token: &Token, expected: &str) -> bool {
     matches!(token, Token::Word(text) if text.eq_ignore_ascii_case(expected))
+}
+
+fn from_sequence_boundary(token: &Token) -> bool {
+    matches!(token, Token::Semicolon)
+        || matches!(
+            identifier_from_token(token).map(|word| word.to_ascii_uppercase()),
+            Some(word)
+                if matches!(
+                    word.as_str(),
+                    "WHERE"
+                        | "GROUP"
+                        | "HAVING"
+                        | "ORDER"
+                        | "LIMIT"
+                        | "OFFSET"
+                        | "UNION"
+                        | "INTERSECT"
+                        | "EXCEPT"
+                )
+        )
+}
+
+fn join_keyword(token: &Token) -> bool {
+    matches!(
+        identifier_from_token(token).map(|word| word.to_ascii_uppercase()),
+        Some(word)
+            if matches!(
+                word.as_str(),
+                "JOIN" | "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "NATURAL" | "FULL"
+            )
+    )
+}
+
+fn alias_stop_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "ON" | "USING"
+            | "WHERE"
+            | "GROUP"
+            | "HAVING"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "JOIN"
+            | "LEFT"
+            | "RIGHT"
+            | "INNER"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "FULL"
+    )
 }
 
 fn identifier_from_token(token: &Token) -> Option<&str> {
@@ -8065,6 +8280,70 @@ mod tests {
     }
 
     #[test]
+    fn scalar_subquery_column_is_nullable_even_when_selected_column_is_not_null() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table carts (id integer primary key);
+            create table waivers (
+                id integer primary key,
+                cart_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("carts");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "show_cart.sql",
+            "
+            select carts.id,
+                   (
+                       select waivers.id
+                       from waivers
+                       where waivers.cart_id = carts.id
+                       order by waivers.id asc
+                       limit 1
+                   ) as first_required_waiver_id
+            from carts
+            ",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [
+                Column {
+                    name: "id".to_string(),
+                    field_name: "id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Column {
+                    name: "first_required_waiver_id".to_string(),
+                    field_name: "first_required_waiver_id".to_string(),
+                    column_type: ValueType::I64,
+                    nullable: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn cast_subquery_column_as_integer_returns_i64_non_nullable() {
         let dir = tempdir().unwrap();
         let database = dir.path().join("app.sqlite3");
@@ -9133,6 +9412,106 @@ mod tests {
                 field_name: "total".to_string(),
                 column_type: ValueType::I64,
                 nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn cast_nullable_column_preserves_nullability() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table t (
+                id integer primary key,
+                val text
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("things");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "convert_things.sql",
+            "select cast(val as integer) as converted from t",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "converted".to_string(),
+                field_name: "converted".to_string(),
+                column_type: ValueType::I64,
+                nullable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn cast_scalar_subquery_preserves_nullable_output() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table carts (id integer primary key);
+            create table waivers (
+                id integer primary key,
+                cart_id integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("carts");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "show_cart.sql",
+            "
+            select cast((
+                       select waivers.id
+                       from waivers
+                       where waivers.cart_id = carts.id
+                       order by waivers.id asc
+                       limit 1
+                   ) as integer) as first_required_waiver_id
+            from carts
+            ",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0].columns,
+            [Column {
+                name: "first_required_waiver_id".to_string(),
+                field_name: "first_required_waiver_id".to_string(),
+                column_type: ValueType::I64,
+                nullable: true,
             }]
         );
     }

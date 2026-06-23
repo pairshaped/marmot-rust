@@ -120,6 +120,65 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 }
 
 #[test]
+fn scalar_subquery_outputs_generate_nullable_rust_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table carts (id integer primary key);
+        create table waivers (
+            id integer primary key,
+            cart_id integer not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("carts");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "show_cart.sql",
+        "
+        select carts.id,
+               (
+                   select waivers.id
+                   from waivers
+                   where waivers.cart_id = carts.id
+                   order by waivers.id asc
+                   limit 1
+               ) as first_required_waiver_id,
+               cast((
+                   select waivers.id
+                   from waivers
+                   where waivers.cart_id = carts.id
+                   order by waivers.id asc
+                   limit 1
+               ) as integer) as first_required_waiver_id_cast
+        from carts
+        ",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("carts.rs")).unwrap();
+    assert!(output.contains("pub first_required_waiver_id: Option<i64>"));
+    assert!(output.contains("pub first_required_waiver_id_cast: Option<i64>"));
+}
+
+#[test]
 fn generated_rust_functions_round_trip_against_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
