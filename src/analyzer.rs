@@ -811,7 +811,7 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
         inferences.insert(key, inference);
     }
     for (key, inference) in numeric_literal_parameter_inferences(&tokens) {
-        inferences.insert(key, inference);
+        merge_numeric_literal_parameter_inference(&mut inferences, key, inference);
     }
     for (key, inference) in case_result_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
@@ -839,6 +839,19 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
     }
 
     inferences
+}
+
+fn merge_numeric_literal_parameter_inference(
+    inferences: &mut BTreeMap<String, ParameterInference>,
+    key: String,
+    inference: ParameterInference,
+) {
+    match inferences.get(&key) {
+        Some(existing) if existing.column_type == ValueType::String => {}
+        _ => {
+            inferences.insert(key, inference);
+        }
+    }
 }
 
 fn insert_parameter_inferences(
@@ -7153,6 +7166,136 @@ mod tests {
                 name: "season".to_string(),
                 sql_names: vec!["@season".to_string()],
                 column_type: ValueType::I64,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn text_sentinel_filter_uses_text_column_type_for_reused_named_param() {
+        let params = analyze_single_query(
+            "
+            create table line_items (
+                id integer primary key,
+                status text not null
+            );
+            ",
+            "
+            select id
+            from line_items
+            where @status = ''
+               or @status = 'all'
+               or (@status = 'owing' and status in ('submitted', 'partially_paid'))
+               or status = @status
+            ",
+        );
+
+        assert_eq!(
+            params,
+            [Parameter {
+                name: "status".to_string(),
+                sql_names: vec!["@status".to_string()],
+                column_type: ValueType::String,
+                nullable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn report_like_text_sentinel_filters_emit_string_arguments() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table products (
+                id integer primary key,
+                product_type text not null
+            );
+            create table line_items (
+                id integer primary key,
+                product_id integer not null,
+                status text not null,
+                kind text not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("reports");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "line_items.sql",
+            "
+            select line_items.id
+            from line_items
+            join products on products.id = line_items.product_id
+            where (
+              @status = ''
+              or @status = 'all'
+              or (@status = 'owing' and line_items.status in ('submitted', 'partially_paid'))
+              or line_items.status = @status
+            )
+            and (
+              @type_filter = ''
+              or @type_filter = 'all'
+              or (@type_filter = 'adjustment' and line_items.kind = 'adjustment')
+              or products.product_type = @type_filter
+            )
+            ",
+        );
+
+        let config = Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        };
+
+        let project = analyze_project(&config).unwrap();
+        crate::emit_project(&config, &project).unwrap();
+
+        assert_eq!(
+            project.queries[0].parameters,
+            [
+                Parameter {
+                    name: "status".to_string(),
+                    sql_names: vec!["@status".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "type_filter".to_string(),
+                    sql_names: vec!["@type_filter".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ]
+        );
+
+        let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
+        assert!(output.contains(
+            "pub fn line_items(conn: &Connection, status: impl AsRef<str>, type_filter: impl AsRef<str>)"
+        ));
+    }
+
+    #[test]
+    fn text_cast_inference_survives_numeric_literal_comparison() {
+        let params = analyze_single_query(
+            "create table events (id integer primary key);",
+            "select id from events where cast(@season as text) = 'all' or @season = 0",
+        );
+
+        assert_eq!(
+            params,
+            [Parameter {
+                name: "season".to_string(),
+                sql_names: vec!["@season".to_string()],
+                column_type: ValueType::String,
                 nullable: false,
             }]
         );
