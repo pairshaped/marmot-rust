@@ -1677,6 +1677,9 @@ fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<
         if !token_is_word(&tokens[between_index], "BETWEEN") {
             continue;
         }
+        if !parameter_is_inside_between_range(tokens, between_index, param_index) {
+            continue;
+        }
         let column_end = if between_index >= 2 && token_is_word(&tokens[between_index - 1], "NOT") {
             between_index - 2
         } else {
@@ -1686,6 +1689,42 @@ fn between_column_for_parameter(tokens: &[Token], param_index: usize) -> Option<
     }
 
     None
+}
+
+fn parameter_is_inside_between_range(
+    tokens: &[Token],
+    between_index: usize,
+    param_index: usize,
+) -> bool {
+    let mut depth = 0usize;
+    let mut top_level_and_count = 0usize;
+
+    for token in tokens.iter().take(param_index).skip(between_index + 1) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            token if token_is_word(token, "AND") => {
+                top_level_and_count += 1;
+                if top_level_and_count > 1 {
+                    return false;
+                }
+            }
+            token if token_is_word(token, "OR") => return false,
+            Token::Comma => return false,
+            Token::Word(word)
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "ORDER" | "GROUP" | "HAVING" | "LIMIT" | "OFFSET" | "UNION" | "RETURNING"
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    true
 }
 
 fn collect_balanced_parens(tokens: &[Token], open_index: usize) -> (&[Token], usize) {
@@ -7281,6 +7320,103 @@ mod tests {
         assert!(output.contains(
             "pub fn line_items(conn: &Connection, status: impl AsRef<str>, type_filter: impl AsRef<str>)"
         ));
+    }
+
+    #[test]
+    fn report_like_text_sentinel_filters_with_extra_params_emit_string_arguments() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table orders (
+                id integer primary key,
+                org_id integer not null,
+                status text not null
+            );
+            create table products (
+                id integer primary key,
+                org_id integer not null,
+                product_type text not null
+            );
+            create table line_items (
+                id integer primary key,
+                order_id integer not null,
+                product_id integer,
+                status text not null,
+                kind text not null,
+                created_at integer not null
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("reports");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "line_items.sql",
+            "
+            select line_items.id
+            from line_items
+            join orders on orders.id = line_items.order_id
+            left join products on products.id = line_items.product_id
+            where orders.org_id = @org_id
+              and orders.status != 'pending'
+              and line_items.created_at between @from_ts and @to_ts
+              and (
+                cast(@status as text) = ''
+                or cast(@status as text) = 'all'
+                or (cast(@status as text) = 'owing' and line_items.status in ('submitted', 'partially_paid'))
+                or line_items.status = cast(@status as text)
+              )
+              and (
+                cast(@type_filter as text) = ''
+                or cast(@type_filter as text) = 'all'
+                or (cast(@type_filter as text) = 'adjustment' and line_items.kind = 'adjustment')
+                or products.product_type = cast(@type_filter as text)
+              )
+              and (@item_id = 0 or line_items.product_id = @item_id)
+            order by line_items.created_at desc, line_items.id desc
+            limit @limit offset @offset
+            ",
+        );
+
+        let config = Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+        };
+
+        let project = analyze_project(&config).unwrap();
+        crate::emit_project(&config, &project).unwrap();
+
+        let params = project.queries[0]
+            .parameters
+            .iter()
+            .map(|param| (param.name.as_str(), param.column_type.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            params,
+            [
+                ("org_id", ValueType::I64),
+                ("from_ts", ValueType::I64),
+                ("to_ts", ValueType::I64),
+                ("status", ValueType::String),
+                ("type_filter", ValueType::String),
+                ("item_id", ValueType::I64),
+                ("limit", ValueType::I64),
+                ("offset", ValueType::I64),
+            ]
+        );
+
+        let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
+        assert!(output.contains("status: impl AsRef<str>"));
+        assert!(output.contains("type_filter: impl AsRef<str>"));
     }
 
     #[test]
