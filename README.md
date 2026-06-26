@@ -47,6 +47,7 @@ It currently:
 - lowers source-level SQL parameters to dense positional binds in generated Rust
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
 - supports named database references for multi-database projects
+- can enforce configured temporal suffixes and generate checked Rust date/datetime boundary types for those columns
 
 The remaining work is deeper SQL coverage and polish around diagnostics and edge-case inference.
 
@@ -92,6 +93,33 @@ seeds_dir = "db/seeds/analytics"
 ```
 
 Pass `--database-name app` to target one named database. Without it, `generate`, `migrate`, `seed`, and `reset` run every named database in sorted name order. Ambient `DATABASE_URL` does not replace named database paths in that mode. Named references can omit paths; Marmot derives `db/NAME.sqlite`, `src/NAME`, `src/NAME/generated/sql`, `db/migrations/NAME`, and `db/seeds/NAME`.
+
+### Temporal Suffixes
+
+Temporal suffix enforcement is opt-in:
+
+```toml
+[tools.marmot.temporal]
+strict_suffixes = true
+datetime_suffixes = ["_at"]
+date_suffixes = ["_on"]
+datetime_storage = "text_second_utc"
+date_storage = "text_ymd"
+```
+
+With `strict_suffixes = true`, columns ending in a configured datetime suffix
+must be declared as `TEXT` and generate `temporal::DbDateTime`. Columns ending
+in a configured date suffix must be declared as `TEXT` and generate
+`temporal::DbDate`.
+
+The storage keys are explicit because they are part of the project contract,
+but they are not a menu of equally supported backends yet. The only supported
+values today are:
+
+- `datetime_storage = "text_second_utc"` for `YYYY-MM-DD HH:MM:SS` UTC datetime text
+- `date_storage = "text_ymd"` for `YYYY-MM-DD` date text
+
+Unknown storage values are rejected.
 
 `init_sql` is optional setup for Marmot's analysis connection. Marmot runs the
 file after opening SQLite and before reading schema metadata or preparing query
