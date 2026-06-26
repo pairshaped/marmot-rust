@@ -5,7 +5,7 @@ use std::path::Path;
 use heck::ToSnakeCase;
 use rusqlite::Connection;
 
-use crate::config::Config;
+use crate::config::{Config, TemporalConfig};
 use crate::discovery::discover_sql_files;
 use crate::error::{Error, Result};
 use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
@@ -33,7 +33,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
                 source,
             })?;
     }
-    let schema = load_schema(&conn)?;
+    let schema = load_schema(&conn, &config.temporal)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
 
@@ -112,6 +112,7 @@ impl Schema {
 #[derive(Debug, Clone)]
 struct SchemaColumn {
     declared_type: String,
+    column_type: ValueType,
     nullable: bool,
     notnull: bool,
     primary_key: bool,
@@ -119,7 +120,7 @@ struct SchemaColumn {
     ordinal: i64,
 }
 
-fn load_schema(conn: &Connection) -> Result<Schema> {
+fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
     let table_names = {
         let mut stmt = conn
             .prepare(
@@ -150,28 +151,35 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
                 "#,
             )
             .map_err(|source| Error::InspectDatabase { source })?;
-        let mut column_rows = stmt
+        let raw_column_rows = stmt
             .query_map([table_name.as_str()], |row| {
                 let ordinal: i64 = row.get(0)?;
                 let name: String = row.get(1)?;
                 let declared_type: String = row.get(2)?;
                 let notnull: i64 = row.get(3)?;
                 let primary_key: i64 = row.get(4)?;
-                Ok((
-                    name.to_ascii_lowercase(),
-                    SchemaColumn {
-                        declared_type,
-                        nullable: false,
-                        notnull: notnull != 0,
-                        primary_key: primary_key != 0,
-                        rowid_alias: false,
-                        ordinal,
-                    },
-                ))
+                Ok((ordinal, name, declared_type, notnull, primary_key))
             })
             .map_err(|source| Error::InspectDatabase { source })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|source| Error::InspectDatabase { source })?;
+        let mut column_rows = Vec::new();
+        for (ordinal, name, declared_type, notnull, primary_key) in raw_column_rows {
+            let column_type =
+                value_type_for_schema_column(&table_name, &name, &declared_type, temporal)?;
+            column_rows.push((
+                name.to_ascii_lowercase(),
+                SchemaColumn {
+                    declared_type,
+                    column_type,
+                    nullable: false,
+                    notnull: notnull != 0,
+                    primary_key: primary_key != 0,
+                    rowid_alias: false,
+                    ordinal,
+                },
+            ));
+        }
 
         let without_rowid = table_without_rowid(conn, &table_name)?;
         let primary_key_count = column_rows
@@ -194,6 +202,58 @@ fn load_schema(conn: &Connection) -> Result<Schema> {
     }
 
     Ok(schema)
+}
+
+fn value_type_for_schema_column(
+    table: &str,
+    column: &str,
+    declared_type: &str,
+    temporal: &TemporalConfig,
+) -> Result<ValueType> {
+    let normalized = normalized_declared_type(declared_type);
+    if temporal.strict_suffixes {
+        if temporal
+            .datetime_suffixes
+            .iter()
+            .any(|suffix| column.ends_with(suffix))
+        {
+            if normalized != "text" {
+                return Err(Error::TemporalColumnTypeMismatch {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    declared_type: declared_type.to_string(),
+                    expected: "TEXT",
+                });
+            }
+            return Ok(ValueType::DbDateTime);
+        }
+        if temporal
+            .date_suffixes
+            .iter()
+            .any(|suffix| column.ends_with(suffix))
+        {
+            if normalized != "text" {
+                return Err(Error::TemporalColumnTypeMismatch {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    declared_type: declared_type.to_string(),
+                    expected: "TEXT",
+                });
+            }
+            return Ok(ValueType::DbDate);
+        }
+    }
+
+    Ok(ValueType::from_sqlite_type(declared_type))
+}
+
+fn normalized_declared_type(declared_type: &str) -> String {
+    declared_type
+        .split_once('(')
+        .map(|(base, _)| base)
+        .unwrap_or(declared_type)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn schema_with_ctes(tokens: &[Token], schema: &Schema) -> Schema {
@@ -305,6 +365,7 @@ fn infer_cte_columns(
             name,
             SchemaColumn {
                 declared_type: declared_type_for_value_type(&column_type).to_string(),
+                column_type,
                 nullable,
                 notnull: !nullable,
                 primary_key: false,
@@ -456,6 +517,7 @@ fn declared_type_for_value_type(value_type: &ValueType) -> &'static str {
         ValueType::String => "text",
         ValueType::Bytes => "blob",
         ValueType::Value => "",
+        ValueType::DbDate | ValueType::DbDateTime => "text",
     }
 }
 
@@ -893,7 +955,7 @@ fn insert_parameter_inferences(
                     inferences.insert(
                         key,
                         ParameterInference {
-                            column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                            column_type: schema_column.column_type.clone(),
                             nullable: schema_column.nullable || schema_column.rowid_alias,
                         },
                     );
@@ -935,7 +997,7 @@ fn insert_select_parameter_inferences(
             inferences.insert(
                 key.clone(),
                 ParameterInference {
-                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    column_type: schema_column.column_type.clone(),
                     nullable: schema_column.nullable || schema_column.rowid_alias,
                 },
             );
@@ -1153,7 +1215,7 @@ fn comparison_parameter_inferences(
         inferences.insert(
             key,
             ParameterInference {
-                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                column_type: schema_column.column_type.clone(),
                 nullable: false,
             },
         );
@@ -1309,7 +1371,7 @@ fn in_list_parameter_inferences(
             inferences.insert(
                 key.clone(),
                 ParameterInference {
-                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    column_type: schema_column.column_type.clone(),
                     nullable: false,
                 },
             );
@@ -1363,7 +1425,7 @@ fn case_result_parameter_inferences(
             inferences.insert(
                 key.clone(),
                 ParameterInference {
-                    column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                    column_type: schema_column.column_type.clone(),
                     nullable: false,
                 },
             );
@@ -1535,7 +1597,7 @@ fn between_parameter_inferences(
         inferences.insert(
             key,
             ParameterInference {
-                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                column_type: schema_column.column_type.clone(),
                 nullable: false,
             },
         );
@@ -1651,7 +1713,7 @@ fn infer_update_assignment_parameters(
         inferences.insert(
             key.clone(),
             ParameterInference {
-                column_type: ValueType::from_sqlite_type(&schema_column.declared_type),
+                column_type: schema_column.column_type.clone(),
                 nullable: schema_column.nullable,
             },
         );
@@ -2019,7 +2081,7 @@ fn result_columns(
                     .and_then(Option::as_ref)
             });
         let column_type = schema_column
-            .map(|column| ValueType::from_sqlite_type(&column.declared_type))
+            .map(|column| column.column_type.clone())
             .or_else(|| expression_inference.and_then(|inference| inference.column_type.clone()))
             .unwrap_or_else(|| infer_column_type(&name));
         let table_nullable = metadata
@@ -2543,7 +2605,7 @@ fn infer_expression_tokens(
     }
     if let Some((table, schema_column)) = infer_column_ref_expression(tokens, context) {
         return Some(ExpressionInference {
-            column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
+            column_type: Some(schema_column.column_type.clone()),
             inferred_nullable: Some(
                 schema_column.nullable || context.nullable_tables.contains(&table),
             ),
@@ -2866,7 +2928,7 @@ fn infer_column_ref_case_branch(
     let (table, schema_column) = infer_column_ref_expression(tokens, context)?;
 
     Some(CaseBranch {
-        column_type: Some(ValueType::from_sqlite_type(&schema_column.declared_type)),
+        column_type: Some(schema_column.column_type.clone()),
         nullable: schema_column.nullable || context.nullable_tables.contains(&table),
     })
 }
@@ -3081,6 +3143,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3283,6 +3346,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3344,6 +3408,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3405,6 +3470,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3451,6 +3517,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3507,6 +3574,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3556,6 +3624,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3619,6 +3688,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3791,6 +3861,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3849,6 +3920,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3894,6 +3966,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -3939,6 +4012,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4014,6 +4088,7 @@ mod tests {
                 output: dir.path().join("generated"),
                 target: Target::Rust,
                 check: false,
+                temporal: Default::default(),
             })
             .unwrap();
 
@@ -4061,6 +4136,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4111,6 +4187,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4175,6 +4252,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4424,6 +4502,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4475,6 +4554,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4537,6 +4617,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4724,6 +4805,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4784,6 +4866,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4829,6 +4912,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4875,6 +4959,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4930,6 +5015,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -4992,6 +5078,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5054,6 +5141,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5120,6 +5208,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5188,6 +5277,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5234,6 +5324,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5291,6 +5382,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5346,6 +5438,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5401,6 +5494,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5452,6 +5546,7 @@ mod tests {
                 output: dir.path().join("generated"),
                 target: Target::Rust,
                 check: false,
+                temporal: Default::default(),
             })
             .unwrap();
 
@@ -5508,6 +5603,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5563,6 +5659,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(
@@ -5608,6 +5705,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(
@@ -5642,6 +5740,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(result, Err(Error::PrepareSql { .. })));
@@ -5679,6 +5778,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(result, Err(Error::PrepareSql { .. })));
@@ -5715,6 +5815,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5785,6 +5886,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5852,6 +5954,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5894,6 +5997,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -5957,6 +6061,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6021,6 +6126,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6096,6 +6202,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6160,6 +6267,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6228,6 +6336,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6275,6 +6384,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6323,6 +6433,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6376,6 +6487,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6414,6 +6526,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6452,6 +6565,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6505,6 +6619,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6561,6 +6676,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6599,6 +6715,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6656,6 +6773,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6702,6 +6820,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6753,6 +6872,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6799,6 +6919,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6863,6 +6984,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6901,6 +7023,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -6947,6 +7070,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7004,6 +7128,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7059,6 +7184,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7120,6 +7246,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7158,6 +7285,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7196,6 +7324,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7293,6 +7422,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         };
 
         let project = analyze_project(&config).unwrap();
@@ -7390,6 +7520,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         };
 
         let project = analyze_project(&config).unwrap();
@@ -7468,6 +7599,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7499,6 +7631,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(result, Err(Error::InvalidSql { .. })));
@@ -7524,6 +7657,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(
@@ -7553,6 +7687,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(
@@ -7592,6 +7727,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7632,6 +7768,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         });
 
         assert!(matches!(result, Err(Error::InvalidSqlBlock { .. })));
@@ -7677,6 +7814,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7729,6 +7867,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7781,6 +7920,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7833,6 +7973,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7885,6 +8026,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7926,6 +8068,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -7973,6 +8116,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8020,6 +8164,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8061,6 +8206,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8112,6 +8258,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8171,6 +8318,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8234,6 +8382,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8282,6 +8431,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8340,6 +8490,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8400,6 +8551,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8458,6 +8610,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8509,6 +8662,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8565,6 +8719,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8622,6 +8777,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8679,6 +8835,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8724,6 +8881,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8770,6 +8928,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8826,6 +8985,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8875,6 +9035,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8913,6 +9074,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -8960,6 +9122,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9014,6 +9177,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9073,6 +9237,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9127,6 +9292,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9192,6 +9358,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9261,6 +9428,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9320,6 +9488,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9385,6 +9554,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9453,6 +9623,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9527,6 +9698,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9597,6 +9769,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9684,6 +9857,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9748,6 +9922,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9807,6 +9982,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9862,6 +10038,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9907,6 +10084,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9952,6 +10130,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -9997,6 +10176,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10052,6 +10232,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10097,6 +10278,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10135,6 +10317,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10182,6 +10365,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10236,6 +10420,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10307,6 +10492,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10388,6 +10574,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10445,6 +10632,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10495,6 +10683,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10548,6 +10737,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10603,6 +10793,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10659,6 +10850,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10721,6 +10913,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10779,6 +10972,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10829,6 +11023,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10889,6 +11084,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10927,6 +11123,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -10990,6 +11187,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11075,6 +11273,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11133,6 +11332,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11172,6 +11372,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11211,6 +11412,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11249,6 +11451,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11287,6 +11490,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11344,6 +11548,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11382,6 +11587,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11420,6 +11626,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11458,6 +11665,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11496,6 +11704,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11534,6 +11743,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11580,6 +11790,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11618,6 +11829,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 
@@ -11664,6 +11876,7 @@ mod tests {
             output: dir.path().join("generated"),
             target: Target::Rust,
             check: false,
+            temporal: Default::default(),
         })
         .unwrap();
 

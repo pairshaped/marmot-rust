@@ -14,6 +14,7 @@ pub struct Config {
     pub output: PathBuf,
     pub target: Target,
     pub check: bool,
+    pub temporal: TemporalConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -25,6 +26,38 @@ pub struct FileConfig {
     pub migrations_dir: Option<PathBuf>,
     pub seeds_dir: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
+    pub temporal: TemporalConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalConfig {
+    pub strict_suffixes: bool,
+    pub datetime_suffixes: Vec<String>,
+    pub date_suffixes: Vec<String>,
+    pub datetime_storage: TemporalDateTimeStorage,
+    pub date_storage: TemporalDateStorage,
+}
+
+impl Default for TemporalConfig {
+    fn default() -> Self {
+        Self {
+            strict_suffixes: false,
+            datetime_suffixes: vec!["_at".to_string()],
+            date_suffixes: vec!["_on".to_string()],
+            datetime_storage: TemporalDateTimeStorage::TextSecondUtc,
+            date_storage: TemporalDateStorage::TextYmd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalDateTimeStorage {
+    TextSecondUtc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalDateStorage {
+    TextYmd,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -73,6 +106,12 @@ pub enum ConfigError {
     #[error("malformed [tools.marmot.databases] entry")]
     MalformedDatabaseReference,
 
+    #[error("unknown temporal datetime_storage {0}")]
+    UnknownTemporalDateTimeStorage(String),
+
+    #[error("unknown temporal date_storage {0}")]
+    UnknownTemporalDateStorage(String),
+
     #[error("output path must be under source root: output {output}, source root {source_root}")]
     OutputOutsideSourceRoot {
         output: PathBuf,
@@ -98,6 +137,7 @@ impl FileConfig {
             migrations_dir: toml_path(marmot, "migrations_dir"),
             seeds_dir: toml_path(marmot, "seeds_dir"),
             databases: toml_database_references(marmot)?,
+            temporal: toml_temporal_config(marmot)?,
         })
     }
 
@@ -123,6 +163,57 @@ impl FileConfig {
 fn toml_path(table: Option<&toml::Value>, key: &str) -> Option<PathBuf> {
     let value = table?.get(key)?.as_str()?;
     (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+fn toml_temporal_config(marmot: Option<&toml::Value>) -> Result<TemporalConfig, ConfigError> {
+    let Some(temporal) = marmot.and_then(|marmot| marmot.get("temporal")) else {
+        return Ok(TemporalConfig::default());
+    };
+
+    let mut config = TemporalConfig::default();
+    config.strict_suffixes = temporal
+        .get("strict_suffixes")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(config.strict_suffixes);
+    config.datetime_suffixes =
+        toml_string_array(temporal, "datetime_suffixes").unwrap_or(config.datetime_suffixes);
+    config.date_suffixes =
+        toml_string_array(temporal, "date_suffixes").unwrap_or(config.date_suffixes);
+    if let Some(value) = temporal
+        .get("datetime_storage")
+        .and_then(|value| value.as_str())
+    {
+        config.datetime_storage = match value {
+            "text_second_utc" => TemporalDateTimeStorage::TextSecondUtc,
+            other => {
+                return Err(ConfigError::UnknownTemporalDateTimeStorage(
+                    other.to_string(),
+                ));
+            }
+        };
+    }
+    if let Some(value) = temporal
+        .get("date_storage")
+        .and_then(|value| value.as_str())
+    {
+        config.date_storage = match value {
+            "text_ymd" => TemporalDateStorage::TextYmd,
+            other => return Err(ConfigError::UnknownTemporalDateStorage(other.to_string())),
+        };
+    }
+
+    Ok(config)
+}
+
+fn toml_string_array(table: &toml::Value, key: &str) -> Option<Vec<String>> {
+    let values = table.get(key)?.as_array()?;
+    Some(
+        values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(ToString::to_string)
+            .collect(),
+    )
 }
 
 fn toml_database_references(
@@ -229,6 +320,30 @@ mod tests {
 
         assert_eq!(config.database, None);
         assert_eq!(config.output, None);
+    }
+
+    #[test]
+    fn parses_temporal_config() {
+        let config = FileConfig::from_toml_str(
+            r#"
+            [tools.marmot.temporal]
+            strict_suffixes = true
+            datetime_suffixes = ["_at", "_time"]
+            date_suffixes = ["_on", "_date"]
+            datetime_storage = "text_second_utc"
+            date_storage = "text_ymd"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.temporal.strict_suffixes);
+        assert_eq!(config.temporal.datetime_suffixes, ["_at", "_time"]);
+        assert_eq!(config.temporal.date_suffixes, ["_on", "_date"]);
+        assert_eq!(
+            config.temporal.datetime_storage,
+            TemporalDateTimeStorage::TextSecondUtc
+        );
+        assert_eq!(config.temporal.date_storage, TemporalDateStorage::TextYmd);
     }
 
     #[test]

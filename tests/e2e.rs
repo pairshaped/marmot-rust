@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use marmot::{Config, Target, analyze_project, emit_project};
+use marmot::{Config, Error, Target, analyze_project, emit_project};
 use rusqlite::Connection;
 
 fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
@@ -87,6 +87,7 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
         output: dir.path().join("src/generated"),
         target: Target::Rust,
         check: false,
+        temporal: Default::default(),
     };
 
     let project = analyze_project(&config).unwrap();
@@ -168,6 +169,7 @@ fn scalar_subquery_outputs_generate_nullable_rust_fields() {
         output: dir.path().join("generated"),
         target: Target::Rust,
         check: false,
+        temporal: Default::default(),
     };
 
     let project = analyze_project(&config).unwrap();
@@ -217,6 +219,7 @@ fn optional_and_sentinel_filters_generate_expected_parameter_types() {
         output: dir.path().join("generated"),
         target: Target::Rust,
         check: false,
+        temporal: Default::default(),
     };
 
     let project = analyze_project(&config).unwrap();
@@ -225,6 +228,140 @@ fn optional_and_sentinel_filters_generate_expected_parameter_types() {
     let output = fs::read_to_string(config.output.join("tasks.rs")).unwrap();
     assert!(output.contains(
         "pub fn list_tasks(conn: &Connection, param: Option<i64>, param_2: Option<&str>, param_3: i64)"
+    ));
+}
+
+#[test]
+fn strict_temporal_suffixes_generate_checked_boundary_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table events (
+            id integer primary key,
+            title text not null,
+            starts_at text not null,
+            registration_closes_on text
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("fixture/src");
+    let module_dir = source_root.join("app");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "create_event.sql",
+        "insert into events (title, starts_at, registration_closes_on) \
+         values (@title, @starts_at, @registration_closes_on) \
+         returning id, title, starts_at, registration_closes_on",
+    );
+    write_sql_file(
+        &module_dir,
+        "list_events_after.sql",
+        "select id, title, starts_at, registration_closes_on \
+         from events \
+         where starts_at >= @starts_at \
+           and (@registration_closes_on is null \
+                or registration_closes_on = @registration_closes_on) \
+         order by id",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("runtime/src/generated/sql"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
+    assert_eq!(mod_rs, "pub mod app;\npub mod temporal;\n");
+    let app_rs = fs::read_to_string(config.output.join("app.rs")).unwrap();
+    assert!(app_rs.contains("use super::temporal as temporal;"));
+    assert!(app_rs.contains("pub starts_at: temporal::DbDateTime"));
+    assert!(app_rs.contains("pub registration_closes_on: Option<temporal::DbDate>"));
+    assert!(app_rs.contains("starts_at: impl AsRef<temporal::DbDateTime>"));
+    assert!(app_rs.contains("registration_closes_on: Option<&temporal::DbDate>"));
+    assert!(app_rs.contains(
+        "params![title.as_ref(), starts_at.as_ref().as_str(), registration_closes_on.map(|value| value.as_str())]"
+    ));
+
+    write_temporal_runtime_crate(dir.path());
+
+    let output = Command::new("cargo")
+        .arg("test")
+        .current_dir(dir.path().join("runtime"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generated temporal crate tests failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn strict_temporal_suffixes_reject_non_text_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table events (
+            id integer primary key,
+            starts_at integer not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("events");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_events.sql",
+        "select id, starts_at from events",
+    );
+
+    let result = analyze_project(&Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    });
+
+    assert!(matches!(
+        result,
+        Err(Error::TemporalColumnTypeMismatch {
+            table,
+            column,
+            declared_type,
+            expected
+        }) if table == "events"
+            && column == "starts_at"
+            && declared_type == "INTEGER"
+            && expected == "TEXT"
     ));
 }
 
@@ -346,6 +483,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         output: dir.path().join("runtime/src/generated/sql"),
         target: Target::Rust,
         check: false,
+        temporal: Default::default(),
     };
 
     let project = analyze_project(&config).unwrap();
@@ -395,6 +533,104 @@ fn create_runtime_schema(conn: &Connection) {
             created_at timestamp not null default current_timestamp
         );
         "#,
+    )
+    .unwrap();
+}
+
+fn write_temporal_runtime_crate(root: &std::path::Path) {
+    let runtime = root.join("runtime");
+    fs::create_dir_all(runtime.join("src/generated")).unwrap();
+    fs::write(
+        runtime.join("Cargo.toml"),
+        r#"
+[package]
+name = "marmot-generated-temporal-runtime-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
+"#,
+    )
+    .unwrap();
+    fs::write(runtime.join("src/generated/mod.rs"), "pub mod sql;\n").unwrap();
+    fs::write(
+        runtime.join("src/lib.rs"),
+        r##"
+pub mod generated;
+
+#[cfg(test)]
+mod tests {
+    use super::generated::sql::{
+        app,
+        temporal::{DbDate, DbDateTime},
+    };
+    use rusqlite::Connection;
+
+    fn create_schema(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            create table events (
+                id integer primary key,
+                title text not null,
+                starts_at text not null,
+                registration_closes_on text
+            );
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generated_functions_round_trip_temporal_suffix_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        let starts_at = DbDateTime::new("2026-06-11 09:30:00").unwrap();
+        let closes_on = DbDate::new("2026-06-01").unwrap();
+        let created = app::create_event(&conn, "league", &starts_at, Some(&closes_on)).unwrap();
+
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].starts_at.as_str(), "2026-06-11 09:30:00");
+        assert_eq!(
+            created[0].registration_closes_on.as_ref().map(DbDate::as_str),
+            Some("2026-06-01")
+        );
+
+        let rows = app::list_events_after(
+            &conn,
+            DbDateTime::new("2026-06-01 00:00:00").unwrap(),
+            Some(&closes_on),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].starts_at, starts_at);
+    }
+
+    #[test]
+    fn generated_types_reject_invalid_temporal_values() {
+        assert!(DbDate::new("2026-02-29").is_err());
+        assert!(DbDateTime::new("2026-06-11T09:30:00Z").is_err());
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+        conn.execute(
+            "insert into events (title, starts_at) values ('bad', '2026-99-11 09:30:00')",
+            [],
+        )
+        .unwrap();
+
+        let error = app::list_events_after(
+            &conn,
+            DbDateTime::new("2026-01-01 00:00:00").unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid temporal value"));
+    }
+}
+"##,
     )
     .unwrap();
 }

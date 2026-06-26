@@ -50,6 +50,8 @@ pub enum ValueType {
     F64,
     Bool,
     String,
+    DbDate,
+    DbDateTime,
     Bytes,
     Value,
 }
@@ -94,6 +96,8 @@ impl ValueType {
             Self::F64 => "f64",
             Self::Bool => "bool",
             Self::String => "String",
+            Self::DbDate => "temporal::DbDate",
+            Self::DbDateTime => "temporal::DbDateTime",
             Self::Bytes => "Vec<u8>",
             Self::Value => "rusqlite::types::Value",
         }
@@ -125,6 +129,8 @@ impl Parameter {
         if !self.nullable {
             return match self.column_type {
                 ValueType::String => "impl AsRef<str>".to_string(),
+                ValueType::DbDate => "impl AsRef<temporal::DbDate>".to_string(),
+                ValueType::DbDateTime => "impl AsRef<temporal::DbDateTime>".to_string(),
                 ValueType::Bytes => "impl AsRef<[u8]>".to_string(),
                 _ => self.column_type.rust_type().to_string(),
             };
@@ -132,6 +138,8 @@ impl Parameter {
 
         let rust_type = match self.column_type {
             ValueType::String => "&str",
+            ValueType::DbDate => "&temporal::DbDate",
+            ValueType::DbDateTime => "&temporal::DbDateTime",
             ValueType::Bytes => "&[u8]",
             _ => self.column_type.rust_type(),
         };

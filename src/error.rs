@@ -67,6 +67,13 @@ pub enum Error {
         source: rusqlite::Error,
     },
 
+    TemporalColumnTypeMismatch {
+        table: String,
+        column: String,
+        declared_type: String,
+        expected: &'static str,
+    },
+
     PrepareSql {
         path: PathBuf,
         source: rusqlite::Error,
@@ -96,6 +103,8 @@ pub enum Error {
     DuplicateRowTypeNames {
         names: Vec<String>,
     },
+
+    GeneratedTemporalModuleCollision,
 
     MixedParameterStyles {
         path: PathBuf,
@@ -167,6 +176,15 @@ impl std::fmt::Display for Error {
             Self::InspectDatabase { source } => {
                 write!(f, "could not inspect sqlite schema: {source}")
             }
+            Self::TemporalColumnTypeMismatch {
+                table,
+                column,
+                declared_type,
+                expected,
+            } => write!(
+                f,
+                "temporal column {table}.{column} must be declared as {expected}, got {declared_type:?}"
+            ),
             Self::PrepareSql { path, source } => {
                 write!(f, "could not prepare SQL in {}: {source}", path.display())?;
                 if let Some(hint) = sql_error_hint(&source.to_string()) {
@@ -204,6 +222,10 @@ impl std::fmt::Display for Error {
             Self::DuplicateRowTypeNames { names } => {
                 write!(f, "duplicate generated row type names: {names:?}")
             }
+            Self::GeneratedTemporalModuleCollision => write!(
+                f,
+                "temporal types require a generated temporal module, but the project already has a root temporal SQL module"
+            ),
             Self::MixedParameterStyles { path } => {
                 write!(
                     f,

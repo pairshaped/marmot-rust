@@ -6,7 +6,7 @@ use marmot::{
     Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
     config::{ConfigError, DatabaseReference},
     emit_project, migrations,
-    model::Project,
+    model::{Project, ValueType},
     reset, seeds,
 };
 
@@ -223,7 +223,25 @@ fn generated_output_paths(config: &Config, project: &Project) -> BTreeSet<PathBu
         }
     }
     paths.insert(config.output.join("mod.rs"));
+    if project_uses_temporal(project) {
+        paths.insert(config.output.join("temporal.rs"));
+    }
     paths
+}
+
+fn project_uses_temporal(project: &Project) -> bool {
+    project.queries.iter().any(|query| {
+        query
+            .parameters
+            .iter()
+            .any(|param| matches!(param.column_type, ValueType::DbDate | ValueType::DbDateTime))
+            || query.columns.iter().any(|column| {
+                matches!(
+                    column.column_type,
+                    ValueType::DbDate | ValueType::DbDateTime
+                )
+            })
+    })
 }
 
 fn generated_module_path(output: &Path, module: &str) -> PathBuf {
@@ -276,6 +294,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                         .unwrap_or_else(|| config_source_root.join("generated/sql")),
                     target,
                     check,
+                    temporal: file_config.temporal.clone(),
                 },
                 init_sql: database_target.init_sql,
             }
