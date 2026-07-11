@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use marmot::model::ConnectionAccess;
 use marmot::{Config, Error, Target, analyze_project, emit_project};
 use rusqlite::Connection;
 
@@ -531,6 +532,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         "select id, event_date, starts_at, created_at \
          from events where starts_at >= @starts_at order by id",
     );
+    write_sql_file(
+        &module_dir,
+        "create_user_name_index.sql",
+        "create index users_name_idx on users (name)",
+    );
     let config = Config {
         database,
         source_root,
@@ -541,6 +547,33 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     };
 
     let project = analyze_project(&config).unwrap();
+    assert_eq!(
+        project
+            .queries
+            .iter()
+            .find(|query| query.name == "list_active_users")
+            .unwrap()
+            .connection_access,
+        ConnectionAccess::Read
+    );
+    assert_eq!(
+        project
+            .queries
+            .iter()
+            .find(|query| query.name == "create_user")
+            .unwrap()
+            .connection_access,
+        ConnectionAccess::Mutation
+    );
+    assert_eq!(
+        project
+            .queries
+            .iter()
+            .find(|query| query.name == "create_user_name_index")
+            .unwrap()
+            .connection_access,
+        ConnectionAccess::Mutation
+    );
     emit_project(&config, &project).unwrap();
 
     write_runtime_crate(dir.path());
@@ -558,6 +591,32 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    fs::create_dir_all(dir.path().join("runtime/src/bin")).unwrap();
+    fs::write(
+        dir.path().join("runtime/src/bin/immutable_mutation.rs"),
+        r#"
+use marmot_generated_runtime_test::generated::sql::app;
+use rusqlite::Connection;
+
+fn main() {
+    let conn = Connection::open_in_memory().unwrap();
+    let _ = app::delete_user(&conn, 1);
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new("cargo")
+        .args(["check", "--bin", "immutable_mutation"])
+        .current_dir(dir.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "immutable mutation unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MutationConnection"), "{stderr}");
 }
 
 fn create_runtime_schema(conn: &Connection) {
@@ -638,12 +697,13 @@ mod tests {
 
     #[test]
     fn generated_functions_round_trip_temporal_suffix_types() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         let starts_at = DbDateTime::new("2026-06-11 09:30:00").unwrap();
         let closes_on = DbDate::new("2026-06-01").unwrap();
-        let created = app::create_event(&conn, "league", &starts_at, Some(&closes_on)).unwrap();
+        let created =
+            app::create_event(&mut conn, "league", &starts_at, Some(&closes_on)).unwrap();
 
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].starts_at.as_str(), "2026-06-11 09:30:00");
@@ -681,7 +741,16 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("invalid temporal value"));
+        let message = error.to_string();
+        assert!(message.contains("starts_at"), "{message}");
+        assert!(message.contains("2026-99-11 09:30:00"), "{message}");
+        assert!(message.contains("YYYY-MM-DD HH:MM:SS"), "{message}");
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(std::error::Error::source)
+                .is_some()
+        );
     }
 }
 "##,
@@ -750,11 +819,11 @@ mod tests {
 
     #[test]
     fn generated_functions_round_trip_common_sqlite_types() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         let created = app::create_user(
-            &conn,
+            &mut conn,
             "alice",
             true,
             [1_u8, 2, 3],
@@ -776,22 +845,35 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "alice");
 
-        let renamed = app::rename_user(&conn, None, 1).unwrap();
+        let renamed = app::rename_user(&mut conn, None, 1).unwrap();
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].id, 1);
         assert_eq!(renamed[0].nickname, None);
 
-        assert_eq!(app::delete_user(&conn, 1).unwrap(), 1);
+        assert_eq!(app::delete_user(&mut conn, 1).unwrap(), 1);
         assert_eq!(app::count_users_one(&conn).unwrap(), 0);
     }
 
     #[test]
+    fn generated_mutations_accept_transactions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        app::create_user(&tx, "alice", true, [], 1.0, None).unwrap();
+        assert_eq!(app::count_users_one(&tx).unwrap(), 1);
+        tx.commit().unwrap();
+
+        assert_eq!(app::count_users_one(&conn).unwrap(), 1);
+    }
+
+    #[test]
     fn generated_functions_bind_positional_and_numbered_parameters() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         let created = app::create_user_positional(
-            &conn,
+            &mut conn,
             "bob",
             true,
             [4_u8, 5, 6],
@@ -805,7 +887,7 @@ mod tests {
         assert_eq!(created[0].avatar, vec![4, 5, 6]);
         assert_eq!(created[0].nickname, None);
 
-        assert_eq!(app::set_score_positional(&conn, 2.5, 1).unwrap(), 1);
+        assert_eq!(app::set_score_positional(&mut conn, 2.5, 1).unwrap(), 1);
         let active = app::list_active_users(&conn, true).unwrap();
         assert_eq!(active[0].score, 2.5);
 
@@ -833,13 +915,13 @@ mod tests {
 
     #[test]
     fn generated_functions_handle_empty_results_returning_star_and_delete_returning() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         assert_eq!(app::list_active_users(&conn, true).unwrap(), vec![]);
 
         let created = app::create_user_returning_star(
-            &conn,
+            &mut conn,
             "carol",
             false,
             [7_u8, 8, 9],
@@ -855,7 +937,7 @@ mod tests {
         assert_eq!(created[0].score, 4.75);
         assert_eq!(created[0].nickname.as_deref(), Some("c"));
 
-        let deleted = app::delete_user_returning(&conn, 1).unwrap();
+        let deleted = app::delete_user_returning(&mut conn, 1).unwrap();
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].id, 1);
         assert_eq!(deleted[0].name, "carol");
@@ -864,10 +946,10 @@ mod tests {
 
     #[test]
     fn generated_functions_handle_quoted_keyword_table_names() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app::create_keyword_table_row(&conn, 10, "keyword").unwrap();
+        let created = app::create_keyword_table_row(&mut conn, 10, "keyword").unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].id, 10);
         assert_eq!(created[0].name, "keyword");
@@ -879,7 +961,7 @@ mod tests {
 
     #[test]
     fn generated_functions_handle_reserved_word_column_names() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         conn.execute(
@@ -896,11 +978,11 @@ mod tests {
 
     #[test]
     fn generated_functions_treat_sqlite_temporal_types_as_text() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
         let created = app::create_event(
-            &conn,
+            &mut conn,
             "launch",
             "2026-06-11",
             "2026-06-11 09:30:00",

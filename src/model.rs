@@ -28,9 +28,16 @@ pub struct Query {
     pub module_name: String,
     pub name: String,
     pub return_type: ReturnType,
+    pub connection_access: ConnectionAccess,
     pub sql: String,
     pub parameters: Vec<Parameter>,
     pub columns: Vec<Column>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionAccess {
+    Read,
+    Mutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

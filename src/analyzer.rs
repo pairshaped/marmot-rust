@@ -8,7 +8,9 @@ use rusqlite::Connection;
 use crate::config::{Config, TemporalConfig};
 use crate::discovery::discover_sql_files;
 use crate::error::{Error, Result};
-use crate::model::{Column, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier};
+use crate::model::{
+    Column, ConnectionAccess, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier,
+};
 use crate::sql_text::validate_sql;
 use crate::sqlite::blocks::parse_sql_blocks;
 use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
@@ -55,7 +57,8 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
             let sqlite_sql = strip_nullability_overrides(&sql);
             validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
             let parameters = parameters(&sqlite_sql, &schema);
-            let columns = result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
+            let (columns, connection_access) =
+                result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
             let return_type = if columns.is_empty() {
                 ReturnType::Execute
             } else {
@@ -67,6 +70,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
                 module_name: file.module_name.clone(),
                 name: block.function_name,
                 return_type,
+                connection_access,
                 sql: sqlite_sql,
                 parameters,
                 columns,
@@ -2218,13 +2222,18 @@ fn result_columns(
     path: &std::path::Path,
     sql: &str,
     sqlite_sql: &str,
-) -> Result<Vec<Column>> {
+) -> Result<(Vec<Column>, ConnectionAccess)> {
     let stmt = conn
         .prepare(sqlite_sql)
         .map_err(|source| Error::PrepareSql {
             path: path.to_path_buf(),
             source,
         })?;
+    let connection_access = if stmt.readonly() {
+        ConnectionAccess::Read
+    } else {
+        ConnectionAccess::Mutation
+    };
     let mut seen = BTreeSet::new();
     let mut duplicate_names = BTreeSet::new();
     let mut seen_field_names = BTreeSet::new();
@@ -2302,7 +2311,7 @@ fn result_columns(
         });
     }
 
-    Ok(columns)
+    Ok((columns, connection_access))
 }
 
 fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {

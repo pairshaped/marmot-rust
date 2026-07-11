@@ -44,6 +44,7 @@ It currently:
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
 - emits typed direct `rusqlite` functions using `prepare_cached`
+- requires immutable connections for reads and stronger mutation-capable connections for writes
 - lowers source-level SQL parameters to dense positional binds in generated Rust
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
 - supports named database references for multi-database projects
@@ -129,6 +130,11 @@ must be declared as `TEXT` and generate `temporal::DbDateTime`. Columns ending
 in a configured date suffix must be declared as `TEXT` and generate
 `temporal::DbDate`.
 
+If stored text does not match the configured temporal format, generated row
+decoding includes the generated field name, bad value, and expected format in
+the error. The original `rusqlite` conversion error remains in the error source
+chain.
+
 The storage keys are explicit because they are part of the project contract,
 but they are not a menu of equally supported backends yet. The only supported
 values today are:
@@ -168,6 +174,31 @@ select id, name from items where id = @id;
 -- func: list_items
 select id, name from items order by name;
 ```
+
+### Read and mutation connections
+
+Marmot asks SQLite whether each prepared statement is read-only. Read statements
+generate functions that accept `&Connection`. Anything SQLite reports as a
+write, including `INSERT`, `UPDATE`, `DELETE`, write statements with `RETURNING`,
+and DDL, generates a function that accepts `impl MutationConnection`.
+
+`MutationConnection` is a sealed generated trait implemented for
+`&mut Connection` and `&Transaction`. This means an immutable `&Connection`
+cannot call generated mutation SQL:
+
+```rust
+let mut conn = rusqlite::Connection::open("app.sqlite")?;
+queries::create_item(&mut conn, "Stone")?;
+
+let tx = conn.transaction()?;
+queries::create_item(&tx, "Broom")?;
+tx.commit()?;
+```
+
+Existing callers must make standalone write connections mutable and pass
+`&mut conn`. Callers already inside a transaction should pass `&transaction`.
+Read calls stay unchanged. Marmot rejects multi-statement query blocks, so each
+generated function has one SQLite access classification.
 
 The generated module mirrors the companion SQL file path under the generated
 SQL namespace:
