@@ -51,6 +51,23 @@ It currently:
 
 The remaining work is deeper SQL coverage and polish around diagnostics and edge-case inference.
 
+### Declared types are semantic input
+
+Marmot uses SQLite declared types to build its language-neutral query model. In particular, `BOOLEAN` and `BOOL` generate Boolean parameters and result fields even though SQLite stores those values as integers.
+
+SQLite `STRICT` tables reject `BOOLEAN` and `BOOL`. To preserve explicit Boolean semantics with an allowed integer storage type, name the column's canonical 0/1 check constraint `boolean`:
+
+```sql
+CREATE TABLE settings (
+  enabled INTEGER NOT NULL
+    CONSTRAINT boolean CHECK (enabled IN (0, 1))
+) STRICT;
+```
+
+Marmot generates `enabled` as `bool`. The same named constraint works on ordinary non-strict tables. The marker must be a column-level constraint on an `INT` or `INTEGER` column, and its check must use the exact shape `CHECK (column IN (0, 1))`. Marmot rejects malformed markers during analysis.
+
+An unnamed 0/1 check remains an integer because that shape can represent an index, numeric flag, or two-value domain type. Marmot does not infer Boolean semantics from values, column names, defaults, or unnamed constraints. See [ADR 0003](docs/adr/0003-declared-types-are-semantic-input.md).
+
 ## Usage
 
 Inspect discovered queries:

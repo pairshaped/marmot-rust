@@ -121,6 +121,60 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 }
 
 #[test]
+fn named_boolean_constraints_emit_bool_types_for_strict_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table settings (
+            id integer primary key,
+            enabled integer not null
+                constraint boolean check (enabled in (0, 1)),
+            featured integer
+                constraint boolean check (featured in (0, 1)),
+            winner_side integer check (winner_side in (0, 1))
+        ) strict;
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("settings");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "show.sql",
+        "select enabled, featured, winner_side from settings where id = @id",
+    );
+    write_sql_file(
+        &module_dir,
+        "update.sql",
+        "update settings set enabled = @enabled, featured = @featured where id = @id",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("settings.rs")).unwrap();
+    assert!(output.contains("pub enabled: bool"));
+    assert!(output.contains("pub featured: Option<bool>"));
+    assert!(output.contains("pub winner_side: Option<i64>"));
+    assert!(output.contains("enabled: bool"));
+    assert!(output.contains("featured: Option<bool>"));
+}
+
+#[test]
 fn scalar_subquery_outputs_generate_nullable_rust_fields() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");

@@ -121,11 +121,11 @@ struct SchemaColumn {
 }
 
 fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
-    let table_names = {
+    let schema_objects = {
         let mut stmt = conn
             .prepare(
                 "
-                select name
+                select name, type, sql
                 from sqlite_schema
                 where type in ('table', 'view')
                   and name not like 'sqlite_%'
@@ -133,15 +133,21 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
                 ",
             )
             .map_err(|source| Error::InspectDatabase { source })?;
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .map_err(|source| Error::InspectDatabase { source })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|source| Error::InspectDatabase { source })?
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|source| Error::InspectDatabase { source })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| Error::InspectDatabase { source })?
     };
 
     let mut schema = Schema::default();
 
-    for table_name in table_names {
+    for (table_name, object_type, create_sql) in schema_objects {
         let mut stmt = conn
             .prepare(
                 r#"
@@ -163,10 +169,28 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
             .map_err(|source| Error::InspectDatabase { source })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|source| Error::InspectDatabase { source })?;
+        let declared_types = raw_column_rows
+            .iter()
+            .map(|(_, name, declared_type, _, _)| {
+                (name.to_ascii_lowercase(), declared_type.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let named_boolean_columns = if object_type == "table" {
+            named_boolean_columns(
+                &table_name,
+                create_sql.as_deref().unwrap_or_default(),
+                &declared_types,
+            )?
+        } else {
+            BTreeSet::new()
+        };
         let mut column_rows = Vec::new();
         for (ordinal, name, declared_type, notnull, primary_key) in raw_column_rows {
-            let column_type =
+            let mut column_type =
                 value_type_for_schema_column(&table_name, &name, &declared_type, temporal)?;
+            if named_boolean_columns.contains(&name.to_ascii_lowercase()) {
+                column_type = ValueType::Bool;
+            }
             column_rows.push((
                 name.to_ascii_lowercase(),
                 SchemaColumn {
@@ -202,6 +226,167 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
     }
 
     Ok(schema)
+}
+
+fn named_boolean_columns(
+    table: &str,
+    create_sql: &str,
+    declared_types: &BTreeMap<String, String>,
+) -> Result<BTreeSet<String>> {
+    let tokens = tokenize(create_sql);
+    let Some(open_index) = tokens
+        .iter()
+        .position(|token| matches!(token, Token::OpenParen))
+    else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut segments = Vec::new();
+    let mut depth = 1usize;
+    let mut segment_start = open_index + 1;
+    for (index, token) in tokens.iter().enumerate().skip(open_index + 1) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => {
+                depth -= 1;
+                if depth == 0 {
+                    segments.push(&tokens[segment_start..index]);
+                    break;
+                }
+            }
+            Token::Comma if depth == 1 => {
+                segments.push(&tokens[segment_start..index]);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut boolean_columns = BTreeSet::new();
+    for segment in segments {
+        let Some(column) = segment.first().and_then(token_identifier) else {
+            continue;
+        };
+        let column_key = column.to_ascii_lowercase();
+        let is_table_constraint = matches!(
+            segment.first(),
+            Some(Token::Word(keyword))
+                if matches!(
+                    keyword.to_ascii_lowercase().as_str(),
+                    "constraint" | "primary" | "unique" | "check" | "foreign"
+                )
+        );
+
+        for index in 0..segment.len().saturating_sub(1) {
+            if !token_is_word(&segment[index], "constraint")
+                || !token_identifier(&segment[index + 1])
+                    .is_some_and(|name| name.eq_ignore_ascii_case("boolean"))
+            {
+                continue;
+            }
+
+            if is_table_constraint {
+                return Err(Error::InvalidBooleanConstraint {
+                    table: table.to_string(),
+                    column: "<table>".to_string(),
+                    reason: "the boolean marker must be attached to a column".to_string(),
+                });
+            }
+            let declared_type = declared_types
+                .get(&column_key)
+                .map(String::as_str)
+                .unwrap_or_default();
+            if !matches!(
+                normalized_declared_type(declared_type).as_str(),
+                "int" | "integer"
+            ) {
+                return Err(Error::InvalidBooleanConstraint {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    reason: format!(
+                        "the column must be declared as INT or INTEGER, got {declared_type:?}"
+                    ),
+                });
+            }
+            if !segment
+                .get(index + 2)
+                .is_some_and(|token| token_is_word(token, "check"))
+            {
+                return Err(Error::InvalidBooleanConstraint {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    reason: "the named constraint must be a CHECK constraint".to_string(),
+                });
+            }
+            let expression = check_expression(segment, index + 3).ok_or_else(|| {
+                Error::InvalidBooleanConstraint {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    reason: "the CHECK expression is missing or unbalanced".to_string(),
+                }
+            })?;
+            if !is_boolean_check_expression(expression, column) {
+                return Err(Error::InvalidBooleanConstraint {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    reason: format!(
+                        "expected CHECK ({column} IN (0, 1)) for the named boolean constraint"
+                    ),
+                });
+            }
+            boolean_columns.insert(column_key.clone());
+        }
+    }
+
+    Ok(boolean_columns)
+}
+
+fn token_identifier(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(identifier) | Token::QuotedId(identifier) => Some(identifier),
+        _ => None,
+    }
+}
+
+fn check_expression(tokens: &[Token], open_index: usize) -> Option<&[Token]> {
+    if !tokens
+        .get(open_index)
+        .is_some_and(|token| matches!(token, Token::OpenParen))
+    {
+        return None;
+    }
+    let mut depth = 1usize;
+    for (index, token) in tokens.iter().enumerate().skip(open_index + 1) {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&tokens[open_index + 1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_boolean_check_expression(tokens: &[Token], column: &str) -> bool {
+    matches!(
+        tokens,
+        [
+            column_token,
+            Token::Word(in_keyword),
+            Token::OpenParen,
+            Token::Number(zero),
+            Token::Comma,
+            Token::Number(one),
+            Token::CloseParen,
+        ] if token_identifier(column_token).is_some_and(|name| name.eq_ignore_ascii_case(column))
+            && in_keyword.eq_ignore_ascii_case("in")
+            && zero == "0"
+            && one == "1"
+    )
 }
 
 fn value_type_for_schema_column(
@@ -3373,6 +3558,151 @@ mod tests {
                 ("price", ValueType::F64, true),
                 ("payload", ValueType::Bytes, true),
             ]
+        );
+    }
+
+    #[test]
+    fn named_boolean_constraints_supply_integer_column_semantics() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table items (
+                id integer primary key,
+                enabled integer not null
+                    constraint boolean check (enabled in (0, 1)),
+                featured integer
+                    constraint boolean check (featured in (0, 1)),
+                winner_side integer check (winner_side in (0, 1))
+            ) strict;
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("items");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "list_items.sql",
+            "
+            select enabled, featured, winner_side
+            from items
+            where enabled = @enabled and featured is @featured
+            ",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            project.queries[0]
+                .columns
+                .iter()
+                .map(|column| (column.column_type.clone(), column.nullable))
+                .collect::<Vec<_>>(),
+            [
+                (ValueType::Bool, false),
+                (ValueType::Bool, true),
+                (ValueType::I64, true),
+            ]
+        );
+        assert_eq!(
+            project.queries[0]
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.column_type.clone(), parameter.nullable))
+                .collect::<Vec<_>>(),
+            [(ValueType::Bool, false), (ValueType::Bool, false)]
+        );
+    }
+
+    #[test]
+    fn named_boolean_constraint_does_not_depend_on_strict_tables() {
+        for suffix in ["", " strict"] {
+            let sql = format!(
+                "
+                create table items (
+                    \"active flag\" int
+                        constraint boolean check (\"active flag\" in (0, 1))
+                ){suffix}
+                "
+            );
+            let columns = named_boolean_columns(
+                "items",
+                &sql,
+                &BTreeMap::from([("active flag".to_string(), "INT".to_string())]),
+            )
+            .unwrap();
+
+            assert_eq!(columns, BTreeSet::from(["active flag".to_string()]));
+        }
+    }
+
+    #[test]
+    fn rejects_named_boolean_constraint_without_canonical_check() {
+        let error = named_boolean_columns(
+            "items",
+            "
+            create table items (
+                active integer constraint boolean check (active in (0, 2))
+            )
+            ",
+            &BTreeMap::from([("active".to_string(), "INTEGER".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid boolean constraint on items.active: expected CHECK (active IN (0, 1)) for the named boolean constraint"
+        );
+    }
+
+    #[test]
+    fn rejects_named_boolean_constraint_on_non_integer_column() {
+        let error = named_boolean_columns(
+            "items",
+            "
+            create table items (
+                active text constraint boolean check (active in (0, 1))
+            )
+            ",
+            &BTreeMap::from([("active".to_string(), "TEXT".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid boolean constraint on items.active: the column must be declared as INT or INTEGER, got \"TEXT\""
+        );
+    }
+
+    #[test]
+    fn rejects_table_level_boolean_marker() {
+        let error = named_boolean_columns(
+            "items",
+            "
+            create table items (
+                active integer,
+                constraint boolean check (active in (0, 1))
+            )
+            ",
+            &BTreeMap::from([("active".to_string(), "INTEGER".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid boolean constraint on items.<table>: the boolean marker must be attached to a column"
         );
     }
 

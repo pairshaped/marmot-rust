@@ -74,6 +74,12 @@ pub enum Error {
         expected: &'static str,
     },
 
+    InvalidBooleanConstraint {
+        table: String,
+        column: String,
+        reason: String,
+    },
+
     PrepareSql {
         path: PathBuf,
         source: rusqlite::Error,
@@ -184,6 +190,14 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "temporal column {table}.{column} must be declared as {expected}, got {declared_type:?}"
+            ),
+            Self::InvalidBooleanConstraint {
+                table,
+                column,
+                reason,
+            } => write!(
+                f,
+                "invalid boolean constraint on {table}.{column}: {reason}"
             ),
             Self::PrepareSql { path, source } => {
                 write!(f, "could not prepare SQL in {}: {source}", path.display())?;
