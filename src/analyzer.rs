@@ -209,7 +209,7 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
             ));
         }
 
-        let without_rowid = table_without_rowid(conn, &table_name)?;
+        let (without_rowid, strict) = table_options(conn, &table_name)?;
         let primary_key_count = column_rows
             .iter()
             .filter(|(_, column)| column.primary_key)
@@ -219,8 +219,9 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
                 && primary_key_count == 1
                 && column.primary_key
                 && column.declared_type.eq_ignore_ascii_case("INTEGER");
-            column.nullable =
-                !(column.notnull || column.rowid_alias || without_rowid && column.primary_key);
+            column.nullable = !(column.notnull
+                || column.rowid_alias
+                || (without_rowid || strict) && column.primary_key);
         }
         let columns = column_rows.into_iter().collect::<BTreeMap<_, _>>();
 
@@ -753,13 +754,12 @@ fn insert_values_shape(tokens: &[Token], schema: &Schema) -> Option<(String, Vec
     Some((table, columns, values_index))
 }
 
-fn table_without_rowid(conn: &Connection, table_name: &str) -> Result<bool> {
+fn table_options(conn: &Connection, table_name: &str) -> Result<(bool, bool)> {
     conn.query_row(
-        "select wr from pragma_table_list where name = ?1",
+        "select wr, strict from pragma_table_list where name = ?1",
         [table_name],
-        |row| row.get::<_, i64>(0),
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
     )
-    .map(|without_rowid| without_rowid != 0)
     .map_err(|source| Error::InspectDatabase { source })
 }
 
@@ -5800,6 +5800,45 @@ mod tests {
                 ("param_2", ValueType::I64, false),
             ]
         );
+    }
+
+    #[test]
+    fn strict_text_primary_keys_are_not_nullable() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table uploads (
+                uuid text primary key,
+                name text not null
+            ) strict;
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let module_dir = source_root.join("uploads");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_sql_file(
+            &module_dir,
+            "queries.sql",
+            "select uuid from uploads;\n\n-- func: insert_upload\ninsert into uploads (uuid, name) values (?, ?)",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        })
+        .unwrap();
+
+        assert!(!project.queries[0].columns[0].nullable);
+        assert!(!project.queries[1].parameters[0].nullable);
     }
 
     #[test]
