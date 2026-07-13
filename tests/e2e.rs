@@ -668,6 +668,310 @@ fn cte_temporal_alias_infers_datetime_parameter() {
 }
 
 #[test]
+fn guarded_nullable_column_emits_non_null_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_seasons.sql",
+        "select season from products where season is not null",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    assert!(output.contains("Result<Vec<i64>>"));
+    assert!(!output.contains("Result<Vec<Option<i64>>>"));
+}
+
+#[test]
+fn guarded_distinct_nullable_column_emits_non_null_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_seasons.sql",
+        "select distinct p.season \
+         from products p \
+         where p.season is not null",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    assert!(output.contains("Result<Vec<i64>>"));
+    assert!(!output.contains("Result<Vec<Option<i64>>>"));
+}
+
+#[test]
+fn guarded_nullable_column_cast_emits_non_null_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_cast_seasons.sql",
+        "select cast(season as integer) as season \
+         from products \
+         where season is not null",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    assert!(output.contains("Result<Vec<i64>>"));
+    assert!(!output.contains("Result<Vec<Option<i64>>>"));
+}
+
+#[test]
+fn compound_result_stays_nullable_when_any_arm_is_unguarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table current_products (
+            id integer primary key,
+            season integer
+        );
+        create table archived_products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_seasons.sql",
+        "select season from current_products where season is not null \
+         union all \
+         select season from archived_products",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    assert!(output.contains("Result<Vec<Option<i64>>>"));
+}
+
+#[test]
+fn compound_result_is_non_null_when_every_arm_is_guarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table current_products (
+            id integer primary key,
+            season integer
+        );
+        create table archived_products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_seasons.sql",
+        "select p.season from current_products p where p.season is not null \
+         union all \
+         select p.season from archived_products p where p.season is not null",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    assert!(output.contains("Result<Vec<i64>>"));
+    assert!(!output.contains("Result<Vec<Option<i64>>>"));
+}
+
+#[test]
+fn non_null_guards_do_not_leak_across_query_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table products (
+            id integer primary key,
+            season integer
+        );
+        create table archived_products (
+            id integer primary key,
+            season integer
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("products");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_unguarded.sql",
+        "select season from products",
+    );
+    write_sql_file(
+        &module_dir,
+        "list_unrelated_guard.sql",
+        "select p.season \
+         from products p \
+         join archived_products a on a.id = p.id \
+         where a.season is not null",
+    );
+    write_sql_file(
+        &module_dir,
+        "list_nested_guard.sql",
+        "select p.season \
+         from products p \
+         where exists (\
+             select 1 from archived_products a where a.season is not null\
+         )",
+    );
+    write_sql_file(
+        &module_dir,
+        "list_outer_join_guard.sql",
+        "select a.season \
+         from products p \
+         left join archived_products a \
+           on a.id = p.id and a.season is not null",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    for function in [
+        "list_unguarded",
+        "list_unrelated_guard",
+        "list_nested_guard",
+        "list_outer_join_guard",
+    ] {
+        assert!(output.contains(&format!(
+            "pub fn {function}(conn: &Connection) -> Result<Vec<Option<i64>>>"
+        )));
+    }
+}
+
+#[test]
 fn generated_rust_functions_round_trip_against_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
