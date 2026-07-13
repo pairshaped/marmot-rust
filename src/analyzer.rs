@@ -56,7 +56,13 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
             })?;
             let sqlite_sql = strip_nullability_overrides(&sql);
             validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
-            let parameters = parameters(&sqlite_sql, &schema);
+            validate_temporal_parameter_inferences(
+                &sqlite_sql,
+                &schema,
+                &config.temporal,
+                &file.path,
+            )?;
+            let parameters = parameters_with_temporal(&sqlite_sql, &schema, &config.temporal);
             let (columns, connection_access) =
                 result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
             let return_type = if columns.is_empty() {
@@ -763,8 +769,17 @@ fn table_options(conn: &Connection, table_name: &str) -> Result<(bool, bool)> {
     .map_err(|source| Error::InspectDatabase { source })
 }
 
+#[cfg(test)]
 fn parameters(sql: &str, schema: &Schema) -> Vec<Parameter> {
-    let inferences = parameter_inferences(sql, schema);
+    parameters_with_temporal(sql, schema, &TemporalConfig::default())
+}
+
+fn parameters_with_temporal(
+    sql: &str,
+    schema: &Schema,
+    temporal: &TemporalConfig,
+) -> Vec<Parameter> {
+    let inferences = parameter_inferences(sql, schema, temporal);
     let mut params: Vec<Parameter> = Vec::new();
     let mut slots = ParameterSlots::default();
     let mut slot_params: BTreeMap<usize, String> = BTreeMap::new();
@@ -1049,14 +1064,24 @@ impl ParameterSlots {
     }
 }
 
-fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, ParameterInference> {
+fn parameter_inferences(
+    sql: &str,
+    schema: &Schema,
+    temporal: &TemporalConfig,
+) -> BTreeMap<String, ParameterInference> {
     let tokens = tokenize(sql);
     let schema = schema_with_ctes(&tokens, schema);
     let mut inferences = insert_parameter_inferences(&tokens, &schema);
     let table_refs = table_references(&tokens);
+    for (key, inference) in temporal_suffix_parameter_inferences(&tokens, temporal) {
+        inferences.entry(key).or_insert(inference);
+    }
+    for (key, inference) in sqlite_unixepoch_parameter_inferences(&tokens) {
+        inferences.insert(key, inference);
+    }
 
     for (key, inference) in cast_parameter_inferences(&tokens) {
-        inferences.insert(key, inference);
+        merge_cast_parameter_inference(&mut inferences, key, inference);
     }
     for (key, inference) in comparison_parameter_inferences(&tokens, &schema, &table_refs) {
         inferences.insert(key, inference);
@@ -1087,6 +1112,137 @@ fn parameter_inferences(sql: &str, schema: &Schema) -> BTreeMap<String, Paramete
                 column_type: ValueType::String,
                 nullable: true,
             });
+    }
+    inferences
+}
+
+fn validate_temporal_parameter_inferences(
+    sql: &str,
+    schema: &Schema,
+    temporal: &TemporalConfig,
+    path: &Path,
+) -> Result<()> {
+    if !temporal.strict_suffixes {
+        return Ok(());
+    }
+
+    let tokens = tokenize(sql);
+    let schema = schema_with_ctes(&tokens, schema);
+    let table_refs = table_references(&tokens);
+    let mut evidence = temporal_suffix_parameter_inferences(&tokens, temporal)
+        .into_iter()
+        .collect::<Vec<_>>();
+    evidence.extend(comparison_parameter_evidence(&tokens, &schema, &table_refs));
+
+    let mut temporal_types: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
+    for (key, inference) in evidence {
+        let inferred_type: &'static str = match inference.column_type {
+            ValueType::DbDate => "DbDate",
+            ValueType::DbDateTime => "DbDateTime",
+            _ => continue,
+        };
+        let logical_name = key.get(1..).unwrap_or(&key).to_ascii_lowercase();
+        if let Some((first_key, first_type)) = temporal_types.get(&logical_name) {
+            if *first_type != inferred_type {
+                return Err(Error::ConflictingTemporalParameterTypes {
+                    path: path.to_path_buf(),
+                    parameter: first_key.clone(),
+                    first: first_type,
+                    second: inferred_type,
+                });
+            }
+        } else {
+            temporal_types.insert(logical_name, (key, inferred_type));
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_cast_parameter_inference(
+    inferences: &mut BTreeMap<String, ParameterInference>,
+    key: String,
+    inference: ParameterInference,
+) {
+    let preserves_temporal_storage_type = inference.column_type == ValueType::String
+        && inferences.get(&key).is_some_and(|existing| {
+            matches!(
+                existing.column_type,
+                ValueType::DbDate | ValueType::DbDateTime
+            )
+        });
+    if !preserves_temporal_storage_type {
+        inferences.insert(key, inference);
+    }
+}
+
+fn temporal_suffix_parameter_inferences(
+    tokens: &[Token],
+    temporal: &TemporalConfig,
+) -> BTreeMap<String, ParameterInference> {
+    if !temporal.strict_suffixes {
+        return BTreeMap::new();
+    }
+
+    let mut inferences = BTreeMap::new();
+    for token in tokens {
+        let Token::ParamNamed { prefix, name } = token else {
+            continue;
+        };
+        let normalized_name = name.to_ascii_lowercase();
+        let column_type = if temporal
+            .datetime_suffixes
+            .iter()
+            .any(|suffix| normalized_name.ends_with(&suffix.to_ascii_lowercase()))
+        {
+            Some(ValueType::DbDateTime)
+        } else if temporal
+            .date_suffixes
+            .iter()
+            .any(|suffix| normalized_name.ends_with(&suffix.to_ascii_lowercase()))
+        {
+            Some(ValueType::DbDate)
+        } else {
+            None
+        };
+        if let Some(column_type) = column_type {
+            inferences.insert(
+                format!("{prefix}{name}"),
+                ParameterInference {
+                    column_type,
+                    nullable: false,
+                },
+            );
+        }
+    }
+    inferences
+}
+
+fn sqlite_unixepoch_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {
+    let parameter_keys = parameter_keys_by_index(tokens);
+    let mut inferences = BTreeMap::new();
+
+    for index in 0..tokens.len() {
+        if !token_is_word(&tokens[index], "DATETIME")
+            || !matches!(tokens.get(index + 1), Some(Token::OpenParen))
+            || !matches!(tokens.get(index + 3), Some(Token::Comma))
+            || !matches!(
+                tokens.get(index + 4),
+                Some(Token::StringLit(modifier)) if modifier.eq_ignore_ascii_case("unixepoch")
+            )
+        {
+            continue;
+        }
+        let Some(key) = parameter_keys.get(&(index + 2)) else {
+            continue;
+        };
+        inferences.insert(
+            key.clone(),
+            ParameterInference {
+                column_type: ValueType::I64,
+                nullable: false,
+            },
+        );
     }
 
     inferences
@@ -1380,8 +1536,24 @@ fn comparison_parameter_inferences(
     schema: &Schema,
     table_refs: &BTreeMap<String, String>,
 ) -> BTreeMap<String, ParameterInference> {
-    let mut inferences = BTreeMap::new();
+    comparison_parameter_evidence(tokens, schema, table_refs)
+        .into_iter()
+        .collect()
+}
+
+fn comparison_parameter_evidence(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> Vec<(String, ParameterInference)> {
+    let mut evidence = Vec::new();
     let mut slots = ParameterSlots::default();
+    let nullable_tables = BTreeSet::new();
+    let expression_context = ExpressionContext {
+        schema,
+        table_refs,
+        nullable_tables: &nullable_tables,
+    };
 
     for (index, token) in tokens.iter().enumerate() {
         let Some(key) = slots.key(token) else {
@@ -1393,24 +1565,41 @@ fn comparison_parameter_inferences(
         let column_after = comparison_operator_after(tokens, index)
             .and_then(|column_start| comparison_column_ref_starting_at(tokens, column_start));
         let arithmetic_column = arithmetic_column_for_parameter(tokens, index);
+        let expression_type_before = comparison_operator_before(tokens, index)
+            .and_then(|expression_end| comparison_expression_ending_at(tokens, expression_end))
+            .and_then(|expression| infer_expression_tokens(expression, &expression_context))
+            .and_then(|inference| inference.column_type);
 
-        let Some(column_ref) = column_before.or(column_after).or(arithmetic_column) else {
+        let column_type = column_before
+            .or(column_after)
+            .or(arithmetic_column)
+            .and_then(|column_ref| resolve_column_ref(schema, table_refs, &column_ref))
+            .map(|schema_column| schema_column.column_type.clone())
+            .or(expression_type_before);
+        let Some(column_type) = column_type else {
             continue;
         };
-        let Some(schema_column) = resolve_column_ref(schema, table_refs, &column_ref) else {
-            continue;
-        };
 
-        inferences.insert(
+        evidence.push((
             key,
             ParameterInference {
-                column_type: schema_column.column_type.clone(),
+                column_type,
                 nullable: false,
             },
-        );
+        ));
     }
 
-    inferences
+    evidence
+}
+
+fn comparison_expression_ending_at(tokens: &[Token], index: usize) -> Option<&[Token]> {
+    if !matches!(tokens.get(index), Some(Token::CloseParen)) {
+        return None;
+    }
+    let open_index = matching_open_paren(tokens, index)?;
+    let function_index = open_index.checked_sub(1)?;
+    identifier_from_token(tokens.get(function_index)?)?;
+    Some(&tokens[function_index..=index])
 }
 
 fn numeric_literal_parameter_inferences(tokens: &[Token]) -> BTreeMap<String, ParameterInference> {

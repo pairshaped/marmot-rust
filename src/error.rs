@@ -74,6 +74,13 @@ pub enum Error {
         expected: &'static str,
     },
 
+    ConflictingTemporalParameterTypes {
+        path: PathBuf,
+        parameter: String,
+        first: &'static str,
+        second: &'static str,
+    },
+
     InvalidBooleanConstraint {
         table: String,
         column: String,
@@ -190,6 +197,16 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "temporal column {table}.{column} must be declared as {expected}, got {declared_type:?}"
+            ),
+            Self::ConflictingTemporalParameterTypes {
+                path,
+                parameter,
+                first,
+                second,
+            } => write!(
+                f,
+                "parameter {parameter} has conflicting temporal types {first} and {second} in {}",
+                path.display()
             ),
             Self::InvalidBooleanConstraint {
                 table,
