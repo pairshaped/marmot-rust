@@ -533,6 +533,7 @@ fn infer_cte_columns(
         schema: &schema,
         table_refs: &table_refs,
         nullable_tables: &nullable_tables,
+        non_null_columns: None,
     };
     let mut columns = BTreeMap::new();
 
@@ -1553,6 +1554,7 @@ fn comparison_parameter_evidence(
         schema,
         table_refs,
         nullable_tables: &nullable_tables,
+        non_null_columns: None,
     };
 
     for (index, token) in tokens.iter().enumerate() {
@@ -2505,6 +2507,10 @@ fn result_columns(
 
 fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
     let tokens = tokenize(sql);
+    outer_join_nullable_tables_for_tokens(&tokens)
+}
+
+fn outer_join_nullable_tables_for_tokens(tokens: &[Token]) -> BTreeSet<String> {
     let mut aliases = BTreeMap::new();
     let mut nullable_tables = BTreeSet::new();
     let mut joined_tables = BTreeSet::new();
@@ -2512,13 +2518,13 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
 
     while index < tokens.len() {
         if token_is_word(&tokens[index], "FROM") {
-            register_joined_table(&tokens, index + 1, &mut aliases, &mut joined_tables);
+            register_joined_table(tokens, index + 1, &mut aliases, &mut joined_tables);
             index += 1;
             continue;
         }
 
         if token_is_word(&tokens[index], "JOIN") {
-            register_joined_table(&tokens, index + 1, &mut aliases, &mut joined_tables);
+            register_joined_table(tokens, index + 1, &mut aliases, &mut joined_tables);
             index += 1;
             continue;
         }
@@ -2541,7 +2547,7 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
             }
 
             if let Some(table_name) =
-                register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables)
+                register_joined_table(tokens, join_index + 1, &mut aliases, &mut joined_tables)
             {
                 nullable_tables.insert(table_name);
             }
@@ -2568,7 +2574,7 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
             }
 
             nullable_tables.extend(joined_tables.iter().cloned());
-            register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables);
+            register_joined_table(tokens, join_index + 1, &mut aliases, &mut joined_tables);
 
             index = join_index + 1;
             continue;
@@ -2593,7 +2599,7 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
 
             nullable_tables.extend(joined_tables.iter().cloned());
             if let Some(table_name) =
-                register_joined_table(&tokens, join_index + 1, &mut aliases, &mut joined_tables)
+                register_joined_table(tokens, join_index + 1, &mut aliases, &mut joined_tables)
             {
                 nullable_tables.insert(table_name);
             }
@@ -2605,7 +2611,7 @@ fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
         index += 1;
     }
 
-    for table in where_null_rejected_tables(&tokens, &aliases) {
+    for table in where_null_rejected_tables(tokens, &aliases) {
         nullable_tables.remove(&table);
     }
 
@@ -2704,7 +2710,14 @@ fn top_level_clause_end(tokens: &[Token], start: usize) -> usize {
                 if depth == 0
                     && matches!(
                         word.to_ascii_uppercase().as_str(),
-                        "GROUP" | "HAVING" | "ORDER" | "LIMIT" | "RETURNING"
+                        "GROUP"
+                            | "HAVING"
+                            | "ORDER"
+                            | "LIMIT"
+                            | "RETURNING"
+                            | "UNION"
+                            | "INTERSECT"
+                            | "EXCEPT"
                     ) =>
             {
                 return index;
@@ -2772,17 +2785,47 @@ fn select_expression_inferences(
     nullable_tables: &BTreeSet<String>,
 ) -> SelectExpressionInferences {
     let tokens = tokenize(sql);
+    let arms = top_level_compound_arms(&tokens);
+    if arms.len() == 1 {
+        return select_expression_inferences_for_arm(arms[0], schema, nullable_tables);
+    }
+
+    let mut arm_inferences = arms.into_iter().map(|arm| {
+        let nullable_tables = outer_join_nullable_tables_for_tokens(arm);
+        select_expression_inferences_for_arm(arm, schema, &nullable_tables)
+    });
+    let mut inferences = arm_inferences.next().unwrap_or_default();
+    for arm in arm_inferences {
+        merge_compound_expression_inferences(&mut inferences, &arm);
+    }
+    inferences.by_name.clear();
+    inferences
+}
+
+fn select_expression_inferences_for_arm(
+    tokens: &[Token],
+    schema: &Schema,
+    nullable_tables: &BTreeSet<String>,
+) -> SelectExpressionInferences {
     let Some(expression_list) =
-        top_level_select_list(&tokens).or_else(|| top_level_returning_list(&tokens))
+        top_level_select_list(tokens).or_else(|| top_level_returning_list(tokens))
     else {
         return SelectExpressionInferences::default();
     };
-    let schema = schema_with_derived_tables(&tokens, schema);
-    let table_refs = table_references_with_derived_tables(&tokens);
+    let expression_list = match expression_list.first() {
+        Some(token) if token_is_word(token, "DISTINCT") || token_is_word(token, "ALL") => {
+            &expression_list[1..]
+        }
+        _ => expression_list,
+    };
+    let schema = schema_with_derived_tables(tokens, schema);
+    let table_refs = table_references_with_derived_tables(tokens);
+    let non_null_columns = top_level_non_null_columns(tokens, &schema, &table_refs);
     let context = ExpressionContext {
         schema: &schema,
         table_refs: &table_refs,
         nullable_tables,
+        non_null_columns: Some(&non_null_columns),
     };
     let mut inferences = SelectExpressionInferences::default();
 
@@ -2816,6 +2859,66 @@ fn select_expression_inferences(
     }
 
     inferences
+}
+
+fn top_level_compound_arms(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut arms = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if depth == 0
+                    && matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "UNION" | "INTERSECT" | "EXCEPT"
+                    ) =>
+            {
+                arms.push(&tokens[start..index]);
+                index += 1;
+                if tokens
+                    .get(index)
+                    .is_some_and(|token| token_is_word(token, "ALL"))
+                {
+                    index += 1;
+                }
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    arms.push(&tokens[start..]);
+    arms
+}
+
+fn merge_compound_expression_inferences(
+    inferences: &mut SelectExpressionInferences,
+    arm: &SelectExpressionInferences,
+) {
+    for index in 0..inferences.by_index.len() {
+        let Some(existing) = inferences.by_index[index].as_mut() else {
+            continue;
+        };
+        let arm_nullable = arm
+            .by_index
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|inference| inference.nullable_override.or(inference.inferred_nullable))
+            .unwrap_or(true);
+        let existing_nullable = existing
+            .nullable_override
+            .or(existing.inferred_nullable)
+            .unwrap_or(true);
+        existing.inferred_nullable = Some(existing_nullable || arm_nullable);
+        existing.nullable_override = None;
+    }
 }
 
 fn top_level_select_list(tokens: &[Token]) -> Option<&[Token]> {
@@ -2869,6 +2972,81 @@ struct ExpressionContext<'a> {
     schema: &'a Schema,
     table_refs: &'a BTreeMap<String, String>,
     nullable_tables: &'a BTreeSet<String>,
+    non_null_columns: Option<&'a BTreeSet<(String, String)>>,
+}
+
+fn top_level_non_null_columns(
+    tokens: &[Token],
+    schema: &Schema,
+    table_refs: &BTreeMap<String, String>,
+) -> BTreeSet<(String, String)> {
+    let Some(where_start) = top_level_keyword(tokens, "WHERE") else {
+        return BTreeSet::new();
+    };
+    let where_end = top_level_clause_end(tokens, where_start + 1);
+    let where_tokens = &tokens[where_start + 1..where_end];
+    let mut depth = 0usize;
+    for token in where_tokens {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            token if depth == 0 && token_is_word(token, "OR") => return BTreeSet::new(),
+            _ => {}
+        }
+    }
+
+    let mut columns = BTreeSet::new();
+    let mut index = where_start + 1;
+    let mut depth = 0usize;
+    while index < where_end {
+        match &tokens[index] {
+            Token::OpenParen => {
+                depth += 1;
+                index += 1;
+                continue;
+            }
+            Token::CloseParen => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                continue;
+            }
+            _ if depth > 0 => {
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let Some(column_ref) = column_ref_starting_at(tokens, index) else {
+            index += 1;
+            continue;
+        };
+        let after_column = if column_ref.qualifier.is_some() {
+            index + 3
+        } else {
+            index + 1
+        };
+        let is_not_null = tokens
+            .get(after_column)
+            .is_some_and(|token| token_is_word(token, "IS"))
+            && tokens
+                .get(after_column + 1)
+                .is_some_and(|token| token_is_word(token, "NOT"))
+            && tokens
+                .get(after_column + 2)
+                .is_some_and(|token| token_is_word(token, "NULL"));
+        if is_not_null
+            && let Some((table, _)) = resolve_column_ref_with_table(schema, table_refs, &column_ref)
+        {
+            columns.insert((
+                table.to_ascii_lowercase(),
+                column_ref.column.to_ascii_lowercase(),
+            ));
+        }
+        index = after_column;
+    }
+
+    columns
 }
 
 fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
@@ -2987,10 +3165,18 @@ fn infer_expression_tokens(
         });
     }
     if let Some((table, schema_column)) = infer_column_ref_expression(tokens, context) {
+        let column = column_ref_from_expression(tokens)?;
+        let proven_non_null = context.non_null_columns.is_some_and(|columns| {
+            columns.contains(&(
+                table.to_ascii_lowercase(),
+                column.column.to_ascii_lowercase(),
+            ))
+        });
         return Some(ExpressionInference {
             column_type: Some(schema_column.column_type.clone()),
             inferred_nullable: Some(
-                schema_column.nullable || context.nullable_tables.contains(&table),
+                !proven_non_null
+                    && (schema_column.nullable || context.nullable_tables.contains(&table)),
             ),
             nullable_override: None,
         });
@@ -3057,6 +3243,7 @@ fn infer_scalar_subquery_expression(
         schema: &schema,
         table_refs: &table_refs,
         nullable_tables: &nullable_tables,
+        non_null_columns: None,
     };
     let mut inference = infer_expression_tokens(selected_expression, &inner_context).unwrap_or(
         ExpressionInference {
@@ -3309,10 +3496,18 @@ fn infer_column_ref_case_branch(
     context: &ExpressionContext<'_>,
 ) -> Option<CaseBranch> {
     let (table, schema_column) = infer_column_ref_expression(tokens, context)?;
+    let column = column_ref_from_expression(tokens)?;
+    let proven_non_null = context.non_null_columns.is_some_and(|columns| {
+        columns.contains(&(
+            table.to_ascii_lowercase(),
+            column.column.to_ascii_lowercase(),
+        ))
+    });
 
     Some(CaseBranch {
         column_type: Some(schema_column.column_type.clone()),
-        nullable: schema_column.nullable || context.nullable_tables.contains(&table),
+        nullable: !proven_non_null
+            && (schema_column.nullable || context.nullable_tables.contains(&table)),
     })
 }
 
