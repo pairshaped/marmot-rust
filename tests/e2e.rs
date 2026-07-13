@@ -421,6 +421,253 @@ fn strict_temporal_suffixes_reject_non_text_storage() {
 }
 
 #[test]
+fn temporal_comparison_expression_infers_datetime_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table registrations (
+            id integer primary key,
+            registered_at text,
+            created_at text not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("registrations");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_recent.sql",
+        "select id from registrations \
+         where coalesce(registered_at, created_at) >= @season_start_at",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
+    assert!(output.contains("season_start_at: impl AsRef<temporal::DbDateTime>"));
+}
+
+#[test]
+fn temporal_suffix_infers_standalone_parameter_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    Connection::open(&database).unwrap();
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("events");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "echo_published_at.sql",
+        "select @published_at as value",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    assert!(output.contains("published_at: impl AsRef<temporal::DbDateTime>"));
+}
+
+#[test]
+fn temporal_suffix_survives_storage_cast() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    Connection::open(&database).unwrap();
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("events");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "echo_published_at.sql",
+        "select cast(@published_at as text) as value",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    assert!(output.contains("published_at: impl AsRef<temporal::DbDateTime>"));
+}
+
+#[test]
+fn sqlite_unixepoch_datetime_infers_integer_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    Connection::open(&database).unwrap();
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("events");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "from_unixepoch.sql",
+        "select datetime(@season_start, 'unixepoch') as value",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    assert!(output.contains("season_start: i64"));
+}
+
+#[test]
+fn conflicting_temporal_parameter_evidence_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table events (
+            id integer primary key,
+            starts_at text not null,
+            registration_closes_on text not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("events");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_between.sql",
+        "select id from events \
+         where starts_at >= @boundary \
+           and registration_closes_on <= @boundary",
+    );
+
+    let result = analyze_project(&Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    });
+
+    let error = result.expect_err("conflicting temporal evidence should fail analysis");
+    assert!(
+        error
+            .to_string()
+            .contains("parameter @boundary has conflicting temporal types DbDateTime and DbDate")
+    );
+}
+
+#[test]
+fn cte_temporal_alias_infers_datetime_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+        create table registrations (
+            id integer primary key,
+            registered_at text,
+            created_at text not null
+        );
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    let module_dir = source_root.join("registrations");
+    fs::create_dir_all(&module_dir).unwrap();
+    write_sql_file(
+        &module_dir,
+        "list_recent.sql",
+        "with effective_registrations as (\
+             select coalesce(registered_at, created_at) as effective_at \
+             from registrations\
+         ) \
+         select effective_at \
+         from effective_registrations \
+         where effective_at >= @season_start_at",
+    );
+
+    let config = Config {
+        database,
+        source_root,
+        output: dir.path().join("generated"),
+        target: Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            strict_suffixes: true,
+            ..Default::default()
+        },
+    };
+
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+
+    let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
+    assert!(output.contains("season_start_at: impl AsRef<temporal::DbDateTime>"));
+}
+
+#[test]
 fn generated_rust_functions_round_trip_against_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
