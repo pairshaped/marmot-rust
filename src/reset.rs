@@ -33,12 +33,34 @@ pub fn reset_from(
     migrations_dir: impl AsRef<Path>,
     seeds_dir: impl AsRef<Path>,
 ) -> Result<(Vec<String>, Vec<String>), ResetError> {
+    reset_from_with_tracking_table(
+        database_path,
+        migrations_dir,
+        [seeds_dir],
+        migrations::TRACKING_TABLE,
+    )
+}
+
+pub fn reset_from_with_tracking_table<I, P>(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    seed_directories: I,
+    tracking_table: &str,
+) -> Result<(Vec<String>, Vec<String>), ResetError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
     let database_path = database_path.as_ref();
     // Reset is a dev-only command: dropping first keeps stale SQLite sidecar files
     // out of the rebuild path, and callers should not point it at valuable data.
     drop_database(database_path)?;
-    let applied_migrations = migrations::migrate_from(database_path, migrations_dir)?;
-    let applied_seeds = seeds::seed_from(database_path, seeds_dir)?;
+    let applied_migrations = migrations::migrate_from_with_tracking_table(
+        database_path,
+        migrations_dir,
+        tracking_table,
+    )?;
+    let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
     Ok((applied_migrations, applied_seeds))
 }
 
@@ -48,11 +70,59 @@ pub fn reset_with_views_from(
     seeds_dir: impl AsRef<Path>,
     source_root: impl AsRef<Path>,
 ) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
+    reset_with_views_and_tracking_from(
+        database_path,
+        migrations_dir,
+        [seeds_dir],
+        source_root,
+        migrations::TRACKING_TABLE,
+    )
+}
+
+pub fn reset_with_views_and_tracking_from<I, P>(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    seed_directories: I,
+    source_root: impl AsRef<Path>,
+    tracking_table: &str,
+) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
     let database_path = database_path.as_ref();
     drop_database(database_path)?;
-    let applied_migrations = migrations::migrate_from(database_path, migrations_dir)?;
+    let applied_migrations = migrations::migrate_from_with_tracking_table(
+        database_path,
+        migrations_dir,
+        tracking_table,
+    )?;
     let audit = views::reconcile_database(database_path, source_root.as_ref())?;
-    let applied_seeds = seeds::seed_from(database_path, seeds_dir)?;
+    let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
+    Ok((applied_migrations, applied_seeds, audit))
+}
+
+pub fn reset_with_views_bootstrap_and_seeds_from(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    bootstrap_dir: Option<impl AsRef<Path>>,
+    seeds_dir: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+    tracking_table: &str,
+) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
+    let database_path = database_path.as_ref();
+    drop_database(database_path)?;
+    let applied_migrations = migrations::migrate_from_with_tracking_table(
+        database_path,
+        migrations_dir,
+        tracking_table,
+    )?;
+    let audit = views::reconcile_database(database_path, source_root.as_ref())?;
+    let mut applied_seeds = Vec::new();
+    if let Some(bootstrap_dir) = bootstrap_dir {
+        applied_seeds.extend(seeds::seed_from(database_path, bootstrap_dir)?);
+    }
+    applied_seeds.extend(seeds::seed_from(database_path, seeds_dir)?);
     Ok((applied_migrations, applied_seeds, audit))
 }
 

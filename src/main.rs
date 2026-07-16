@@ -7,7 +7,7 @@ use marmot::{
     config::{ConfigError, DatabaseReference},
     emit_project, migrations,
     model::{Project, ValueType},
-    reset, seeds, views,
+    reset, schema, seeds, views,
 };
 
 #[derive(Debug, Parser)]
@@ -28,8 +28,10 @@ enum Command {
     Inspect(Args),
     Generate(Args),
     Migrate(MigrateArgs),
+    Bootstrap(BootstrapArgs),
     Seed(SeedArgs),
     Reset(ResetArgs),
+    DumpSchema(DumpSchemaArgs),
     AuditViews(AuditViewsArgs),
 }
 
@@ -70,6 +72,12 @@ struct MigrateArgs {
 
     #[arg(long)]
     deny_view_warnings: bool,
+
+    #[arg(long)]
+    migration_table: Option<String>,
+
+    #[arg(long)]
+    schema_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -85,6 +93,18 @@ struct SeedArgs {
 }
 
 #[derive(Debug, Parser)]
+struct BootstrapArgs {
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    #[arg(long)]
+    database_name: Option<String>,
+
+    #[arg(long)]
+    bootstrap_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
 struct ResetArgs {
     #[arg(long)]
     database: Option<PathBuf>,
@@ -96,6 +116,9 @@ struct ResetArgs {
     migrations_dir: Option<PathBuf>,
 
     #[arg(long)]
+    bootstrap_dir: Option<PathBuf>,
+
+    #[arg(long)]
     seeds_dir: Option<PathBuf>,
 
     #[arg(long)]
@@ -103,6 +126,27 @@ struct ResetArgs {
 
     #[arg(long)]
     deny_view_warnings: bool,
+
+    #[arg(long)]
+    migration_table: Option<String>,
+
+    #[arg(long)]
+    schema_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct DumpSchemaArgs {
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    #[arg(long)]
+    database_name: Option<String>,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -184,9 +228,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let migrations_dir = args
                     .migrations_dir
                     .clone()
-                    .or(target.migrations_dir)
+                    .or(target.migrations_dir.clone())
                     .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR));
-                let applied = migrations::migrate_from(&target.database, migrations_dir)?;
+                let migration_table = resolved_migration_table(&args.migration_table, &target);
+                let applied = migrations::migrate_from_with_tracking_table(
+                    &target.database,
+                    migrations_dir,
+                    migration_table,
+                )?;
                 print_applied("Applied", &applied);
                 let audit = views::reconcile_database(&target.database, &source_root)?;
                 if args.deny_view_warnings {
@@ -194,6 +243,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     print_view_warnings(&audit, &source_root);
                 }
+                dump_schema_if_configured(
+                    &target.database,
+                    args.schema_output
+                        .as_ref()
+                        .or(target.schema_output.as_ref()),
+                )?;
             }
         }
         Command::Seed(args) => {
@@ -207,6 +262,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_applied("Ran", &applied);
             }
         }
+        Command::Bootstrap(args) => {
+            for target in database_targets(args.database, args.database_name, &file_config)? {
+                let bootstrap_dir = args
+                    .bootstrap_dir
+                    .clone()
+                    .or(target.bootstrap_dir)
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "missing bootstrap directory; pass --bootstrap-dir or configure bootstrap_dir",
+                        )
+                    })?;
+                let applied = seeds::seed_from(target.database, bootstrap_dir)?;
+                print_applied("Ran", &applied);
+            }
+        }
         Command::Reset(args) => {
             for target in database_targets(args.database, args.database_name, &file_config)? {
                 let source_root =
@@ -214,19 +284,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let migrations_dir = args
                     .migrations_dir
                     .clone()
-                    .or(target.migrations_dir)
+                    .or(target.migrations_dir.clone())
                     .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR));
+                let migration_table = resolved_migration_table(&args.migration_table, &target);
+                let bootstrap_dir = args.bootstrap_dir.clone().or(target.bootstrap_dir.clone());
                 let seeds_dir = args
                     .seeds_dir
                     .clone()
-                    .or(target.seeds_dir)
+                    .or(target.seeds_dir.clone())
                     .unwrap_or_else(|| PathBuf::from(seeds::SEED_DIR));
-                let (applied_migrations, applied_seeds, audit) = reset::reset_with_views_from(
-                    &target.database,
-                    migrations_dir,
-                    seeds_dir,
-                    &source_root,
-                )?;
+                let (applied_migrations, applied_seeds, audit) =
+                    reset::reset_with_views_bootstrap_and_seeds_from(
+                        &target.database,
+                        migrations_dir,
+                        bootstrap_dir,
+                        seeds_dir,
+                        &source_root,
+                        migration_table,
+                    )?;
                 print_applied("Applied", &applied_migrations);
                 print_applied("Ran", &applied_seeds);
                 if args.deny_view_warnings {
@@ -234,6 +309,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     print_view_warnings(&audit, &source_root);
                 }
+                dump_schema_if_configured(
+                    &target.database,
+                    args.schema_output
+                        .as_ref()
+                        .or(target.schema_output.as_ref()),
+                )?;
             }
         }
         Command::AuditViews(args) => {
@@ -248,6 +329,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::DumpSchema(args) => {
+            let targets = database_targets(args.database, args.database_name, &file_config)?;
+            if targets.len() != 1 {
+                return Err(std::io::Error::other(
+                    "dump-schema requires one database; pass --database-name",
+                )
+                .into());
+            }
+            let output = args
+                .output
+                .or_else(|| targets[0].schema_output.clone())
+                .unwrap_or_else(|| PathBuf::from("db/schema.sql"));
+            let result = schema::dump(&targets[0].database, &output, args.check)?;
+            if result == schema::DumpResult::Written {
+                println!("Wrote {}", output.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolved_migration_table<'a>(cli: &'a Option<String>, target: &'a DatabaseTarget) -> &'a str {
+    cli.as_deref()
+        .or(target.migration_table.as_deref())
+        .unwrap_or(migrations::TRACKING_TABLE)
+}
+
+fn dump_schema_if_configured(
+    database: &Path,
+    output: Option<&PathBuf>,
+) -> Result<(), schema::SchemaError> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    if schema::dump(database, output, false)? == schema::DumpResult::Written {
+        println!("Wrote {}", output.display());
     }
     Ok(())
 }
@@ -393,7 +510,10 @@ struct DatabaseTarget {
     output: Option<PathBuf>,
     init_sql: Option<PathBuf>,
     migrations_dir: Option<PathBuf>,
+    bootstrap_dir: Option<PathBuf>,
     seeds_dir: Option<PathBuf>,
+    migration_table: Option<String>,
+    schema_output: Option<PathBuf>,
 }
 
 fn database_targets(
@@ -437,7 +557,10 @@ fn database_targets(
             output: file_config.output.clone(),
             init_sql: file_config.init_sql.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
+            bootstrap_dir: file_config.bootstrap_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
+            migration_table: file_config.migration_table.clone(),
+            schema_output: file_config.schema_output.clone(),
         }]);
     }
 
@@ -456,7 +579,10 @@ fn simple_database_target(
             output: file_config.output.clone(),
             init_sql: file_config.init_sql.clone(),
             migrations_dir: file_config.migrations_dir.clone(),
+            bootstrap_dir: file_config.bootstrap_dir.clone(),
             seeds_dir: file_config.seeds_dir.clone(),
+            migration_table: file_config.migration_table.clone(),
+            schema_output: file_config.schema_output.clone(),
         })
         .ok_or(ConfigError::MissingDatabase)
 }
@@ -511,6 +637,12 @@ fn named_database_target(
                 })
                 .unwrap_or_else(|| PathBuf::from("db/migrations").join(name)),
         ),
+        bootstrap_dir: reference.bootstrap_dir.clone().or_else(|| {
+            file_config
+                .bootstrap_dir
+                .clone()
+                .map(|base| join_namespace(base, name))
+        }),
         seeds_dir: Some(
             reference
                 .seeds_dir
@@ -523,6 +655,11 @@ fn named_database_target(
                 })
                 .unwrap_or_else(|| PathBuf::from("db/seeds").join(name)),
         ),
+        migration_table: reference
+            .migration_table
+            .clone()
+            .or_else(|| file_config.migration_table.clone()),
+        schema_output: reference.schema_output.clone(),
     }
 }
 

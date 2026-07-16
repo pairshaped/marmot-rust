@@ -5,12 +5,6 @@ use rusqlite::Connection;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlFilesError {
-    #[error("could not open SQLite database {path}: {source}")]
-    DatabaseOpenError {
-        path: PathBuf,
-        source: rusqlite::Error,
-    },
-
     #[error("missing SQL directory: {path}")]
     MissingDirectory { path: PathBuf },
 
@@ -48,25 +42,19 @@ struct SqlFile {
     version: String,
 }
 
-pub fn run(
-    database_path: &Path,
-    directory: &Path,
-    tracking_table: Option<&str>,
-) -> Result<Vec<String>, SqlFilesError> {
-    let conn =
-        Connection::open(database_path).map_err(|source| SqlFilesError::DatabaseOpenError {
-            path: database_path.to_path_buf(),
-            source,
-        })?;
-    run_connection(&conn, directory, tracking_table)
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FilenameStyle {
+    Numbered,
+    Named,
 }
 
-fn run_connection(
+pub(crate) fn run_connection(
     conn: &Connection,
     directory: &Path,
     tracking_table: Option<&str>,
+    filename_style: FilenameStyle,
 ) -> Result<Vec<String>, SqlFilesError> {
-    let files = read_sql_files(directory)?;
+    let files = read_sql_files(directory, filename_style)?;
 
     if let Some(table_name) = tracking_table {
         ensure_tracking_table(conn, table_name)?;
@@ -81,7 +69,10 @@ fn run_connection(
     }
 }
 
-fn read_sql_files(directory: &Path) -> Result<Vec<SqlFile>, SqlFilesError> {
+fn read_sql_files(
+    directory: &Path,
+    filename_style: FilenameStyle,
+) -> Result<Vec<SqlFile>, SqlFilesError> {
     validate_directory(directory)?;
 
     let mut entries = fs::read_dir(directory)
@@ -108,7 +99,7 @@ fn read_sql_files(directory: &Path) -> Result<Vec<SqlFile>, SqlFilesError> {
     entries.sort();
     entries
         .into_iter()
-        .map(sql_file_from_path)
+        .map(|path| sql_file_from_path(path, filename_style))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -130,12 +121,15 @@ fn validate_directory(directory: &Path) -> Result<(), SqlFilesError> {
     }
 }
 
-fn sql_file_from_path(path: PathBuf) -> Result<SqlFile, SqlFilesError> {
+fn sql_file_from_path(
+    path: PathBuf,
+    filename_style: FilenameStyle,
+) -> Result<SqlFile, SqlFilesError> {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if !valid_filename(filename) {
+    if !valid_filename(filename, filename_style) {
         return Err(SqlFilesError::InvalidFilename { path });
     }
 
@@ -143,18 +137,26 @@ fn sql_file_from_path(path: PathBuf) -> Result<SqlFile, SqlFilesError> {
     Ok(SqlFile { path, version })
 }
 
-fn valid_filename(filename: &str) -> bool {
+fn valid_filename(filename: &str, filename_style: FilenameStyle) -> bool {
     let Some(stem) = filename.strip_suffix(".sql") else {
         return false;
     };
     let bytes = stem.as_bytes();
-    if bytes.len() <= 4 || bytes.get(3) != Some(&b'_') {
-        return false;
+    match filename_style {
+        FilenameStyle::Numbered => {
+            if bytes.len() <= 4 || bytes.get(3) != Some(&b'_') {
+                return false;
+            }
+            bytes[..3].iter().all(u8::is_ascii_digit) && valid_name_bytes(&bytes[4..])
+        }
+        FilenameStyle::Named => !bytes.is_empty() && valid_name_bytes(bytes),
     }
-    bytes[..3].iter().all(u8::is_ascii_digit)
-        && bytes[4..]
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn valid_name_bytes(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 fn ensure_tracking_table(conn: &Connection, table_name: &str) -> Result<(), SqlFilesError> {
@@ -163,7 +165,7 @@ fn ensure_tracking_table(conn: &Connection, table_name: &str) -> Result<(), SqlF
             "create table if not exists {table_name} (
                 version text primary key,
                 applied_at text not null
-            )"
+            ) strict"
         ),
         [],
     )

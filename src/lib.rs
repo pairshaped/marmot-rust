@@ -6,6 +6,7 @@ pub mod error;
 pub mod migrations;
 pub mod model;
 pub mod reset;
+pub mod schema;
 pub mod seeds;
 mod sql_files;
 pub mod sql_text;

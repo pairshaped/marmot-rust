@@ -3754,24 +3754,24 @@ mod tests {
         fs::create_dir_all(&view_root).unwrap();
         fs::write(
             view_root.join("view_user_scores.sql"),
-            "-- view: view_user_scores(id, name, score_plus_one, score_cast)\n\
-             SELECT id, name, score + 1, CAST(score + 1 AS INTEGER) FROM users",
+            "CREATE VIEW view_user_scores (id, name, score_plus_one, score_cast) AS\n\
+             SELECT id, name, score + 1, CAST(score + 1 AS INTEGER) FROM users;",
         )
         .unwrap();
         fs::write(
             view_root.join("view_score_summary.sql"),
-            "-- view: view_score_summary(name, total_raw, total_cast)\n\
+            "CREATE VIEW view_score_summary (name, total_raw, total_cast) AS\n\
              SELECT users.name, SUM(score_entries.amount),
                     CAST(SUM(score_entries.amount) AS INTEGER)\n\
              FROM users\n\
              LEFT JOIN score_entries ON score_entries.user_id = users.id\n\
-             GROUP BY users.id",
+             GROUP BY users.id;",
         )
         .unwrap();
         fs::write(
             view_root.join("view_nested_score_summary.sql"),
-            "-- view: view_nested_score_summary(name, total_cast)\n\
-             SELECT name, total_cast FROM view_score_summary",
+            "CREATE VIEW view_nested_score_summary (name, total_cast) AS\n\
+             SELECT name, total_cast FROM view_score_summary;",
         )
         .unwrap();
         let module_path = source_root.join("scores");

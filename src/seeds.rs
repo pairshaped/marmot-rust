@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::sql_files::{self, SqlFilesError};
+use rusqlite::Connection;
+
+use crate::sql_files::{self, FilenameStyle, SqlFilesError};
 
 pub const SEED_DIR: &str = "db/seeds";
 
@@ -41,6 +43,9 @@ pub enum SeedError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+
+    #[error("seed data violates foreign keys:\n{violations}")]
+    ForeignKeyViolations { violations: String },
 }
 
 pub fn seed(database_path: impl AsRef<Path>) -> Result<Vec<String>, SeedError> {
@@ -51,14 +56,106 @@ pub fn seed_from(
     database_path: impl AsRef<Path>,
     seeds_dir: impl AsRef<Path>,
 ) -> Result<Vec<String>, SeedError> {
-    sql_files::run(database_path.as_ref(), seeds_dir.as_ref(), None).map_err(map_error)
+    let conn = Connection::open(database_path.as_ref()).map_err(|source| {
+        SeedError::DatabaseOpenError {
+            path: database_path.as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    seed_connection(&conn, seeds_dir)
+}
+
+pub fn seed_connection(
+    conn: &Connection,
+    seeds_dir: impl AsRef<Path>,
+) -> Result<Vec<String>, SeedError> {
+    seed_directories_connection(conn, [seeds_dir])
+}
+
+pub fn seed_directories_from<I, P>(
+    database_path: impl AsRef<Path>,
+    seed_directories: I,
+) -> Result<Vec<String>, SeedError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let conn = Connection::open(database_path.as_ref()).map_err(|source| {
+        SeedError::DatabaseOpenError {
+            path: database_path.as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    seed_directories_connection(&conn, seed_directories)
+}
+
+pub fn seed_directories_connection<I, P>(
+    conn: &Connection,
+    seed_directories: I,
+) -> Result<Vec<String>, SeedError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("foreign_keys"),
+            source,
+        })?;
+
+    let mut applied = Vec::new();
+    for directory in seed_directories {
+        applied.extend(
+            sql_files::run_connection(conn, directory.as_ref(), None, FilenameStyle::Named)
+                .map_err(map_error)?,
+        );
+    }
+
+    let violations = foreign_key_violations(conn)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("foreign_keys"),
+            source,
+        })?;
+    if violations.is_empty() {
+        Ok(applied)
+    } else {
+        Err(SeedError::ForeignKeyViolations {
+            violations: violations.join("\n"),
+        })
+    }
+}
+
+fn foreign_key_violations(conn: &Connection) -> Result<Vec<String>, SeedError> {
+    let mut statement =
+        conn.prepare("pragma foreign_key_check")
+            .map_err(|source| SeedError::SeedSqlError {
+                path: PathBuf::from("foreign_key_check"),
+                source,
+            })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(format!(
+                "{} rowid {} references {}({})",
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?
+            ))
+        })
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("foreign_key_check"),
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("foreign_key_check"),
+            source,
+        })
 }
 
 fn map_error(error: SqlFilesError) -> SeedError {
     match error {
-        SqlFilesError::DatabaseOpenError { path, source } => {
-            SeedError::DatabaseOpenError { path, source }
-        }
         SqlFilesError::MissingDirectory { path } => SeedError::MissingSeedDirectory { path },
         SqlFilesError::PathIsNotDirectory { path } => SeedError::SeedPathIsNotDirectory { path },
         SqlFilesError::NoSqlFiles { path } => SeedError::NoSeedFiles { path },
@@ -105,6 +202,58 @@ mod tests {
 
         let conn = Connection::open(&database).unwrap();
         assert_eq!(user_count(&conn), 1);
+    }
+
+    #[test]
+    fn accepts_descriptive_seed_names_without_migration_numbers() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            seeds_dir.join("demo.sql"),
+            "create table users (id integer primary key, name text not null);
+             insert into users (id, name) values (1, 'Lucy')",
+        )
+        .unwrap();
+        fs::write(
+            seeds_dir.join("zzz_refresh_counts.sql"),
+            "update users set name = name",
+        )
+        .unwrap();
+
+        assert_eq!(
+            seed_from(&database, &seeds_dir).unwrap(),
+            ["demo", "zzz_refresh_counts"]
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_key_violations_after_all_seed_directories_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "create table parents (id integer primary key);
+             create table children (
+               id integer primary key,
+               parent_id integer not null references parents(id)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        fs::write(
+            seeds_dir.join("demo.sql"),
+            "insert into children (id, parent_id) values (1, 99)",
+        )
+        .unwrap();
+
+        let error = seed_from(&database, &seeds_dir).unwrap_err().to_string();
+
+        assert!(error.contains("seed data violates foreign keys"));
+        assert!(error.contains("children rowid 1 references parents"));
     }
 
     #[test]

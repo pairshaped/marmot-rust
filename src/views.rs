@@ -13,7 +13,7 @@ pub const GENERATED_FILE: &str = "views.sql";
 pub struct ViewDefinition {
     pub name: String,
     pub columns: Vec<String>,
-    pub select_sql: String,
+    pub create_sql: String,
     pub source_path: PathBuf,
 }
 
@@ -61,13 +61,6 @@ pub enum ViewError {
 
     #[error("invalid view declaration in {path}: {reason}")]
     InvalidDeclaration { path: PathBuf, reason: String },
-
-    #[error("view declaration name `{name}` must match its filename stem `{filename}` in {path}")]
-    FilenameMismatch {
-        path: PathBuf,
-        name: String,
-        filename: String,
-    },
 
     #[error("duplicate view declaration `{name}` in {first} and {second}")]
     DuplicateDeclaration {
@@ -310,86 +303,55 @@ fn parse_file(path: &Path) -> Result<ViewDefinition, ViewError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut declaration = None;
-    let mut sql = String::new();
-    for line in contents.lines() {
-        if let Some(value) = view_declaration(line) {
-            if declaration.replace(value.to_string()).is_some() {
-                return invalid(
-                    path,
-                    "the file contains more than one `-- view:` declaration",
-                );
-            }
-        } else {
-            sql.push_str(line);
-            sql.push('\n');
-        }
-    }
-    let declaration = declaration.ok_or_else(|| ViewError::InvalidDeclaration {
-        path: path.to_path_buf(),
-        reason: "the file must contain one `-- view: view_name(column, ...)` declaration"
-            .to_string(),
-    })?;
-    let (name, columns) = parse_declaration(path, &declaration)?;
-    let filename = path
+    let name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string();
-    if name != filename {
-        return Err(ViewError::FilenameMismatch {
-            path: path.to_path_buf(),
-            name,
-            filename,
-        });
+    if !valid_view_name(&name) {
+        return invalid(
+            path,
+            "the filename must be lowercase snake_case beginning with `view_`",
+        );
     }
-    let select_sql = validate_sql(&sql).map_err(|reason| ViewError::InvalidDeclaration {
+    let create_sql = validate_sql(&contents).map_err(|reason| ViewError::InvalidDeclaration {
         path: path.to_path_buf(),
         reason: reason.to_string(),
     })?;
-    let first_token = strip_comments(&select_sql)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(first_token.as_str(), "select" | "with") {
-        return invalid(path, "a view definition must be a SELECT or WITH statement");
-    }
+    let columns = parse_create_view(path, &name, &create_sql)?;
 
     Ok(ViewDefinition {
         name,
         columns,
-        select_sql,
+        create_sql,
         source_path: path.to_path_buf(),
     })
 }
 
-fn view_declaration(line: &str) -> Option<&str> {
-    let body = line.trim().strip_prefix("--")?.trim();
-    body.strip_prefix("view:").map(str::trim)
-}
-
-fn parse_declaration(path: &Path, declaration: &str) -> Result<(String, Vec<String>), ViewError> {
-    let Some(open) = declaration.find('(') else {
+fn parse_create_view(path: &Path, name: &str, sql: &str) -> Result<Vec<String>, ViewError> {
+    let uncommented = strip_comments(sql);
+    let lowercase = uncommented.to_ascii_lowercase();
+    let prefix = format!("create view {name}");
+    if !lowercase.starts_with(&prefix) {
         return invalid(
             path,
-            "the declaration must include an explicit output column list",
+            format!(
+                "the file must contain `CREATE VIEW {name} (column, ...) AS ...` matching its filename"
+            ),
+        );
+    }
+    let after_name = &uncommented[prefix.len()..];
+    let after_name = after_name.trim_start();
+    let Some(after_open) = after_name.strip_prefix('(') else {
+        return invalid(
+            path,
+            "the CREATE VIEW statement must include an explicit output column list",
         );
     };
-    if !declaration.ends_with(')') {
-        return invalid(
-            path,
-            "the declaration must end after its output column list",
-        );
-    }
-    let name = declaration[..open].trim();
-    if !valid_view_name(name) {
-        return invalid(
-            path,
-            "the view name must be lowercase snake_case beginning with `view_`",
-        );
-    }
-    let raw_columns = &declaration[open + 1..declaration.len() - 1];
+    let Some(close) = after_open.find(')') else {
+        return invalid(path, "the CREATE VIEW output column list is not closed");
+    };
+    let raw_columns = &after_open[..close];
     let columns = raw_columns
         .split(',')
         .map(str::trim)
@@ -405,7 +367,20 @@ fn parse_declaration(path: &Path, declaration: &str) -> Result<(String, Vec<Stri
     if unique.len() != columns.len() {
         return invalid(path, "output column names must be unique");
     }
-    Ok((name.to_string(), columns))
+    let after_columns = after_open[close + 1..].trim_start();
+    let after_as = after_columns.get(..2).unwrap_or_default();
+    if !after_as.eq_ignore_ascii_case("as")
+        || !after_columns[2..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return invalid(
+            path,
+            "the CREATE VIEW output column list must be followed by AS",
+        );
+    }
+    Ok(columns)
 }
 
 fn valid_view_name(name: &str) -> bool {
@@ -428,17 +403,7 @@ fn invalid<T>(path: &Path, reason: impl Into<String>) -> Result<T, ViewError> {
 }
 
 fn create_statement(definition: &ViewDefinition) -> String {
-    let columns = definition
-        .columns
-        .iter()
-        .map(|column| quote_identifier(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE VIEW {} ({columns}) AS\n{};",
-        quote_identifier(&definition.name),
-        definition.select_sql
-    )
+    format!("{};", definition.create_sql)
 }
 
 fn validate_definitions(
@@ -534,9 +499,14 @@ mod tests {
     fn write_view(source_root: &Path, name: &str, declaration: &str, sql: &str) {
         let directory = source_root.join(VIEW_DIR);
         fs::create_dir_all(&directory).unwrap();
+        let (declared_name, columns) = declaration.split_once('(').unwrap();
+        let sql = sql.trim_end().trim_end_matches(';');
         fs::write(
             directory.join(format!("{name}.sql")),
-            format!("-- view: {declaration}\n{sql}\n"),
+            format!(
+                "CREATE VIEW {declared_name} ({}) AS\n{sql};\n",
+                columns.trim_end_matches(')')
+            ),
         )
         .unwrap();
     }
@@ -556,9 +526,10 @@ mod tests {
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "view_active_users");
         assert_eq!(definitions[0].columns, ["id", "display_name"]);
-        assert_eq!(
-            definitions[0].select_sql,
-            "SELECT id, name FROM users WHERE active = 1"
+        assert!(
+            definitions[0]
+                .create_sql
+                .contains("SELECT id, name FROM users WHERE active = 1")
         );
     }
 
@@ -840,7 +811,7 @@ mod tests {
         emit_generated_sql(&definitions, &output, true).unwrap();
         let generated = fs::read_to_string(output.join(GENERATED_FILE)).unwrap();
         assert!(generated.contains("DROP VIEW IF EXISTS \"view_users\";"));
-        assert!(generated.contains("CREATE VIEW \"view_users\" (\"id\") AS"));
+        assert!(generated.contains("CREATE VIEW view_users (id) AS"));
 
         assert!(matches!(
             emit_generated_sql(&[], &output, true),
@@ -869,7 +840,7 @@ mod tests {
         );
         assert!(matches!(
             discover(temp.path()),
-            Err(ViewError::FilenameMismatch { .. })
+            Err(ViewError::InvalidDeclaration { .. })
         ));
 
         fs::remove_dir_all(temp.path().join(VIEW_DIR)).unwrap();

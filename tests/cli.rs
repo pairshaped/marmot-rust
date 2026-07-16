@@ -28,9 +28,10 @@ fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
 fn write_view(source_root: &Path, name: &str, columns: &str, sql: &str) {
     let directory = source_root.join("db_views");
     fs::create_dir_all(&directory).unwrap();
+    let sql = sql.trim_end().trim_end_matches(';');
     fs::write(
         directory.join(format!("{name}.sql")),
-        format!("-- view: {name}({columns})\n{sql}\n"),
+        format!("CREATE VIEW {name} ({columns}) AS\n{sql};\n"),
     )
     .unwrap();
 }
@@ -56,9 +57,62 @@ fn help_does_not_require_database_configuration() {
     assert!(stdout.contains("Usage: marmot"));
     assert!(stdout.contains("generate"));
     assert!(stdout.contains("migrate"));
+    assert!(stdout.contains("bootstrap"));
     assert!(stdout.contains("seed"));
     assert!(stdout.contains("reset"));
+    assert!(stdout.contains("dump-schema"));
     assert!(stdout.contains("audit-views"));
+}
+
+#[test]
+fn dump_schema_writes_and_checks_a_deterministic_schema_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let schema = dir.path().join("db/schema.sql");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("create table users (id integer primary key, name text not null);")
+        .unwrap();
+    drop(connection);
+
+    let write = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("dump-schema")
+        .arg("--database")
+        .arg(&database)
+        .arg("--output")
+        .arg(&schema)
+        .output()
+        .unwrap();
+    assert!(write.status.success());
+    assert!(
+        fs::read_to_string(&schema)
+            .unwrap()
+            .contains("CREATE TABLE users")
+    );
+
+    let check = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("dump-schema")
+        .arg("--database")
+        .arg(&database)
+        .arg("--output")
+        .arg(&schema)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+
+    fs::write(&schema, "stale\n").unwrap();
+    let stale = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("dump-schema")
+        .arg("--database")
+        .arg(&database)
+        .arg("--output")
+        .arg(&schema)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("schema dump is stale"));
 }
 
 #[test]
@@ -281,6 +335,7 @@ fn migrate_command_uses_marmot_toml_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.db");
     let migrations_dir = dir.path().join("db/migrations/custom");
+    let schema_output = dir.path().join("db/schema.sql");
     fs::create_dir_all(&migrations_dir).unwrap();
     fs::write(
         migrations_dir.join("001_create_users.sql"),
@@ -295,9 +350,12 @@ fn migrate_command_uses_marmot_toml_defaults() {
 [tools.marmot]
 database = "{}"
 migrations_dir = "{}"
+migration_table = "schema_versions"
+schema_output = "{}"
 "#,
             database.display(),
             migrations_dir.display(),
+            schema_output.display(),
         ),
     )
     .unwrap();
@@ -317,8 +375,84 @@ migrations_dir = "{}"
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Applied 001_create_users\n"
+        format!(
+            "Applied 001_create_users\nWrote {}\n",
+            schema_output.display()
+        )
     );
+    let conn = Connection::open(&database).unwrap();
+    let version: String = conn
+        .query_row("select version from schema_versions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, "001_create_users");
+    assert!(
+        fs::read_to_string(schema_output)
+            .unwrap()
+            .contains("CREATE TABLE users")
+    );
+}
+
+#[test]
+fn reset_uses_configured_bootstrap_and_seed_directories_and_writes_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("db/migrations")).unwrap();
+    fs::create_dir_all(dir.path().join("db/bootstrap")).unwrap();
+    fs::create_dir_all(dir.path().join("db/seeds")).unwrap();
+    fs::write(
+        dir.path().join("db/migrations/001_create_users.sql"),
+        "create table users (id integer primary key, name text not null)",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("db/bootstrap/admin.sql"),
+        "insert into users (id, name) values (1, 'Admin')",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("db/seeds/demo.sql"),
+        "insert into users (id, name) values (2, 'Lucy')",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+database = "db/app.db"
+migrations_dir = "db/migrations"
+bootstrap_dir = "db/bootstrap"
+seeds_dir = "db/seeds"
+migration_table = "schema_versions"
+schema_output = "db/schema.sql"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("reset")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "reset failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Applied 001_create_users\nRan admin\nRan demo\nWrote db/schema.sql\n"
+    );
+    let conn = Connection::open(dir.path().join("db/app.db")).unwrap();
+    let names = conn
+        .prepare("select name from users order by id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(names, ["Admin", "Lucy"]);
+    assert!(dir.path().join("db/schema.sql").exists());
 }
 
 #[test]
@@ -1404,6 +1538,57 @@ fn seed_command_runs_seed_files() {
         .query_row("select count(*) from users", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn bootstrap_command_runs_only_the_configured_bootstrap_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.db");
+    let bootstrap_dir = dir.path().join("db/bootstrap");
+    let seeds_dir = dir.path().join("db/seeds");
+    fs::create_dir_all(&bootstrap_dir).unwrap();
+    fs::create_dir_all(&seeds_dir).unwrap();
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch("create table users (id integer primary key, name text not null);")
+        .unwrap();
+    fs::write(
+        bootstrap_dir.join("admin.sql"),
+        "insert into users (id, name) values (1, 'Admin')",
+    )
+    .unwrap();
+    fs::write(
+        seeds_dir.join("demo.sql"),
+        "insert into users (id, name) values (2, 'Lucy')",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+database = "app.db"
+bootstrap_dir = "db/bootstrap"
+seeds_dir = "db/seeds"
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .arg("bootstrap")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let conn = Connection::open(&database).unwrap();
+    let names = conn
+        .prepare("select name from users order by id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(names, ["Admin"]);
 }
 
 #[test]

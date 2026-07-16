@@ -27,16 +27,21 @@ src/db_views/
   view_membership_qualifying_line_items.sql
 ```
 
-Each file contains one explicit view declaration and one defining `SELECT` or `WITH` statement. Physical view names use lowercase `view_` prefixes. The filename stem must equal the physical view name. The declaration carries the explicit, stable output-column contract:
+Each file contains one native `CREATE VIEW` statement. Physical view names use
+lowercase `view_` prefixes. The filename stem must equal the physical view name.
+The statement carries the explicit, stable output-column contract:
 
 ```sql
--- view: view_active_purchase_line_items(line_item_id, participant_id)
+CREATE VIEW view_active_purchase_line_items (line_item_id, participant_id) AS
 SELECT id, participant_id
 FROM line_items
 WHERE status IN ('submitted', 'paid');
 ```
 
-Parameters are not supported.
+The configured directory and matching filename already classify the file as a
+reusable declarative view. Marmot annotations are reserved for cases where
+ordinary SQL and source conventions cannot express the required ownership or
+reuse semantics. Parameters are not supported.
 
 Marmot generates the aggregate installation SQL under its configured generated output:
 
