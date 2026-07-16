@@ -24,7 +24,10 @@ pub struct FileConfig {
     pub output: Option<PathBuf>,
     pub init_sql: Option<PathBuf>,
     pub migrations_dir: Option<PathBuf>,
+    pub bootstrap_dir: Option<PathBuf>,
     pub seeds_dir: Option<PathBuf>,
+    pub migration_table: Option<String>,
+    pub schema_output: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
     pub temporal: TemporalConfig,
 }
@@ -65,7 +68,10 @@ pub struct DatabaseReference {
     pub path: Option<PathBuf>,
     pub source_root: Option<PathBuf>,
     pub migrations_dir: Option<PathBuf>,
+    pub bootstrap_dir: Option<PathBuf>,
     pub seeds_dir: Option<PathBuf>,
+    pub migration_table: Option<String>,
+    pub schema_output: Option<PathBuf>,
     pub init_sql: Option<PathBuf>,
     pub output: Option<PathBuf>,
 }
@@ -135,7 +141,10 @@ impl FileConfig {
             output: toml_path(marmot, "output"),
             init_sql: toml_path(marmot, "init_sql"),
             migrations_dir: toml_path(marmot, "migrations_dir"),
+            bootstrap_dir: toml_path(marmot, "bootstrap_dir"),
             seeds_dir: toml_path(marmot, "seeds_dir"),
+            migration_table: toml_string(marmot, "migration_table"),
+            schema_output: toml_path(marmot, "schema_output"),
             databases: toml_database_references(marmot)?,
             temporal: toml_temporal_config(marmot)?,
         })
@@ -163,6 +172,14 @@ impl FileConfig {
 fn toml_path(table: Option<&toml::Value>, key: &str) -> Option<PathBuf> {
     let value = table?.get(key)?.as_str()?;
     (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+fn toml_string(table: Option<&toml::Value>, key: &str) -> Option<String> {
+    table?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn toml_temporal_config(marmot: Option<&toml::Value>) -> Result<TemporalConfig, ConfigError> {
@@ -258,7 +275,10 @@ fn database_reference_from_table(table: &toml::map::Map<String, toml::Value>) ->
         path: table_path(table, "path"),
         source_root: table_path(table, "source_root"),
         migrations_dir: table_path(table, "migrations_dir"),
+        bootstrap_dir: table_path(table, "bootstrap_dir"),
         seeds_dir: table_path(table, "seeds_dir"),
+        migration_table: table_string(table, "migration_table"),
+        schema_output: table_path(table, "schema_output"),
         init_sql: table_path(table, "init_sql"),
         output: table_path(table, "output"),
     }
@@ -267,6 +287,14 @@ fn database_reference_from_table(table: &toml::map::Map<String, toml::Value>) ->
 fn table_path(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<PathBuf> {
     let value = table.get(key)?.as_str()?;
     (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+fn table_string(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<String> {
+    table
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
@@ -291,7 +319,10 @@ mod tests {
             output = "src/generated"
             init_sql = "db/marmot_init.sql"
             migrations_dir = "db/migrations/app"
+            bootstrap_dir = "db/bootstrap"
             seeds_dir = "db/seeds/app"
+            migration_table = "schema_versions"
+            schema_output = "db/schema.sql"
             "#,
         )
         .unwrap();
@@ -304,7 +335,10 @@ mod tests {
             config.migrations_dir,
             Some(PathBuf::from("db/migrations/app"))
         );
+        assert_eq!(config.bootstrap_dir, Some(PathBuf::from("db/bootstrap")));
         assert_eq!(config.seeds_dir, Some(PathBuf::from("db/seeds/app")));
+        assert_eq!(config.migration_table.as_deref(), Some("schema_versions"));
+        assert_eq!(config.schema_output, Some(PathBuf::from("db/schema.sql")));
     }
 
     #[test]
@@ -354,6 +388,9 @@ mod tests {
             path = "db/app.db"
             source_root = "src/app"
             migrations_dir = "db/migrations/app"
+            bootstrap_dir = "db/bootstrap/app"
+            migration_table = "app_schema_versions"
+            schema_output = "db/app_schema.sql"
             init_sql = "db/app_init.sql"
 
             [tools.marmot.databases.analytics]
@@ -378,6 +415,18 @@ mod tests {
         assert_eq!(
             config.databases["app"].init_sql,
             Some(PathBuf::from("db/app_init.sql"))
+        );
+        assert_eq!(
+            config.databases["app"].schema_output,
+            Some(PathBuf::from("db/app_schema.sql"))
+        );
+        assert_eq!(
+            config.databases["app"].bootstrap_dir,
+            Some(PathBuf::from("db/bootstrap/app"))
+        );
+        assert_eq!(
+            config.databases["app"].migration_table.as_deref(),
+            Some("app_schema_versions")
         );
         assert_eq!(
             config.databases["analytics"].path,

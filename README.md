@@ -87,7 +87,10 @@ source_root = "path/to/src"
 output = "path/to/src/generated/sql"
 init_sql = "db/marmot_init.sql"
 migrations_dir = "db/migrations"
+bootstrap_dir = "db/bootstrap"
 seeds_dir = "db/seeds"
+migration_table = "schema_versions"
+schema_output = "db/schema.sql"
 ```
 
 Use another config path with `--config path/to/marmot.toml`. CLI flags override config values.
@@ -230,7 +233,7 @@ and its filename must match the physical view name:
 
 ```sql
 -- src/db_views/view_active_memberships.sql
--- view: view_active_memberships(participant_id, season_started_in)
+CREATE VIEW view_active_memberships (participant_id, season_started_in) AS
 SELECT participant_id, season_started_in
 FROM line_items
 WHERE status IN ('submitted', 'paid');
@@ -238,8 +241,9 @@ WHERE status IN ('submitted', 'paid');
 
 View names use lowercase `view_` prefixes. The declaration requires an explicit
 output column list because those names are the view's public contract. A file
-contains one `-- view:` declaration and one `SELECT` or `WITH` statement.
-Parameters are not supported.
+contains one native `CREATE VIEW` statement, and the SQL view name must match
+the filename. The directory and filename convention identifies declarative
+view code, so no Marmot annotation is required. Parameters are not supported.
 
 `inspect` and `generate` install the declarations before Marmot analyzes queries
 that consume them. `generate` also writes the disposable aggregate
@@ -250,7 +254,8 @@ fails if the database contains a managed `view_*` without a declaration.
 them after migrations and before seeds, so seed SQL can read declared views.
 Both commands accept `--source-root`; without it they use `marmot.toml` or
 `src`. Pass `--deny-view-warnings` in deployment checks to reject stale managed
-views.
+views. When `schema_output` is configured, both commands write the deterministic
+schema dump after the database lifecycle succeeds.
 
 Marmot replaces the complete declared view set transactionally. It drops every
 declared view, creates every current definition, then prepares a zero-row query
@@ -292,6 +297,19 @@ cargo run -- seed \
   --seeds-dir db/seeds
 ```
 
+Production-safe bootstrap data is separate from development and test fixtures:
+
+```sh
+cargo run -- bootstrap \
+  --database path/to/app.db \
+  --bootstrap-dir db/bootstrap
+```
+
+`bootstrap_dir` is optional. Reset runs it before `seeds_dir` when configured.
+Seed and bootstrap filenames use lowercase letters, digits, and underscores.
+Unlike migrations, they do not need a numeric prefix because Marmot reruns
+every file in lexical filename order.
+
 Reset a database, then run migrations and seeds:
 
 ```sh
@@ -300,6 +318,17 @@ cargo run -- reset \
   --migrations-dir db/migrations \
   --seeds-dir db/seeds
 ```
+
+Write the database schema in deterministic object order, or verify that a
+committed dump is current:
+
+```sh
+cargo run -- dump-schema --database path/to/app.db --output db/schema.sql
+cargo run -- dump-schema --database path/to/app.db --output db/schema.sql --check
+```
+
+The dump contains schema only. It has no timestamps or migration data, so a
+reset does not manufacture history-only diffs.
 
 ## Design Notes
 

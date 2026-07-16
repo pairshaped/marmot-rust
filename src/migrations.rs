@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use crate::sql_files::{self, SqlFilesError};
+use rusqlite::Connection;
+
+use crate::sql_files::{self, FilenameStyle, SqlFilesError};
 
 pub const MIGRATION_DIR: &str = "db/migrations";
 
-const TRACKING_TABLE: &str = "schema_migrations";
+pub const TRACKING_TABLE: &str = "schema_migrations";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
@@ -38,6 +40,9 @@ pub enum MigrationError {
     #[error("invalid migration filename: {path}")]
     InvalidMigrationFilename { path: PathBuf },
 
+    #[error("invalid migration tracking table name: {name}")]
+    InvalidTrackingTable { name: String },
+
     #[error("migration SQL failed in {path}: {source}")]
     MigrationSqlError {
         path: PathBuf,
@@ -53,19 +58,61 @@ pub fn migrate_from(
     database_path: impl AsRef<Path>,
     migrations_dir: impl AsRef<Path>,
 ) -> Result<Vec<String>, MigrationError> {
-    sql_files::run(
-        database_path.as_ref(),
+    migrate_from_with_tracking_table(database_path, migrations_dir, TRACKING_TABLE)
+}
+
+pub fn migrate_from_with_tracking_table(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+) -> Result<Vec<String>, MigrationError> {
+    let conn = Connection::open(database_path.as_ref()).map_err(|source| {
+        MigrationError::DatabaseOpenError {
+            path: database_path.as_ref().to_path_buf(),
+            source,
+        }
+    })?;
+    migrate_connection(&conn, migrations_dir, tracking_table)
+}
+
+pub fn migrate_connection(
+    conn: &Connection,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+) -> Result<Vec<String>, MigrationError> {
+    validate_tracking_table(tracking_table)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|source| MigrationError::MigrationSqlError {
+            path: migrations_dir.as_ref().to_path_buf(),
+            source,
+        })?;
+    sql_files::run_connection(
+        conn,
         migrations_dir.as_ref(),
-        Some(TRACKING_TABLE),
+        Some(tracking_table),
+        FilenameStyle::Numbered,
     )
     .map_err(map_error)
 }
 
+fn validate_tracking_table(name: &str) -> Result<(), MigrationError> {
+    let mut bytes = name.bytes();
+    let valid_first = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_');
+    if valid_first
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Ok(())
+    } else {
+        Err(MigrationError::InvalidTrackingTable {
+            name: name.to_string(),
+        })
+    }
+}
+
 fn map_error(error: SqlFilesError) -> MigrationError {
     match error {
-        SqlFilesError::DatabaseOpenError { path, source } => {
-            MigrationError::DatabaseOpenError { path, source }
-        }
         SqlFilesError::MissingDirectory { path } => {
             MigrationError::MissingMigrationDirectory { path }
         }
@@ -190,6 +237,37 @@ mod tests {
             migrate_from(&database, &migrations_dir),
             Err(MigrationError::InvalidMigrationFilename { path })
                 if path == migrations_dir.join("002-add-email.sql")
+        ));
+    }
+
+    #[test]
+    fn supports_a_project_specific_tracking_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations_dir = temp.path().join("db/migrations");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(
+            migrations_dir.join("001_create_users.sql"),
+            "create table users (id integer primary key)",
+        )
+        .unwrap();
+
+        migrate_from_with_tracking_table(&database, &migrations_dir, "schema_versions").unwrap();
+
+        let conn = Connection::open(&database).unwrap();
+        let version: String = conn
+            .query_row("select version from schema_versions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, "001_create_users");
+    }
+
+    #[test]
+    fn rejects_unsafe_tracking_table_names() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        assert!(matches!(
+            migrate_connection(&conn, "db/migrations", "versions; drop table users"),
+            Err(MigrationError::InvalidTrackingTable { .. })
         ));
     }
 

@@ -20,7 +20,10 @@ database = "app.sqlite3"
 source_root = "src"
 output = "src/generated/sql"
 migrations_dir = "db/migrations"
+bootstrap_dir = "db/bootstrap"
 seeds_dir = "db/seeds"
+migration_table = "schema_versions"
+schema_output = "db/schema.sql"
 ```
 
 CLI flags override config values. `DATABASE_URL` may provide the top-level database path when no `--database` flag is present and no named database reference is selected.
@@ -33,7 +36,10 @@ path = "db/app.sqlite"
 source_root = "src/app"
 output = "src/app/generated/sql"
 migrations_dir = "db/migrations/app"
+bootstrap_dir = "db/bootstrap/app"
 seeds_dir = "db/seeds/app"
+migration_table = "app_schema_versions"
+schema_output = "db/app_schema.sql"
 ```
 
 They can also be written as array entries:
@@ -60,7 +66,12 @@ seeds_dir      db/seeds/NAME
 
 If a named reference sets `source_root`, its default output is derived from that source root. For example, `source_root = "src/app"` gives `src/app/generated/sql` when the named reference omits `output`.
 
-If a global `migrations_dir` or `seeds_dir` is configured, named references without their own value append the database name to that global path. If the global path already ends with the database name, it is used as-is.
+If a global `migrations_dir`, `bootstrap_dir`, or `seeds_dir` is configured,
+named references without their own value append the database name to that path.
+If a path already ends with the database name, it is used as-is. A named
+reference inherits the global `migration_table`. Schema output is not inherited
+by named references because multiple databases must not write the same dump
+file.
 
 Global `output` applies only to unnamed generation. Named references use their own `output` value or the default derived from their source root.
 
