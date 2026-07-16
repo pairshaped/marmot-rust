@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{migrations, seeds};
+use crate::{migrations, seeds, views};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResetError {
@@ -19,6 +19,9 @@ pub enum ResetError {
 
     #[error(transparent)]
     SeedError(#[from] seeds::SeedError),
+
+    #[error(transparent)]
+    ViewError(#[from] views::ViewError),
 }
 
 pub fn reset(database_path: impl AsRef<Path>) -> Result<(Vec<String>, Vec<String>), ResetError> {
@@ -37,6 +40,20 @@ pub fn reset_from(
     let applied_migrations = migrations::migrate_from(database_path, migrations_dir)?;
     let applied_seeds = seeds::seed_from(database_path, seeds_dir)?;
     Ok((applied_migrations, applied_seeds))
+}
+
+pub fn reset_with_views_from(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    seeds_dir: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
+    let database_path = database_path.as_ref();
+    drop_database(database_path)?;
+    let applied_migrations = migrations::migrate_from(database_path, migrations_dir)?;
+    let audit = views::reconcile_database(database_path, source_root.as_ref())?;
+    let applied_seeds = seeds::seed_from(database_path, seeds_dir)?;
+    Ok((applied_migrations, applied_seeds, audit))
 }
 
 fn drop_database(database_path: &Path) -> Result<(), ResetError> {

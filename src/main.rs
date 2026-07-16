@@ -7,7 +7,7 @@ use marmot::{
     config::{ConfigError, DatabaseReference},
     emit_project, migrations,
     model::{Project, ValueType},
-    reset, seeds,
+    reset, seeds, views,
 };
 
 #[derive(Debug, Parser)]
@@ -30,6 +30,7 @@ enum Command {
     Migrate(MigrateArgs),
     Seed(SeedArgs),
     Reset(ResetArgs),
+    AuditViews(AuditViewsArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -63,6 +64,12 @@ struct MigrateArgs {
 
     #[arg(long)]
     migrations_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    source_root: Option<PathBuf>,
+
+    #[arg(long)]
+    deny_view_warnings: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -90,6 +97,27 @@ struct ResetArgs {
 
     #[arg(long)]
     seeds_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    source_root: Option<PathBuf>,
+
+    #[arg(long)]
+    deny_view_warnings: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AuditViewsArgs {
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    #[arg(long)]
+    database_name: Option<String>,
+
+    #[arg(long)]
+    source_root: Option<PathBuf>,
+
+    #[arg(long)]
+    deny_warnings: bool,
 }
 
 fn main() {
@@ -107,6 +135,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for target in configs(args, &file_config)? {
                 let project =
                     analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
+                let audit =
+                    views::audit_database(&target.config.database, &target.config.source_root)?;
+                print_view_warnings(&audit, &target.config.source_root);
                 for query in project.queries {
                     println!(
                         "{}::{} params={} columns={} source={}",
@@ -136,17 +167,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ensure_generated_outputs_do_not_collide(&analyzed)?;
             for (config, project) in analyzed {
                 emit_project(&config, &project)?;
+                let definitions = views::discover(&config.source_root)?;
+                views::emit_generated_sql(&definitions, &config.output, config.check)?;
+                let audit = views::audit_database(&config.database, &config.source_root)?;
+                if config.check {
+                    audit.deny_warnings(&config.source_root)?;
+                } else {
+                    print_view_warnings(&audit, &config.source_root);
+                }
             }
         }
         Command::Migrate(args) => {
             for target in database_targets(args.database, args.database_name, &file_config)? {
+                let source_root =
+                    resolved_source_root(&target, args.source_root.as_ref(), &file_config);
                 let migrations_dir = args
                     .migrations_dir
                     .clone()
                     .or(target.migrations_dir)
                     .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR));
-                let applied = migrations::migrate_from(target.database, migrations_dir)?;
+                let applied = migrations::migrate_from(&target.database, migrations_dir)?;
                 print_applied("Applied", &applied);
+                let audit = views::reconcile_database(&target.database, &source_root)?;
+                if args.deny_view_warnings {
+                    audit.deny_warnings(&source_root)?;
+                } else {
+                    print_view_warnings(&audit, &source_root);
+                }
             }
         }
         Command::Seed(args) => {
@@ -162,6 +209,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Reset(args) => {
             for target in database_targets(args.database, args.database_name, &file_config)? {
+                let source_root =
+                    resolved_source_root(&target, args.source_root.as_ref(), &file_config);
                 let migrations_dir = args
                     .migrations_dir
                     .clone()
@@ -172,10 +221,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .or(target.seeds_dir)
                     .unwrap_or_else(|| PathBuf::from(seeds::SEED_DIR));
-                let (applied_migrations, applied_seeds) =
-                    reset::reset_from(target.database, migrations_dir, seeds_dir)?;
+                let (applied_migrations, applied_seeds, audit) = reset::reset_with_views_from(
+                    &target.database,
+                    migrations_dir,
+                    seeds_dir,
+                    &source_root,
+                )?;
                 print_applied("Applied", &applied_migrations);
                 print_applied("Ran", &applied_seeds);
+                if args.deny_view_warnings {
+                    audit.deny_warnings(&source_root)?;
+                } else {
+                    print_view_warnings(&audit, &source_root);
+                }
+            }
+        }
+        Command::AuditViews(args) => {
+            for target in database_targets(args.database, args.database_name, &file_config)? {
+                let source_root =
+                    resolved_source_root(&target, args.source_root.as_ref(), &file_config);
+                let audit = views::audit_database(&target.database, &source_root)?;
+                if args.deny_warnings {
+                    audit.deny_warnings(&source_root)?;
+                } else {
+                    print_view_warnings(&audit, &source_root);
+                }
             }
         }
     }
@@ -185,6 +255,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn print_applied(action: &str, applied: &[String]) {
     for version in applied {
         println!("{action} {version}");
+    }
+}
+
+fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
+    for warning in audit.warnings(source_root) {
+        eprintln!("{warning}");
     }
 }
 
@@ -262,10 +338,6 @@ struct AnalysisTarget {
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, ConfigError> {
     let targets = database_targets(args.database, args.database_name, file_config)?;
     let cli_source_root = args.source_root;
-    let source_root = file_config
-        .source_root
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("src"));
     let output = args.output;
     let target = args.target;
     let check = args.check;
@@ -273,17 +345,8 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
     Ok(targets
         .into_iter()
         .map(|database_target| {
-            let config_source_root = if let Some(cli_source_root) = cli_source_root.clone() {
-                database_target
-                    .source_root_namespace
-                    .as_deref()
-                    .map(|name| join_namespace(cli_source_root.clone(), name))
-                    .unwrap_or(cli_source_root)
-            } else {
-                database_target
-                    .source_root
-                    .unwrap_or_else(|| source_root.clone())
-            };
+            let config_source_root =
+                resolved_source_root(&database_target, cli_source_root.as_ref(), file_config);
             AnalysisTarget {
                 config: Config {
                     database: database_target.database,
@@ -300,6 +363,26 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
             }
         })
         .collect())
+}
+
+fn resolved_source_root(
+    target: &DatabaseTarget,
+    cli_source_root: Option<&PathBuf>,
+    file_config: &FileConfig,
+) -> PathBuf {
+    if let Some(cli_source_root) = cli_source_root {
+        target
+            .source_root_namespace
+            .as_deref()
+            .map(|name| join_namespace(cli_source_root.clone(), name))
+            .unwrap_or_else(|| cli_source_root.clone())
+    } else {
+        target
+            .source_root
+            .clone()
+            .or_else(|| file_config.source_root.clone())
+            .unwrap_or_else(|| PathBuf::from("src"))
+    }
 }
 
 #[derive(Debug)]

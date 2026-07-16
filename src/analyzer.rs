@@ -14,13 +14,14 @@ use crate::model::{
 use crate::sql_text::validate_sql;
 use crate::sqlite::blocks::parse_sql_blocks;
 use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
+use crate::views;
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
     analyze_project_with_init_sql(config, None)
 }
 
 pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -> Result<Project> {
-    let conn = Connection::open(&config.database).map_err(|source| Error::OpenDatabase {
+    let mut conn = Connection::open(&config.database).map_err(|source| Error::OpenDatabase {
         path: config.database.clone(),
         source,
     })?;
@@ -35,6 +36,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
                 source,
             })?;
     }
+    views::reconcile_connection(&mut conn, &config.source_root)?;
     let schema = load_schema(&conn, &config.temporal)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
@@ -3726,6 +3728,88 @@ mod tests {
         .unwrap();
 
         project.queries[0].parameters.clone()
+    }
+
+    #[test]
+    fn analyzes_queries_through_declared_views_conservatively() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                score INTEGER NOT NULL
+             );
+             CREATE TABLE score_entries (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                amount INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let view_root = source_root.join("db_views");
+        fs::create_dir_all(&view_root).unwrap();
+        fs::write(
+            view_root.join("view_user_scores.sql"),
+            "-- view: view_user_scores(id, name, score_plus_one, score_cast)\n\
+             SELECT id, name, score + 1, CAST(score + 1 AS INTEGER) FROM users",
+        )
+        .unwrap();
+        fs::write(
+            view_root.join("view_score_summary.sql"),
+            "-- view: view_score_summary(name, total_raw, total_cast)\n\
+             SELECT users.name, SUM(score_entries.amount),
+                    CAST(SUM(score_entries.amount) AS INTEGER)\n\
+             FROM users\n\
+             LEFT JOIN score_entries ON score_entries.user_id = users.id\n\
+             GROUP BY users.id",
+        )
+        .unwrap();
+        fs::write(
+            view_root.join("view_nested_score_summary.sql"),
+            "-- view: view_nested_score_summary(name, total_cast)\n\
+             SELECT name, total_cast FROM view_score_summary",
+        )
+        .unwrap();
+        let module_path = source_root.join("scores");
+        write_sql_file(
+            &module_path,
+            "list.sql",
+            "SELECT id, name, score_plus_one, score_cast FROM view_user_scores",
+        );
+        write_sql_file(
+            &module_path,
+            "summaries.sql",
+            "SELECT summary.name, summary.total_raw, nested.total_cast\n\
+             FROM view_score_summary AS summary\n\
+             JOIN view_nested_score_summary AS nested ON nested.name = summary.name",
+        );
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        })
+        .unwrap();
+        let columns = &project.queries[0].columns;
+
+        assert_eq!(columns[0].column_type, ValueType::I64);
+        assert_eq!(columns[1].column_type, ValueType::String);
+        assert_eq!(columns[2].column_type, ValueType::Value);
+        assert_eq!(columns[3].column_type, ValueType::I64);
+        assert!(columns.iter().all(|column| column.nullable));
+
+        let summary_columns = &project.queries[1].columns;
+        assert_eq!(summary_columns[0].column_type, ValueType::String);
+        assert_eq!(summary_columns[1].column_type, ValueType::Value);
+        assert_eq!(summary_columns[2].column_type, ValueType::I64);
+        assert!(summary_columns.iter().all(|column| column.nullable));
     }
 
     #[test]
