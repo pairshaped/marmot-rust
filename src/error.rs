@@ -130,6 +130,10 @@ pub enum Error {
     GeneratedOutputCollision {
         paths: Vec<PathBuf>,
     },
+
+    View {
+        source: crate::views::ViewError,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -270,6 +274,7 @@ impl std::fmt::Display for Error {
             Self::GeneratedOutputCollision { paths } => {
                 write!(f, "generated output collision: {paths:?}")
             }
+            Self::View { source } => source.fmt(f),
         }
     }
 }
@@ -286,8 +291,15 @@ impl std::error::Error for Error {
             | Self::InspectDatabase { source }
             | Self::RunInitSql { source, .. }
             | Self::PrepareSql { source, .. } => Some(source),
+            Self::View { source } => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<crate::views::ViewError> for Error {
+    fn from(source: crate::views::ViewError) -> Self {
+        Self::View { source }
     }
 }
 

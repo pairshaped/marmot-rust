@@ -25,6 +25,16 @@ fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
     .unwrap();
 }
 
+fn write_view(source_root: &Path, name: &str, columns: &str, sql: &str) {
+    let directory = source_root.join("db_views");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join(format!("{name}.sql")),
+        format!("-- view: {name}({columns})\n{sql}\n"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn help_does_not_require_database_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -48,6 +58,161 @@ fn help_does_not_require_database_configuration() {
     assert!(stdout.contains("migrate"));
     assert!(stdout.contains("seed"));
     assert!(stdout.contains("reset"));
+    assert!(stdout.contains("audit-views"));
+}
+
+#[test]
+fn generate_reconciles_declared_views_before_analyzing_consumers() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL
+             );
+             INSERT INTO users (id, name, active) VALUES (1, 'Lucy', 1), (2, 'Mina', 0);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let source_root = dir.path().join("src");
+    let output = source_root.join("generated/sql");
+    write_view(
+        &source_root,
+        "view_active_users",
+        "id, name",
+        "SELECT id, name FROM users WHERE active = 1",
+    );
+    let query = source_root.join("active_users");
+    fs::create_dir_all(&source_root).unwrap();
+    write_sql_file(
+        &query,
+        "list.sql",
+        "SELECT id, name FROM view_active_users ORDER BY id",
+    );
+
+    let generated = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert!(
+        generated.status.success(),
+        "generate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(output.join("views.sql").exists());
+    assert!(output.join("active_users.rs").exists());
+    let connection = Connection::open(&database).unwrap();
+    let names = connection
+        .prepare("SELECT name FROM view_active_users ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(names, ["Lucy"]);
+}
+
+#[test]
+fn audit_views_warns_and_strict_mode_fails_with_removal_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let source_root = dir.path().join("src");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("CREATE VIEW view_stale_memberships (id) AS SELECT 1;")
+        .unwrap();
+    drop(connection);
+
+    let warning = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("audit-views")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .output()
+        .unwrap();
+    assert!(warning.status.success());
+    let stderr = String::from_utf8_lossy(&warning.stderr);
+    assert!(stderr.contains("warning: database view `view_stale_memberships`"));
+    assert!(stderr.contains("DROP VIEW IF EXISTS \"view_stale_memberships\";"));
+
+    let strict = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("audit-views")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--deny-warnings")
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("error: database view `view_stale_memberships`"));
+    assert!(stderr.contains("DROP VIEW IF EXISTS \"view_stale_memberships\";"));
+}
+
+#[test]
+fn reset_installs_declared_views_before_running_seeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let source_root = dir.path().join("src");
+    let migrations = dir.path().join("db/migrations");
+    let seeds = dir.path().join("db/seeds");
+    fs::create_dir_all(&migrations).unwrap();
+    fs::create_dir_all(&seeds).unwrap();
+    fs::write(
+        migrations.join("001_create_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+    )
+    .unwrap();
+    fs::write(
+        seeds.join("001_seed_users.sql"),
+        "INSERT INTO users (id, name) SELECT id, name FROM view_seed_users;",
+    )
+    .unwrap();
+    write_view(
+        &source_root,
+        "view_seed_users",
+        "id, name",
+        "SELECT 1, 'Lucy'",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("reset")
+        .arg("--database")
+        .arg(&database)
+        .arg("--migrations-dir")
+        .arg(&migrations)
+        .arg("--seeds-dir")
+        .arg(&seeds)
+        .arg("--source-root")
+        .arg(&source_root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "reset failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let connection = Connection::open(&database).unwrap();
+    let name: String = connection
+        .query_row("SELECT name FROM users", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(name, "Lucy");
 }
 
 #[test]

@@ -47,6 +47,7 @@ It currently:
 - requires immutable connections for reads and stronger mutation-capable connections for writes
 - lowers source-level SQL parameters to dense positional binds in generated Rust
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
+- owns declarative SQLite views under `src/db_views` and reconciles them after migrations
 - supports named database references for multi-database projects
 - can enforce configured temporal suffixes and generate checked Rust date/datetime boundary types for those columns
 
@@ -221,6 +222,59 @@ cargo run -- generate \
   --output path/to/src/generated/sql \
   --check
 ```
+
+### Declarative views
+
+Put reusable, permanent SQLite views in `src/db_views`. Each view has one file,
+and its filename must match the physical view name:
+
+```sql
+-- src/db_views/view_active_memberships.sql
+-- view: view_active_memberships(participant_id, season_started_in)
+SELECT participant_id, season_started_in
+FROM line_items
+WHERE status IN ('submitted', 'paid');
+```
+
+View names use lowercase `view_` prefixes. The declaration requires an explicit
+output column list because those names are the view's public contract. A file
+contains one `-- view:` declaration and one `SELECT` or `WITH` statement.
+Parameters are not supported.
+
+`inspect` and `generate` install the declarations before Marmot analyzes queries
+that consume them. `generate` also writes the disposable aggregate
+`src/generated/sql/views.sql`. `generate --check` verifies that aggregate and
+fails if the database contains a managed `view_*` without a declaration.
+
+`migrate` reconciles declared views after forward migrations. `reset` reconciles
+them after migrations and before seeds, so seed SQL can read declared views.
+Both commands accept `--source-root`; without it they use `marmot.toml` or
+`src`. Pass `--deny-view-warnings` in deployment checks to reject stale managed
+views.
+
+Marmot replaces the complete declared view set transactionally. It drops every
+declared view, creates every current definition, then prepares a zero-row query
+against each one. That final preparation catches missing dependencies, cycles,
+and incompatible output contracts. A failure rolls back to the previous view
+set.
+
+Removing a source file does not drop the installed view. Add an explicit
+forward migration with `DROP VIEW IF EXISTS`, then run the audit:
+
+```sh
+cargo run -- audit-views --database path/to/app.db --source-root path/to/src
+cargo run -- audit-views --database path/to/app.db --source-root path/to/src --deny-warnings
+```
+
+The audit prints copyable migration SQL for database-only `view_*` objects. It
+never executes that removal itself.
+
+SQLite exposes declared types for direct view columns and explicit casts, so
+Marmot can retain those generated types. SQLite does not preserve useful
+`NOT NULL` metadata through a view, and an uncast expression may have no declared
+type. Marmot handles those cases conservatively: view results are nullable, and
+untyped expressions generate `rusqlite::types::Value`. Use `CAST` in the view
+definition when an expression needs a stable generated type.
 
 Run migrations:
 
