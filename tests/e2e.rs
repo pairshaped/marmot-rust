@@ -105,15 +105,17 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 
     let users_output = fs::read_to_string(config.output.join("users.rs")).unwrap();
     assert!(users_output.contains("pub struct FindUserRow"));
-    assert!(users_output.contains("pub fn find_user(conn: &Connection, param: i64)"));
+    assert!(users_output.contains("pub struct FindUserParams"));
+    assert!(users_output.contains("pub fn find_user(conn: &Connection, params: FindUserParams)"));
     assert!(users_output.contains("pub struct ListUsersRow"));
     assert!(users_output.contains("pub fn list_users(conn: &Connection)"));
 
     let items_output = fs::read_to_string(config.output.join("items.rs")).unwrap();
     assert!(items_output.contains("pub struct ListItemsRow"));
-    assert!(items_output.contains("pub fn list_items(conn: &Connection, owner_id: i64)"));
+    assert!(items_output.contains("pub struct ListItemsParams"));
+    assert!(items_output.contains("pub fn list_items(conn: &Connection, params: ListItemsParams)"));
     assert!(items_output.contains("where owner_id = ?1"));
-    assert!(items_output.contains("params![owner_id]"));
+    assert!(items_output.contains("params![params.owner_id]"));
 
     let admin_items_output =
         fs::read_to_string(config.output.join("admin/items/index.rs")).unwrap();
@@ -281,9 +283,11 @@ fn optional_and_sentinel_filters_generate_expected_parameter_types() {
     emit_project(&config, &project).unwrap();
 
     let output = fs::read_to_string(config.output.join("tasks.rs")).unwrap();
-    assert!(output.contains(
-        "pub fn list_tasks(conn: &Connection, param: Option<i64>, param_2: Option<&str>, param_3: i64)"
-    ));
+    assert!(output.contains("pub struct ListTasksParams<'a>"));
+    assert!(output.contains("pub param: Option<i64>"));
+    assert!(output.contains("pub param_2: Option<&'a str>"));
+    assert!(output.contains("pub param_3: i64"));
+    assert!(output.contains("pub fn list_tasks(conn: &Connection, params: ListTasksParams<'_>)"));
 }
 
 #[test]
@@ -346,10 +350,10 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
     assert!(app_rs.contains("use super::temporal as temporal;"));
     assert!(app_rs.contains("pub starts_at: temporal::DbDateTime"));
     assert!(app_rs.contains("pub registration_closes_on: Option<temporal::DbDate>"));
-    assert!(app_rs.contains("starts_at: impl AsRef<temporal::DbDateTime>"));
-    assert!(app_rs.contains("registration_closes_on: Option<&temporal::DbDate>"));
+    assert!(app_rs.contains("pub starts_at: &'a temporal::DbDateTime"));
+    assert!(app_rs.contains("pub registration_closes_on: Option<&'a temporal::DbDate>"));
     assert!(app_rs.contains(
-        "params![title.as_ref(), starts_at.as_ref().as_str(), registration_closes_on.map(|value| value.as_str())]"
+        "params![params.title, params.starts_at.as_str(), params.registration_closes_on.map(|value| value.as_str())]"
     ));
 
     write_temporal_runtime_crate(dir.path());
@@ -463,7 +467,7 @@ fn temporal_comparison_expression_infers_datetime_parameter() {
     emit_project(&config, &project).unwrap();
 
     let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
-    assert!(output.contains("season_start_at: impl AsRef<temporal::DbDateTime>"));
+    assert!(output.contains("pub season_start_at: &'a temporal::DbDateTime"));
 }
 
 #[test]
@@ -497,7 +501,7 @@ fn temporal_suffix_infers_standalone_parameter_type() {
     emit_project(&config, &project).unwrap();
 
     let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
-    assert!(output.contains("published_at: impl AsRef<temporal::DbDateTime>"));
+    assert!(output.contains("pub published_at: &'a temporal::DbDateTime"));
 }
 
 #[test]
@@ -531,7 +535,7 @@ fn temporal_suffix_survives_storage_cast() {
     emit_project(&config, &project).unwrap();
 
     let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
-    assert!(output.contains("published_at: impl AsRef<temporal::DbDateTime>"));
+    assert!(output.contains("pub published_at: &'a temporal::DbDateTime"));
 }
 
 #[test]
@@ -664,7 +668,7 @@ fn cte_temporal_alias_infers_datetime_parameter() {
     emit_project(&config, &project).unwrap();
 
     let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
-    assert!(output.contains("season_start_at: impl AsRef<temporal::DbDateTime>"));
+    assert!(output.contains("pub season_start_at: &'a temporal::DbDateTime"));
 }
 
 #[test]
@@ -1152,7 +1156,7 @@ use rusqlite::Connection;
 
 fn main() {
     let conn = Connection::open_in_memory().unwrap();
-    let _ = app::delete_user(&conn, 1);
+    let _ = app::delete_user(&conn, app::DeleteUserParams { id: 1 });
 }
 "#,
     )
@@ -1253,8 +1257,15 @@ mod tests {
 
         let starts_at = DbDateTime::new("2026-06-11 09:30:00").unwrap();
         let closes_on = DbDate::new("2026-06-01").unwrap();
-        let created =
-            app::create_event(&mut conn, "league", &starts_at, Some(&closes_on)).unwrap();
+        let created = app::create_event(
+            &mut conn,
+            app::CreateEventParams {
+                title: "league",
+                starts_at: &starts_at,
+                registration_closes_on: Some(&closes_on),
+            },
+        )
+        .unwrap();
 
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].starts_at.as_str(), "2026-06-11 09:30:00");
@@ -1265,8 +1276,10 @@ mod tests {
 
         let rows = app::list_events_after(
             &conn,
-            DbDateTime::new("2026-06-01 00:00:00").unwrap(),
-            Some(&closes_on),
+            app::ListEventsAfterParams {
+                starts_at: &DbDateTime::new("2026-06-01 00:00:00").unwrap(),
+                registration_closes_on: Some(&closes_on),
+            },
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
@@ -1288,8 +1301,10 @@ mod tests {
 
         let error = app::list_events_after(
             &conn,
-            DbDateTime::new("2026-01-01 00:00:00").unwrap(),
-            None,
+            app::ListEventsAfterParams {
+                starts_at: &DbDateTime::new("2026-01-01 00:00:00").unwrap(),
+                registration_closes_on: None,
+            },
         )
         .unwrap_err();
         let message = error.to_string();
@@ -1375,11 +1390,13 @@ mod tests {
 
         let created = app::create_user(
             &mut conn,
-            "alice",
-            true,
-            [1_u8, 2, 3],
-            9.5,
-            Some("ally"),
+            app::CreateUserParams {
+                name: "alice",
+                active: true,
+                avatar: &[1_u8, 2, 3],
+                score: 9.5,
+                nickname: Some("ally"),
+            },
         )
         .unwrap();
         assert_eq!(created.len(), 1);
@@ -1392,16 +1409,27 @@ mod tests {
 
         assert_eq!(app::count_users_one(&conn).unwrap(), 1);
 
-        let active = app::list_active_users(&conn, true).unwrap();
+        let active =
+            app::list_active_users(&conn, app::ListActiveUsersParams { active: true }).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "alice");
 
-        let renamed = app::rename_user(&mut conn, None, 1).unwrap();
+        let renamed = app::rename_user(
+            &mut conn,
+            app::RenameUserParams {
+                nickname: None,
+                id: 1,
+            },
+        )
+        .unwrap();
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].id, 1);
         assert_eq!(renamed[0].nickname, None);
 
-        assert_eq!(app::delete_user(&mut conn, 1).unwrap(), 1);
+        assert_eq!(
+            app::delete_user(&mut conn, app::DeleteUserParams { id: 1 }).unwrap(),
+            1
+        );
         assert_eq!(app::count_users_one(&conn).unwrap(), 0);
     }
 
@@ -1411,7 +1439,17 @@ mod tests {
         create_schema(&conn);
 
         let tx = conn.transaction().unwrap();
-        app::create_user(&tx, "alice", true, [], 1.0, None).unwrap();
+        app::create_user(
+            &tx,
+            app::CreateUserParams {
+                name: "alice",
+                active: true,
+                avatar: &[],
+                score: 1.0,
+                nickname: None,
+            },
+        )
+        .unwrap();
         assert_eq!(app::count_users_one(&tx).unwrap(), 1);
         tx.commit().unwrap();
 
@@ -1425,11 +1463,13 @@ mod tests {
 
         let created = app::create_user_positional(
             &mut conn,
-            "bob",
-            true,
-            [4_u8, 5, 6],
-            1.25,
-            None,
+            app::CreateUserPositionalParams {
+                param: "bob",
+                param_2: true,
+                param_3: &[4_u8, 5, 6],
+                param_4: 1.25,
+                param_5: None,
+            },
         )
         .unwrap();
         assert_eq!(created.len(), 1);
@@ -1438,28 +1478,68 @@ mod tests {
         assert_eq!(created[0].avatar, vec![4, 5, 6]);
         assert_eq!(created[0].nickname, None);
 
-        assert_eq!(app::set_score_positional(&mut conn, 2.5, 1).unwrap(), 1);
-        let active = app::list_active_users(&conn, true).unwrap();
+        assert_eq!(
+            app::set_score_positional(
+                &mut conn,
+                app::SetScorePositionalParams {
+                    param: 2.5,
+                    param_2: 1,
+                },
+            )
+            .unwrap(),
+            1
+        );
+        let active =
+            app::list_active_users(&conn, app::ListActiveUsersParams { active: true }).unwrap();
         assert_eq!(active[0].score, 2.5);
 
         assert_eq!(
-            app::find_name_numbered_one(&conn, 1, true).unwrap(),
+            app::find_name_numbered_one(
+                &conn,
+                app::FindNameNumberedParams {
+                    param: 1,
+                    param_2: true,
+                },
+            )
+            .unwrap(),
             "bob"
         );
         assert_eq!(
-            app::find_name_numbered_leading_zero_one(&conn, 1, true).unwrap(),
+            app::find_name_numbered_leading_zero_one(
+                &conn,
+                app::FindNameNumberedLeadingZeroParams {
+                    param: 1,
+                    param_2: true,
+                },
+            )
+            .unwrap(),
             "bob"
         );
         assert_eq!(
-            app::find_active_sparse_numbered_one(&conn, true).unwrap(),
+            app::find_active_sparse_numbered_one(
+                &conn,
+                app::FindActiveSparseNumberedParams { param_2: true },
+            )
+            .unwrap(),
             "bob"
         );
         assert_eq!(
-            app::find_name_mixed_positional_one(&conn, 1, true).unwrap(),
+            app::find_name_mixed_positional_one(
+                &conn,
+                app::FindNameMixedPositionalParams {
+                    param: 1,
+                    param_2: true,
+                },
+            )
+            .unwrap(),
             "bob"
         );
         assert_eq!(
-            app::find_name_named_numbered_same_slot_one(&conn, 1).unwrap(),
+            app::find_name_named_numbered_same_slot_one(
+                &conn,
+                app::FindNameNamedNumberedSameSlotParams { id: 1 },
+            )
+            .unwrap(),
             "bob"
         );
     }
@@ -1469,15 +1549,20 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        assert_eq!(app::list_active_users(&conn, true).unwrap(), vec![]);
+        assert_eq!(
+            app::list_active_users(&conn, app::ListActiveUsersParams { active: true }).unwrap(),
+            vec![]
+        );
 
         let created = app::create_user_returning_star(
             &mut conn,
-            "carol",
-            false,
-            [7_u8, 8, 9],
-            4.75,
-            Some("c"),
+            app::CreateUserReturningStarParams {
+                name: "carol",
+                active: false,
+                avatar: &[7_u8, 8, 9],
+                score: 4.75,
+                nickname: Some("c"),
+            },
         )
         .unwrap();
         assert_eq!(created.len(), 1);
@@ -1488,7 +1573,11 @@ mod tests {
         assert_eq!(created[0].score, 4.75);
         assert_eq!(created[0].nickname.as_deref(), Some("c"));
 
-        let deleted = app::delete_user_returning(&mut conn, 1).unwrap();
+        let deleted = app::delete_user_returning(
+            &mut conn,
+            app::DeleteUserReturningParams { id: 1 },
+        )
+        .unwrap();
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].id, 1);
         assert_eq!(deleted[0].name, "carol");
@@ -1500,12 +1589,23 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         create_schema(&conn);
 
-        let created = app::create_keyword_table_row(&mut conn, 10, "keyword").unwrap();
+        let created = app::create_keyword_table_row(
+            &mut conn,
+            app::CreateKeywordTableRowParams {
+                id: 10,
+                name: "keyword",
+            },
+        )
+        .unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].id, 10);
         assert_eq!(created[0].name, "keyword");
         assert_eq!(
-            app::find_keyword_table_row_one(&conn, 10).unwrap(),
+            app::find_keyword_table_row_one(
+                &conn,
+                app::FindKeywordTableRowParams { id: 10 },
+            )
+            .unwrap(),
             "keyword"
         );
     }
@@ -1521,7 +1621,11 @@ mod tests {
         )
         .unwrap();
 
-        let rows = app::find_typed_thing(&conn, "primary").unwrap();
+        let rows = app::find_typed_thing(
+            &conn,
+            app::FindTypedThingParams { type_: "primary" },
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 1);
         assert_eq!(rows[0].type_, "primary");
@@ -1534,9 +1638,11 @@ mod tests {
 
         let created = app::create_event(
             &mut conn,
-            "launch",
-            "2026-06-11",
-            "2026-06-11 09:30:00",
+            app::CreateEventParams {
+                name: "launch",
+                event_date: "2026-06-11",
+                starts_at: "2026-06-11 09:30:00",
+            },
         )
         .unwrap();
         assert_eq!(created.len(), 1);
@@ -1544,7 +1650,13 @@ mod tests {
         assert_eq!(created[0].starts_at, "2026-06-11 09:30:00");
         assert!(created[0].created_at.len() >= 19);
 
-        let rows = app::list_events_since(&conn, "2026-06-11 00:00:00").unwrap();
+        let rows = app::list_events_since(
+            &conn,
+            app::ListEventsSinceParams {
+                starts_at: "2026-06-11 00:00:00",
+            },
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_date, "2026-06-11");
         assert_eq!(rows[0].starts_at, "2026-06-11 09:30:00");
