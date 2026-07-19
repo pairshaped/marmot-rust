@@ -62,6 +62,61 @@ fn help_does_not_require_database_configuration() {
     assert!(stdout.contains("reset"));
     assert!(stdout.contains("dump-schema"));
     assert!(stdout.contains("audit-views"));
+    assert!(stdout.contains("validate"));
+}
+
+#[test]
+fn validate_emits_stable_json_and_fails_for_an_incomplete_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let migrations = dir.path().join("db/migrations");
+    let source_root = dir.path().join("src");
+    fs::create_dir_all(&migrations).unwrap();
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        migrations.join("001_create_users.sql"),
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY);
+             CREATE TABLE schema_versions (
+               version TEXT PRIMARY KEY,
+               applied_at TEXT NOT NULL
+             ) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("validate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--migrations-dir")
+        .arg(&migrations)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--migration-table")
+        .arg("schema_versions")
+        .arg("--full")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["format_version"], 1);
+    assert_eq!(json["databases"][0]["checks"][0]["name"], "integrity_check");
+    assert_eq!(json["databases"][0]["checks"][3]["status"], "failed");
+    assert!(
+        json["databases"][0]["checks"][3]["details"][0]
+            .as_str()
+            .unwrap()
+            .contains("pending migration")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("database validation failed"));
 }
 
 #[test]

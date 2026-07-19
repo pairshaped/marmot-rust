@@ -435,7 +435,7 @@ fn validate_definitions(
     Ok(())
 }
 
-fn audit_connection(
+pub fn audit_connection(
     connection: &Connection,
     definitions: &[ViewDefinition],
 ) -> Result<ViewAudit, ViewError> {
