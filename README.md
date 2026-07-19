@@ -179,6 +179,43 @@ select id, name from items where id = @id;
 select id, name from items order by name;
 ```
 
+### Allowlisted update columns
+
+SQLite parameters can bind values, but they cannot bind column names. For the
+rare update whose target column is selected at runtime, declare the complete
+allowlist in the function block:
+
+```sql
+-- func: update_user_field
+-- columns: display_name, email
+update users
+set {{column}} = @value,
+    updated_at = @now
+where id = @id;
+```
+
+Marmot verifies that every choice is a real column on the updated table, quotes
+each identifier, prepares every resulting statement during analysis, and
+generates a closed `UpdateUserFieldColumn` Rust enum. The marker must be the
+complete left side of a direct `{{column}} = @value` assignment. Only one
+column allowlist and marker are allowed per function. A long allowlist can
+continue on another `-- columns:` directive:
+
+```sql
+-- columns: first_name, last_name, email
+-- columns: phone, city, country, postal_code
+```
+
+`@column` is reserved because generated parameter structs use `column` for the
+selector enum. Marmot rejects that collision during analysis. Reusing another
+named parameter is allowed and follows SQLite's normal single-binding behavior.
+
+When every allowed column has a compatible type, `@value` keeps that inferred
+type. If the columns have incompatible types, only `@value` falls back to
+`rusqlite::types::Value`; the column remains a closed enum. This feature does
+not substitute table names, clauses, expressions, ordering, or arbitrary SQL
+fragments.
+
 ### Read and mutation connections
 
 Marmot asks SQLite whether each prepared statement is read-only. Read statements

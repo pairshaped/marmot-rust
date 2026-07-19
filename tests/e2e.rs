@@ -1089,6 +1089,12 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     );
     write_sql_file(
         &module_dir,
+        "update_user_field.sql",
+        "-- columns: name, active
+         update users set {{column}} = @value where id = @id",
+    );
+    write_sql_file(
+        &module_dir,
         "create_user_name_index.sql",
         "create index users_name_idx on users (name)",
     );
@@ -1454,6 +1460,49 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(app::count_users_one(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn generated_allowlisted_column_updates_use_static_enum_variants() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+        app::create_user(
+            &mut conn,
+            app::CreateUserParams {
+                name: "alice",
+                active: true,
+                avatar: &[],
+                score: 1.0,
+                nickname: None,
+            },
+        )
+        .unwrap();
+
+        app::update_user_field(
+            &mut conn,
+            app::UpdateUserFieldParams {
+                column: app::UpdateUserFieldColumn::Name,
+                value: rusqlite::types::Value::Text("bob".to_string()),
+                id: 1,
+            },
+        )
+        .unwrap();
+        app::update_user_field(
+            &mut conn,
+            app::UpdateUserFieldParams {
+                column: app::UpdateUserFieldColumn::Active,
+                value: rusqlite::types::Value::Integer(0),
+                id: 1,
+            },
+        )
+        .unwrap();
+
+        let row = conn
+            .query_row("select name, active from users where id = 1", [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("bob".to_string(), false));
     }
 
     #[test]

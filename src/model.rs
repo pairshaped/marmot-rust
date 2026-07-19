@@ -23,6 +23,18 @@ pub struct Column {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSubstitution {
+    pub value_parameter: String,
+    pub choices: Vec<ColumnChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnChoice {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub source_path: PathBuf,
     pub module_name: String,
@@ -32,6 +44,7 @@ pub struct Query {
     pub sql: String,
     pub parameters: Vec<Parameter>,
     pub columns: Vec<Column>,
+    pub column_substitution: Option<ColumnSubstitution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

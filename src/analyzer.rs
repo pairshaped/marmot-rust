@@ -2,14 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use heck::ToSnakeCase;
+use heck::{ToPascalCase, ToSnakeCase};
 use rusqlite::Connection;
 
 use crate::config::{Config, TemporalConfig};
 use crate::discovery::discover_sql_files;
 use crate::error::{Error, Result};
 use crate::model::{
-    Column, ConnectionAccess, Parameter, Project, Query, ReturnType, ValueType, sanitize_identifier,
+    Column, ColumnChoice, ColumnSubstitution, ConnectionAccess, Parameter, Project, Query,
+    ReturnType, ValueType, sanitize_identifier,
 };
 use crate::sql_text::validate_sql;
 use crate::sqlite::blocks::parse_sql_blocks;
@@ -52,41 +53,303 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
         })?;
 
         for block in blocks {
-            let sql = validate_sql(&block.sql).map_err(|reason| Error::InvalidSql {
-                path: file.path.clone(),
-                reason,
-            })?;
-            let sqlite_sql = strip_nullability_overrides(&sql);
-            validate_insert_values_counts(&sqlite_sql, &schema, &file.path)?;
-            validate_temporal_parameter_inferences(
-                &sqlite_sql,
+            let variants = analyze_column_variants(
+                &conn,
                 &schema,
                 &config.temporal,
                 &file.path,
+                &block.function_name,
+                &block.sql,
+                block.column_substitution.as_ref(),
             )?;
-            let parameters = parameters_with_temporal(&sqlite_sql, &schema, &config.temporal);
-            let (columns, connection_access) =
-                result_columns(&conn, &schema, &file.path, &sql, &sqlite_sql)?;
-            let return_type = if columns.is_empty() {
-                ReturnType::Execute
-            } else {
-                ReturnType::Rows
-            };
+            let first = variants
+                .first()
+                .expect("every SQL block produces at least one analyzed variant");
+            let parameters = merge_variant_parameters(
+                &file.path,
+                &block.function_name,
+                first.value_parameter.as_deref(),
+                &variants,
+            )?;
+            if block.column_substitution.is_some()
+                && parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "column")
+            {
+                return Err(invalid_column_substitution(
+                    &file.path,
+                    &block.function_name,
+                    "`@column` conflicts with the generated `column` selector field; rename the SQL value parameter",
+                ));
+            }
+            let column_substitution =
+                block
+                    .column_substitution
+                    .as_ref()
+                    .map(|_| ColumnSubstitution {
+                        value_parameter: first
+                            .value_parameter
+                            .clone()
+                            .expect("column substitutions have an associated value parameter"),
+                        choices: variants
+                            .iter()
+                            .map(|variant| ColumnChoice {
+                                name: variant
+                                    .choice
+                                    .clone()
+                                    .expect("column substitution variants have a choice"),
+                                sql: variant.sql.clone(),
+                            })
+                            .collect(),
+                    });
 
             queries.push(Query {
                 source_path: file.path.clone(),
                 module_name: file.module_name.clone(),
                 name: block.function_name,
-                return_type,
-                connection_access,
-                sql: sqlite_sql,
+                return_type: first.return_type.clone(),
+                connection_access: first.connection_access.clone(),
+                sql: first.sql.clone(),
                 parameters,
-                columns,
+                columns: first.columns.clone(),
+                column_substitution,
             });
         }
     }
 
     Ok(Project { queries })
+}
+
+#[derive(Debug)]
+struct AnalyzedColumnVariant {
+    choice: Option<String>,
+    value_parameter: Option<String>,
+    sql: String,
+    parameters: Vec<Parameter>,
+    columns: Vec<Column>,
+    connection_access: ConnectionAccess,
+    return_type: ReturnType,
+}
+
+#[derive(Debug)]
+struct ColumnSqlVariants {
+    value_parameter: Option<String>,
+    variants: Vec<ColumnSqlVariant>,
+}
+
+#[derive(Debug)]
+struct ColumnSqlVariant {
+    choice: Option<String>,
+    sql: String,
+}
+
+fn analyze_column_variants(
+    conn: &Connection,
+    schema: &Schema,
+    temporal: &TemporalConfig,
+    path: &Path,
+    function: &str,
+    source_sql: &str,
+    substitution: Option<&crate::sqlite::blocks::ColumnSubstitution>,
+) -> Result<Vec<AnalyzedColumnVariant>> {
+    let sql_variants = column_sql_variants(schema, path, function, source_sql, substitution)?;
+    let mut variants = Vec::with_capacity(sql_variants.variants.len());
+
+    for variant in sql_variants.variants {
+        let sql = validate_sql(&variant.sql).map_err(|reason| Error::InvalidSql {
+            path: path.to_path_buf(),
+            reason,
+        })?;
+        let sqlite_sql = strip_nullability_overrides(&sql);
+        validate_insert_values_counts(&sqlite_sql, schema, path)?;
+        validate_temporal_parameter_inferences(&sqlite_sql, schema, temporal, path)?;
+        let parameters = parameters_with_temporal(&sqlite_sql, schema, temporal);
+        let (columns, connection_access) = result_columns(conn, schema, path, &sql, &sqlite_sql)?;
+        let return_type = if columns.is_empty() {
+            ReturnType::Execute
+        } else {
+            ReturnType::Rows
+        };
+        variants.push(AnalyzedColumnVariant {
+            choice: variant.choice,
+            value_parameter: sql_variants.value_parameter.clone(),
+            sql: sqlite_sql,
+            parameters,
+            columns,
+            connection_access,
+            return_type,
+        });
+    }
+
+    let first = variants
+        .first()
+        .expect("every SQL block produces at least one analyzed variant");
+    for variant in variants.iter().skip(1) {
+        if variant.columns != first.columns
+            || variant.connection_access != first.connection_access
+            || variant.return_type != first.return_type
+        {
+            return Err(invalid_column_substitution(
+                path,
+                function,
+                "every allowed column must produce the same result shape and connection access",
+            ));
+        }
+    }
+
+    Ok(variants)
+}
+
+fn column_sql_variants(
+    schema: &Schema,
+    path: &Path,
+    function: &str,
+    source_sql: &str,
+    substitution: Option<&crate::sqlite::blocks::ColumnSubstitution>,
+) -> Result<ColumnSqlVariants> {
+    let Some(substitution) = substitution else {
+        return Ok(ColumnSqlVariants {
+            value_parameter: None,
+            variants: vec![ColumnSqlVariant {
+                choice: None,
+                sql: source_sql.to_string(),
+            }],
+        });
+    };
+
+    let marker = "{{column}}";
+    let sentinel = "__marmot_allowlisted_column__";
+    let parse_sql = source_sql.replace(marker, sentinel);
+    let parsed = crate::sqlite::parse::parse_statement(&tokenize(&parse_sql));
+    let crate::sqlite::parse::Statement::Update(update) = parsed else {
+        return Err(invalid_column_substitution(
+            path,
+            function,
+            "`-- columns:` is supported only for an UPDATE assignment",
+        ));
+    };
+    let value_parameter = split_top_level_commas(&update.set)
+        .into_iter()
+        .find_map(|assignment| match assignment {
+            [
+                Token::Word(column),
+                Token::Eq,
+                Token::ParamNamed { prefix: '@', name },
+            ] if column == sentinel => Some(name.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            invalid_column_substitution(
+                path,
+                function,
+                "the marker must be the complete left side of `{{column}} = @value`",
+            )
+        })?;
+
+    let mut generated_variants = BTreeSet::new();
+    for choice in &substitution.choices {
+        if schema.column(&update.target.table.name, choice).is_none() {
+            return Err(invalid_column_substitution(
+                path,
+                function,
+                format!(
+                    "`{choice}` is not a column on `{}`",
+                    update.target.table.name
+                ),
+            ));
+        }
+        let generated_variant = choice.to_pascal_case();
+        if !generated_variants.insert(generated_variant.clone()) {
+            return Err(invalid_column_substitution(
+                path,
+                function,
+                format!("allowed columns collide as generated variant `{generated_variant}`"),
+            ));
+        }
+    }
+
+    let variants = substitution
+        .choices
+        .iter()
+        .map(|choice| ColumnSqlVariant {
+            choice: Some(choice.clone()),
+            sql: source_sql.replace(marker, &format!("\"{choice}\"")),
+        })
+        .collect();
+    Ok(ColumnSqlVariants {
+        value_parameter: Some(value_parameter),
+        variants,
+    })
+}
+
+fn merge_variant_parameters(
+    path: &Path,
+    function: &str,
+    value_parameter: Option<&str>,
+    variants: &[AnalyzedColumnVariant],
+) -> Result<Vec<Parameter>> {
+    let mut merged = variants
+        .first()
+        .expect("every SQL block produces at least one analyzed variant")
+        .parameters
+        .clone();
+
+    for variant in variants.iter().skip(1) {
+        if variant.parameters.len() != merged.len() {
+            return Err(invalid_column_substitution(
+                path,
+                function,
+                "allowed columns produced different SQL parameter sets",
+            ));
+        }
+        for (parameter, candidate) in merged.iter_mut().zip(&variant.parameters) {
+            if parameter.name != candidate.name || parameter.sql_names != candidate.sql_names {
+                return Err(invalid_column_substitution(
+                    path,
+                    function,
+                    "allowed columns produced different SQL parameter sets",
+                ));
+            }
+            if parameter.column_type != candidate.column_type {
+                if Some(parameter.name.as_str()) != value_parameter {
+                    return Err(invalid_column_substitution(
+                        path,
+                        function,
+                        format!(
+                            "parameter @{} has incompatible types across allowed columns",
+                            parameter.name
+                        ),
+                    ));
+                }
+                parameter.column_type = ValueType::Value;
+                parameter.nullable = false;
+            } else if parameter.column_type != ValueType::Value {
+                parameter.nullable |= candidate.nullable;
+            }
+        }
+    }
+
+    if let Some(value_parameter) = value_parameter
+        && !merged
+            .iter()
+            .any(|parameter| parameter.name == value_parameter)
+    {
+        return Err(invalid_column_substitution(
+            path,
+            function,
+            format!("value parameter @{value_parameter} was not inferred"),
+        ));
+    }
+
+    Ok(merged)
+}
+
+fn invalid_column_substitution(path: &Path, function: &str, reason: impl Into<String>) -> Error {
+    Error::InvalidColumnSubstitution {
+        path: path.to_path_buf(),
+        function: function.to_string(),
+        reason: reason.into(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8590,6 +8853,169 @@ mod tests {
         );
         assert_eq!(project.queries[1].name, "delete_org");
         assert_eq!(project.queries[1].return_type, ReturnType::Execute);
+    }
+
+    #[test]
+    fn analyzes_allowlisted_update_columns_and_uses_value_for_mixed_types() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            create table users (
+                id integer primary key,
+                name text not null,
+                active integer constraint boolean check (active in (0, 1))
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let source_root = dir.path().join("src");
+        let users_dir = source_root.join("users");
+        fs::create_dir_all(&users_dir).unwrap();
+        fs::write(users_dir.join("update.rs"), "").unwrap();
+        fs::write(
+            users_dir.join("update.sql"),
+            "
+            -- func: update_user_field
+            -- columns: name, active
+            update users set {{column}} = @value where id = @id;
+            ",
+        )
+        .unwrap();
+
+        let project = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        })
+        .unwrap();
+
+        let query = &project.queries[0];
+        assert_eq!(
+            query.column_substitution,
+            Some(ColumnSubstitution {
+                value_parameter: "value".to_string(),
+                choices: vec![
+                    ColumnChoice {
+                        name: "name".to_string(),
+                        sql: "update users set \"name\" = @value where id = @id".to_string(),
+                    },
+                    ColumnChoice {
+                        name: "active".to_string(),
+                        sql: "update users set \"active\" = @value where id = @id".to_string(),
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            query.parameters,
+            [
+                Parameter {
+                    name: "value".to_string(),
+                    sql_names: vec!["@value".to_string()],
+                    column_type: ValueType::Value,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_non_assignment_column_substitutions() {
+        for sql in [
+            "
+            -- func: update_user_field
+            -- columns: name, missing
+            update users set {{column}} = @value where id = @id;
+            ",
+            "
+            -- func: update_user_field
+            -- columns: users, archived_users
+            update {{column}} set name = @value where id = @id;
+            ",
+        ] {
+            let dir = tempdir().unwrap();
+            let database = dir.path().join("app.sqlite3");
+            let conn = Connection::open(&database).unwrap();
+            conn.execute_batch("create table users (id integer primary key, name text not null);")
+                .unwrap();
+            drop(conn);
+            let source_root = dir.path().join("src");
+            fs::create_dir_all(&source_root).unwrap();
+            fs::write(source_root.join("users.rs"), "").unwrap();
+            fs::write(source_root.join("users.sql"), sql).unwrap();
+
+            let error = analyze_project(&Config {
+                database,
+                source_root,
+                output: dir.path().join("generated"),
+                target: Target::Rust,
+                check: false,
+                temporal: Default::default(),
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidColumnSubstitution { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_column_parameter_that_collides_with_generated_selector() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("app.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "create table users (
+                id integer primary key,
+                name text not null,
+                nickname text
+            );",
+        )
+        .unwrap();
+        drop(conn);
+        let source_root = dir.path().join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("users.rs"), "").unwrap();
+        fs::write(
+            source_root.join("users.sql"),
+            "
+            -- func: update_user_field
+            -- columns: name, nickname
+            update users set {{column}} = @column where id = @id;
+            ",
+        )
+        .unwrap();
+
+        let error = analyze_project(&Config {
+            database,
+            source_root,
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("`@column` conflicts with the generated `column` selector field"),
+            "{error}"
+        );
     }
 
     #[test]
