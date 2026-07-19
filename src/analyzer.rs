@@ -8293,9 +8293,12 @@ mod tests {
         );
 
         let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
-        assert!(output.contains(
-            "pub fn line_items(conn: &Connection, status: impl AsRef<str>, type_filter: impl AsRef<str>)"
-        ));
+        assert!(output.contains("pub struct LineItemsParams<'a>"));
+        assert!(output.contains("pub status: &'a str"));
+        assert!(output.contains("pub type_filter: &'a str"));
+        assert!(
+            output.contains("pub fn line_items(conn: &Connection, params: LineItemsParams<'_>)")
+        );
     }
 
     #[test]
@@ -8392,8 +8395,8 @@ mod tests {
         );
 
         let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
-        assert!(output.contains("status: impl AsRef<str>"));
-        assert!(output.contains("type_filter: impl AsRef<str>"));
+        assert!(output.contains("pub status: &'a str"));
+        assert!(output.contains("pub type_filter: &'a str"));
     }
 
     #[test]

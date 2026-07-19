@@ -214,14 +214,14 @@ struct TemporalFieldError {
 
 impl fmt::Display for TemporalFieldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &self.source {
-            if let Some(source) = source.downcast_ref::<TemporalParseError>() {
-                return write!(
-                    f,
-                    "invalid temporal value for {}: {:?}; expected {}",
-                    self.field, source.value, source.expected
-                );
-            }
+        if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &self.source
+            && let Some(source) = source.downcast_ref::<TemporalParseError>()
+        {
+            return write!(
+                f,
+                "invalid temporal value for {}: {:?}; expected {}",
+                self.field, source.value, source.expected
+            );
         }
         write!(
             f,
@@ -317,7 +317,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn temporal_error(value: &str, expected: &'static str) -> TemporalParseError {
@@ -368,7 +368,7 @@ fn write_module_tree(path: &Path, tree: &ModuleTree, check: bool) -> Result<()> 
     let content = tree
         .children
         .keys()
-        .map(|module| format!("pub mod {module};\n"))
+        .map(|module| module_declaration(path, module))
         .collect::<String>();
 
     if check {
@@ -387,6 +387,17 @@ fn write_module_tree(path: &Path, tree: &ModuleTree, check: bool) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn module_declaration(parent: &Path, module: &str) -> String {
+    let allow_module_inception = parent
+        .file_name()
+        .is_some_and(|parent_module| parent_module == module);
+    if allow_module_inception {
+        format!("#[allow(clippy::module_inception)]\npub mod {module};\n")
+    } else {
+        format!("pub mod {module};\n")
+    }
 }
 
 fn ensure_file_current(path: &std::path::Path, content: &str) -> Result<()> {
@@ -619,7 +630,8 @@ fn render_query(query: &Query) -> String {
     let lowered = lower_sql_parameters(query);
     let sql = raw_string(&lowered.sql);
 
-    let mut output = format!("const {const_name}: &str = {sql};\n\n");
+    let mut output = render_parameter_struct(query);
+    output.push_str(&format!("const {const_name}: &str = {sql};\n\n"));
     match &query.return_type {
         ReturnType::Execute => output.push_str(&render_execute(query, &lowered, &const_name)),
         ReturnType::Rows if query.columns.len() == 1 => {
@@ -641,7 +653,7 @@ fn render_select(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: 
         .map(|column| format!("    pub {}: {},\n", column.field_name, column.rust_type()))
         .collect::<String>();
     let params = render_params(query);
-    let bindings = render_bindings(lowered);
+    let bindings = render_bindings(query, lowered);
     let row_fields = query
         .columns
         .iter()
@@ -679,20 +691,20 @@ fn render_scalar_select(
     const_name: &str,
 ) -> String {
     let rust_type = query.columns[0].rust_type();
-    let row_get = render_row_get(&query.columns[0], 0);
+    let row_get = render_row_get_result(&query.columns[0], 0);
     let params = render_params(query);
-    let bindings = render_bindings(lowered);
+    let bindings = render_bindings(query, lowered);
     format!(
         "pub fn {name}({connection_param}{params}) -> Result<Vec<{rust_type}>> {{\n\
              {connection_binding}\
              let mut stmt = conn.prepare_cached({const_name})?;\n\
-             let rows = stmt.query_map({bindings}, |row| Ok({row_get}))?;\n\
+             let rows = stmt.query_map({bindings}, |row| {row_get})?;\n\
              rows.collect()\n\
          }}\n\n\
          pub fn {name}_one({connection_param}{params}) -> Result<{rust_type}> {{\n\
              {connection_binding}\
              let mut stmt = conn.prepare_cached({const_name})?;\n\
-             stmt.query_row({bindings}, |row| Ok({row_get}))\n\
+             stmt.query_row({bindings}, |row| {row_get})\n\
          }}\n",
         name = query.name,
         connection_param = render_connection_param(query),
@@ -702,7 +714,7 @@ fn render_scalar_select(
 
 fn render_execute(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: &str) -> String {
     let params = render_params(query);
-    let bindings = render_bindings(lowered);
+    let bindings = render_bindings(query, lowered);
     format!(
         "pub fn {name}({connection_param}{params}) -> Result<usize> {{\n\
              {connection_binding}\
@@ -729,17 +741,25 @@ fn render_connection_binding(query: &Query) -> &'static str {
 }
 
 fn render_row_get(column: &crate::model::Column, index: usize) -> String {
+    format!("{}?", render_row_get_result(column, index))
+}
+
+fn render_row_get_result(column: &crate::model::Column, index: usize) -> String {
     if value_type_is_temporal(&column.column_type) {
         format!(
-            "temporal::with_field(row.get({index}), {:?}, {index})?",
+            "temporal::with_field(row.get({index}), {:?}, {index})",
             column.field_name
         )
     } else {
-        format!("row.get({index})?")
+        format!("row.get({index})")
     }
 }
 
 fn render_params(query: &Query) -> String {
+    if uses_parameter_struct(query) {
+        return format!(", params: {}", parameter_struct_usage(query));
+    }
+
     query
         .parameters
         .iter()
@@ -747,15 +767,93 @@ fn render_params(query: &Query) -> String {
         .collect()
 }
 
-fn render_bindings(lowered: &LoweredSqlParameters<'_>) -> String {
+fn render_parameter_struct(query: &Query) -> String {
+    if !uses_parameter_struct(query) {
+        return String::new();
+    }
+
+    let struct_name = parameter_struct_name(query);
+    let lifetime = if parameter_struct_uses_lifetime(query) {
+        "<'a>"
+    } else {
+        ""
+    };
+    let fields = query
+        .parameters
+        .iter()
+        .map(|param| {
+            format!(
+                "    pub {}: {},\n",
+                param.name,
+                parameter_struct_field_type(param)
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        "#[derive(Debug)]\n\
+         pub struct {struct_name}{lifetime} {{\n\
+         {fields}\
+         }}\n\n"
+    )
+}
+
+fn uses_parameter_struct(query: &Query) -> bool {
+    !query.parameters.is_empty()
+}
+
+fn parameter_struct_name(query: &Query) -> String {
+    format!("{}Params", query.name.to_pascal_case())
+}
+
+fn parameter_struct_usage(query: &Query) -> String {
+    let struct_name = parameter_struct_name(query);
+    if parameter_struct_uses_lifetime(query) {
+        format!("{struct_name}<'_>")
+    } else {
+        struct_name
+    }
+}
+
+fn parameter_struct_uses_lifetime(query: &Query) -> bool {
+    query
+        .parameters
+        .iter()
+        .any(|param| parameter_type_is_borrowed(&param.column_type))
+}
+
+fn parameter_struct_field_type(param: &Parameter) -> String {
+    let rust_type = match param.column_type {
+        ValueType::String => "&'a str",
+        ValueType::DbDate => "&'a temporal::DbDate",
+        ValueType::DbDateTime => "&'a temporal::DbDateTime",
+        ValueType::Bytes => "&'a [u8]",
+        _ => param.column_type.rust_type(),
+    };
+    if param.nullable {
+        format!("Option<{rust_type}>")
+    } else {
+        rust_type.to_string()
+    }
+}
+
+fn parameter_type_is_borrowed(value_type: &ValueType) -> bool {
+    matches!(
+        value_type,
+        ValueType::String | ValueType::DbDate | ValueType::DbDateTime | ValueType::Bytes
+    )
+}
+
+fn render_bindings(query: &Query, lowered: &LoweredSqlParameters<'_>) -> String {
     if lowered.bindings.is_empty() {
         return "[]".to_string();
     }
 
+    let owner = uses_parameter_struct(query).then_some("params");
     let names = lowered
         .bindings
         .iter()
-        .map(|param| param_binding_expr(param))
+        .map(|param| param_binding_expr(param, owner))
         .collect::<Vec<_>>()
         .join(", ");
     format!("params![{names}]")
@@ -873,25 +971,37 @@ fn parameter_for_slot<'a>(
     .expect("every SQL parameter should have a generated function parameter")
 }
 
-fn param_binding_expr(param: &crate::model::Parameter) -> String {
+fn param_binding_expr(param: &crate::model::Parameter, owner: Option<&str>) -> String {
+    let name = owner
+        .map(|owner| format!("{owner}.{}", param.name))
+        .unwrap_or_else(|| param.name.clone());
     if param.nullable {
         if matches!(
             param.column_type,
             crate::model::ValueType::DbDate | crate::model::ValueType::DbDateTime
         ) {
-            return format!("{}.map(|value| value.as_str())", param.name);
+            return format!("{name}.map(|value| value.as_str())");
         }
-        return param.name.clone();
+        return name;
+    }
+
+    if owner.is_some() {
+        return match param.column_type {
+            crate::model::ValueType::DbDate | crate::model::ValueType::DbDateTime => {
+                format!("{name}.as_str()")
+            }
+            _ => name,
+        };
     }
 
     match param.column_type {
         crate::model::ValueType::String | crate::model::ValueType::Bytes => {
-            format!("{}.as_ref()", param.name)
+            format!("{name}.as_ref()")
         }
         crate::model::ValueType::DbDate | crate::model::ValueType::DbDateTime => {
-            format!("{}.as_ref().as_str()", param.name)
+            format!("{name}.as_ref().as_str()")
         }
-        _ => param.name.clone(),
+        _ => name,
     }
 }
 
@@ -950,7 +1060,10 @@ mod tests {
         assert!(output.contains("created_at >= ?2"));
         assert!(output.contains("title like ?3"));
         assert!(output.contains("owner_id = ?4"));
-        assert!(output.contains("params![user_id, since, pattern.as_ref(), user_id]"));
+        assert!(
+            output
+                .contains("params![params.user_id, params.since, params.pattern, params.user_id]")
+        );
         assert!(!output.contains("named_params!"));
     }
 
@@ -982,7 +1095,7 @@ mod tests {
 
         let output = render_query(&query);
 
-        assert!(output.contains("params![param.as_ref(), param_2]"));
+        assert!(output.contains("params![params.param, params.param_2]"));
     }
 
     #[test]
@@ -1014,7 +1127,7 @@ mod tests {
         let output = render_query(&query);
 
         assert!(output.contains("update users set name = ?1 where id = ?2 or parent_id = ?2"));
-        assert!(output.contains("params![param_2.as_ref(), param]"));
+        assert!(output.contains("params![params.param_2, params.param]"));
     }
 
     #[test]
@@ -1038,7 +1151,7 @@ mod tests {
         let output = render_query(&query);
 
         assert!(output.contains("update users set name = ?1"));
-        assert!(output.contains("params![param_2.as_ref()]"));
+        assert!(output.contains("params![params.param_2]"));
     }
 
     #[test]
@@ -1069,7 +1182,7 @@ mod tests {
 
         let output = render_module("users", vec![&query]).unwrap();
 
-        assert!(output.contains("params![param, param_2.as_ref()]"));
+        assert!(output.contains("params![params.param, params.param_2]"));
     }
 
     #[test]
@@ -1101,7 +1214,7 @@ mod tests {
         let output = render_module("users", vec![&query]).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
-        assert!(output.contains("params![param.as_ref(), id]"));
+        assert!(output.contains("params![params.param, params.id]"));
     }
 
     #[test]
@@ -1133,7 +1246,7 @@ mod tests {
         let output = render_module("users", vec![&query]).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
-        assert!(output.contains("params![param.as_ref(), param_2]"));
+        assert!(output.contains("params![params.param, params.param_2]"));
     }
 
     #[test]
@@ -1178,8 +1291,8 @@ mod tests {
 
         let output = render_query(&query);
 
-        assert!(output.contains("bio: Option<&str>"));
-        assert!(output.contains("id: i64"));
+        assert!(output.contains("pub bio: Option<&'a str>"));
+        assert!(output.contains("pub id: i64"));
         assert!(!output.contains("impl rusqlite::ToSql"));
     }
 
@@ -1270,10 +1383,88 @@ mod tests {
         assert!(row_output.contains("pub avatar: Vec<u8>"));
         assert!(row_output.contains("pub metadata: rusqlite::types::Value"));
         assert!(row_output.contains("pub deleted: Option<bool>"));
-        assert!(execute_output.contains(
-            "pub fn update(conn: impl MutationConnection, active: bool, price: f64, avatar: impl AsRef<[u8]>, maybe_avatar: Option<&[u8]>)"
-        ));
-        assert!(execute_output.contains("params![active, price, avatar.as_ref(), maybe_avatar]"));
+        assert!(execute_output.contains("pub struct UpdateParams<'a>"));
+        assert!(execute_output.contains("pub avatar: &'a [u8]"));
+        assert!(execute_output.contains("pub maybe_avatar: Option<&'a [u8]>"));
+        assert!(
+            execute_output
+                .contains("pub fn update(conn: impl MutationConnection, params: UpdateParams<'_>)")
+        );
+        assert!(
+            execute_output.contains(
+                "params![params.active, params.price, params.avatar, params.maybe_avatar]"
+            )
+        );
+    }
+
+    #[test]
+    fn render_scalar_query_returns_the_row_result_directly() {
+        let query = Query {
+            source_path: PathBuf::from("src/users.sql"),
+            module_name: "users".to_string(),
+            name: "count_users".to_string(),
+            return_type: ReturnType::Rows,
+            connection_access: ConnectionAccess::Read,
+            sql: "select count(*) from users".to_string(),
+            parameters: vec![],
+            columns: vec![Column {
+                name: "count(*)".to_string(),
+                field_name: "count".to_string(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }],
+        };
+
+        let output = render_query(&query);
+
+        assert!(output.contains("|row| row.get(0)"), "{output}");
+        assert!(!output.contains("Ok(row.get(0)?)"));
+    }
+
+    #[test]
+    fn render_parameterized_query_uses_a_named_parameter_struct() {
+        let query = Query {
+            source_path: PathBuf::from("src/users.sql"),
+            module_name: "users".to_string(),
+            name: "update_user".to_string(),
+            return_type: ReturnType::Execute,
+            connection_access: ConnectionAccess::Mutation,
+            sql: "update users set a = ?, b = ?, c = ?, d = ?, e = ?, f = ? where id = ?"
+                .to_string(),
+            parameters: (1..=7)
+                .map(|index| Parameter {
+                    name: format!("param_{index}"),
+                    sql_names: vec![],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                })
+                .collect(),
+            columns: vec![],
+        };
+
+        let output = render_query(&query);
+
+        assert!(output.contains("pub struct UpdateUserParams {"), "{output}");
+        assert!(output.contains("pub param_7: i64"), "{output}");
+        assert!(
+            output.contains(
+                "pub fn update_user(conn: impl MutationConnection, params: UpdateUserParams)"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("params![params.param_1, params.param_2"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn render_temporal_support_uses_clippy_clean_control_flow() {
+        let output = render_temporal_module();
+
+        assert!(output.contains("&& let Some(source) = source.downcast_ref"));
+        assert!(output.contains("year.is_multiple_of(4)"));
+        assert!(!output.contains("year % 4 == 0"));
     }
 
     #[test]
@@ -1292,6 +1483,18 @@ mod tests {
         let output = render_query(&query);
 
         assert!(output.contains("r##\"select 'it''s fine', \"quoted\", r#\"raw\"#\"##"));
+    }
+
+    #[test]
+    fn repeated_module_names_allow_module_inception_at_the_generated_boundary() {
+        assert_eq!(
+            module_declaration(Path::new("generated/participants"), "participants"),
+            "#[allow(clippy::module_inception)]\npub mod participants;\n"
+        );
+        assert_eq!(
+            module_declaration(Path::new("generated/participants"), "waivers"),
+            "pub mod waivers;\n"
+        );
     }
 
     #[test]
