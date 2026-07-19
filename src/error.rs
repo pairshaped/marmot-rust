@@ -17,6 +17,12 @@ pub enum Error {
         reason: crate::sqlite::blocks::SqlBlockError,
     },
 
+    InvalidColumnSubstitution {
+        path: PathBuf,
+        function: String,
+        reason: String,
+    },
+
     WriteFile {
         path: PathBuf,
         source: std::io::Error,
@@ -148,6 +154,15 @@ impl std::fmt::Display for Error {
             Self::InvalidSqlBlock { path, reason } => {
                 write!(f, "invalid SQL block in {}: {reason}", path.display())
             }
+            Self::InvalidColumnSubstitution {
+                path,
+                function,
+                reason,
+            } => write!(
+                f,
+                "invalid column substitution for `{function}` in {}: {reason}",
+                path.display()
+            ),
             Self::WriteFile { path, source } => {
                 write!(f, "could not write {}: {source}", path.display())
             }

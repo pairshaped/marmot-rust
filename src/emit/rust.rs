@@ -628,21 +628,104 @@ fn render_import_macros(queries: &[&Query]) -> String {
 fn render_query(query: &Query) -> String {
     let const_name = format!("{}_SQL", query.name.to_uppercase());
     let lowered = lower_sql_parameters(query);
-    let sql = raw_string(&lowered.sql);
 
-    let mut output = render_parameter_struct(query);
-    output.push_str(&format!("const {const_name}: &str = {sql};\n\n"));
+    let mut output = render_column_substitution(query);
+    output.push_str(&render_parameter_struct(query));
+    let (sql_declarations, sql_selection, sql_expression) =
+        render_query_sql(query, &const_name, &lowered);
+    output.push_str(&sql_declarations);
     match &query.return_type {
-        ReturnType::Execute => output.push_str(&render_execute(query, &lowered, &const_name)),
-        ReturnType::Rows if query.columns.len() == 1 => {
-            output.push_str(&render_scalar_select(query, &lowered, &const_name))
-        }
-        ReturnType::Rows => output.push_str(&render_select(query, &lowered, &const_name)),
+        ReturnType::Execute => output.push_str(&render_execute(
+            query,
+            &lowered,
+            &sql_selection,
+            &sql_expression,
+        )),
+        ReturnType::Rows if query.columns.len() == 1 => output.push_str(&render_scalar_select(
+            query,
+            &lowered,
+            &sql_selection,
+            &sql_expression,
+        )),
+        ReturnType::Rows => output.push_str(&render_select(
+            query,
+            &lowered,
+            &sql_selection,
+            &sql_expression,
+        )),
     }
     output
 }
 
-fn render_select(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: &str) -> String {
+fn render_query_sql(
+    query: &Query,
+    const_name: &str,
+    lowered: &LoweredSqlParameters<'_>,
+) -> (String, String, String) {
+    let Some(substitution) = &query.column_substitution else {
+        return (
+            format!(
+                "const {const_name}: &str = {};\n\n",
+                raw_string(&lowered.sql)
+            ),
+            String::new(),
+            const_name.to_string(),
+        );
+    };
+
+    let enum_name = column_substitution_enum_name(query);
+    let mut declarations = String::new();
+    let mut arms = String::new();
+    for choice in &substitution.choices {
+        let choice_const = format!(
+            "{}_{}_SQL",
+            query.name.to_uppercase(),
+            choice.name.to_uppercase()
+        );
+        let lowered_choice = lower_sql_parameters_for(query, &choice.sql);
+        declarations.push_str(&format!(
+            "const {choice_const}: &str = {};\n",
+            raw_string(&lowered_choice.sql)
+        ));
+        arms.push_str(&format!(
+            "                 {enum_name}::{} => {choice_const},\n",
+            choice.name.to_pascal_case()
+        ));
+    }
+    declarations.push('\n');
+    let selection =
+        format!("let sql = match params.column {{\n{arms}             }};\n             ");
+    (declarations, selection, "sql".to_string())
+}
+
+fn render_column_substitution(query: &Query) -> String {
+    let Some(substitution) = &query.column_substitution else {
+        return String::new();
+    };
+    let enum_name = column_substitution_enum_name(query);
+    let variants = substitution
+        .choices
+        .iter()
+        .map(|choice| format!("    {},\n", choice.name.to_pascal_case()))
+        .collect::<String>();
+    format!(
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+         pub enum {enum_name} {{\n\
+         {variants}\
+         }}\n\n"
+    )
+}
+
+fn column_substitution_enum_name(query: &Query) -> String {
+    format!("{}Column", query.name.to_pascal_case())
+}
+
+fn render_select(
+    query: &Query,
+    lowered: &LoweredSqlParameters<'_>,
+    sql_selection: &str,
+    sql_expression: &str,
+) -> String {
     let ReturnType::Rows = &query.return_type else {
         unreachable!("render_select only accepts row queries")
     };
@@ -673,7 +756,8 @@ fn render_select(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: 
         "{struct_definition}\
          pub fn {name}({connection_param}{params}) -> Result<Vec<{row_type}>> {{\n\
              {connection_binding}\
-             let mut stmt = conn.prepare_cached({const_name})?;\n\
+             {sql_selection}\
+             let mut stmt = conn.prepare_cached({sql_expression})?;\n\
              let rows = stmt.query_map({bindings}, |row| {{\n\
                  Ok({row_type} {{\n{row_fields}        }})\n\
              }})?;\n\
@@ -688,7 +772,8 @@ fn render_select(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: 
 fn render_scalar_select(
     query: &Query,
     lowered: &LoweredSqlParameters<'_>,
-    const_name: &str,
+    sql_selection: &str,
+    sql_expression: &str,
 ) -> String {
     let rust_type = query.columns[0].rust_type();
     let row_get = render_row_get_result(&query.columns[0], 0);
@@ -697,13 +782,15 @@ fn render_scalar_select(
     format!(
         "pub fn {name}({connection_param}{params}) -> Result<Vec<{rust_type}>> {{\n\
              {connection_binding}\
-             let mut stmt = conn.prepare_cached({const_name})?;\n\
+             {sql_selection}\
+             let mut stmt = conn.prepare_cached({sql_expression})?;\n\
              let rows = stmt.query_map({bindings}, |row| {row_get})?;\n\
              rows.collect()\n\
          }}\n\n\
          pub fn {name}_one({connection_param}{params}) -> Result<{rust_type}> {{\n\
              {connection_binding}\
-             let mut stmt = conn.prepare_cached({const_name})?;\n\
+             {sql_selection}\
+             let mut stmt = conn.prepare_cached({sql_expression})?;\n\
              stmt.query_row({bindings}, |row| {row_get})\n\
          }}\n",
         name = query.name,
@@ -712,13 +799,19 @@ fn render_scalar_select(
     )
 }
 
-fn render_execute(query: &Query, lowered: &LoweredSqlParameters<'_>, const_name: &str) -> String {
+fn render_execute(
+    query: &Query,
+    lowered: &LoweredSqlParameters<'_>,
+    sql_selection: &str,
+    sql_expression: &str,
+) -> String {
     let params = render_params(query);
     let bindings = render_bindings(query, lowered);
     format!(
         "pub fn {name}({connection_param}{params}) -> Result<usize> {{\n\
              {connection_binding}\
-             conn.execute({const_name}, {bindings})\n\
+             {sql_selection}\
+             conn.execute({sql_expression}, {bindings})\n\
          }}\n",
         name = query.name,
         connection_param = render_connection_param(query),
@@ -778,7 +871,7 @@ fn render_parameter_struct(query: &Query) -> String {
     } else {
         ""
     };
-    let fields = query
+    let mut fields = query
         .parameters
         .iter()
         .map(|param| {
@@ -789,6 +882,15 @@ fn render_parameter_struct(query: &Query) -> String {
             )
         })
         .collect::<String>();
+    if query.column_substitution.is_some() {
+        fields.insert_str(
+            0,
+            &format!(
+                "    pub column: {},\n",
+                column_substitution_enum_name(query)
+            ),
+        );
+    }
 
     format!(
         "#[derive(Debug)]\n\
@@ -799,7 +901,7 @@ fn render_parameter_struct(query: &Query) -> String {
 }
 
 fn uses_parameter_struct(query: &Query) -> bool {
-    !query.parameters.is_empty()
+    !query.parameters.is_empty() || query.column_substitution.is_some()
 }
 
 fn parameter_struct_name(query: &Query) -> String {
@@ -866,17 +968,21 @@ struct LoweredSqlParameters<'a> {
 }
 
 fn lower_sql_parameters(query: &Query) -> LoweredSqlParameters<'_> {
+    lower_sql_parameters_for(query, &query.sql)
+}
+
+fn lower_sql_parameters_for<'a>(query: &'a Query, sql: &str) -> LoweredSqlParameters<'a> {
     if query.parameters.is_empty() {
         return LoweredSqlParameters {
-            sql: query.sql.clone(),
+            sql: sql.to_string(),
             bindings: Vec::new(),
         };
     }
 
-    let tokens = tokenize_spans(&query.sql);
+    let tokens = tokenize_spans(sql);
     let mut slots = ParameterSlots::default();
     let mut copied_until = 0usize;
-    let mut lowered = String::with_capacity(query.sql.len());
+    let mut lowered = String::with_capacity(sql.len());
     let mut slot_params: BTreeMap<usize, &Parameter> = BTreeMap::new();
     let mut dense_slots: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -892,13 +998,13 @@ fn lower_sql_parameters(query: &Query) -> LoweredSqlParameters<'_> {
         let next_dense_slot = dense_slots.len() + 1;
         let dense_slot = dense_slots.entry(slot.index).or_insert(next_dense_slot);
 
-        lowered.push_str(&query.sql[copied_until..spanned.start]);
+        lowered.push_str(&sql[copied_until..spanned.start]);
         lowered.push('?');
         lowered.push_str(&dense_slot.to_string());
         copied_until = spanned.end;
     }
 
-    lowered.push_str(&query.sql[copied_until..]);
+    lowered.push_str(&sql[copied_until..]);
 
     let mut slots_by_dense_index = dense_slots
         .iter()
@@ -1019,7 +1125,9 @@ fn raw_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Column, ConnectionAccess, Parameter, Query, ValueType};
+    use crate::model::{
+        Column, ColumnChoice, ColumnSubstitution, ConnectionAccess, Parameter, Query, ValueType,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1051,6 +1159,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1065,6 +1174,58 @@ mod tests {
                 .contains("params![params.user_id, params.since, params.pattern, params.user_id]")
         );
         assert!(!output.contains("named_params!"));
+    }
+
+    #[test]
+    fn renders_allowlisted_columns_as_an_enum_and_static_sql_variants() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/update.sql"),
+            module_name: "users/update".to_string(),
+            name: "update_user_field".to_string(),
+            return_type: ReturnType::Execute,
+            connection_access: ConnectionAccess::Mutation,
+            sql: "update users set \"name\" = @value where id = @id".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "value".to_string(),
+                    sql_names: vec!["@value".to_string()],
+                    column_type: ValueType::Value,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+            ],
+            columns: vec![],
+            column_substitution: Some(ColumnSubstitution {
+                value_parameter: "value".to_string(),
+                choices: vec![
+                    ColumnChoice {
+                        name: "name".to_string(),
+                        sql: "update users set \"name\" = @value where id = @id".to_string(),
+                    },
+                    ColumnChoice {
+                        name: "active".to_string(),
+                        sql: "update users set \"active\" = @value where id = @id".to_string(),
+                    },
+                ],
+            }),
+        };
+
+        let output = render_query(&query);
+
+        assert!(output.contains("pub enum UpdateUserFieldColumn"));
+        assert!(output.contains("Name,"));
+        assert!(output.contains("Active,"));
+        assert!(output.contains("pub column: UpdateUserFieldColumn"));
+        assert!(output.contains("pub value: rusqlite::types::Value"));
+        assert!(output.contains("const UPDATE_USER_FIELD_NAME_SQL"));
+        assert!(output.contains("const UPDATE_USER_FIELD_ACTIVE_SQL"));
+        assert!(output.contains("UpdateUserFieldColumn::Name => UPDATE_USER_FIELD_NAME_SQL"));
+        assert!(output.contains("conn.execute(sql, params![params.value, params.id])"));
     }
 
     #[test]
@@ -1090,6 +1251,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1121,6 +1283,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1145,6 +1308,7 @@ mod tests {
                 column_type: ValueType::String,
                 nullable: false,
             }],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1177,6 +1341,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1208,6 +1373,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1240,6 +1406,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1286,6 +1453,7 @@ mod tests {
                     nullable: false,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1306,6 +1474,7 @@ mod tests {
             connection_access: ConnectionAccess::Read,
             sql: "select active, price, avatar, metadata, deleted from files".to_string(),
             parameters: vec![],
+            column_substitution: None,
             columns: vec![
                 Column {
                     name: "active".to_string(),
@@ -1372,6 +1541,7 @@ mod tests {
                     nullable: true,
                 },
             ],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1407,6 +1577,7 @@ mod tests {
             connection_access: ConnectionAccess::Read,
             sql: "select count(*) from users".to_string(),
             parameters: vec![],
+            column_substitution: None,
             columns: vec![Column {
                 name: "count(*)".to_string(),
                 field_name: "count".to_string(),
@@ -1439,6 +1610,7 @@ mod tests {
                     nullable: false,
                 })
                 .collect(),
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1477,6 +1649,7 @@ mod tests {
             connection_access: ConnectionAccess::Read,
             sql: "select 'it''s fine', \"quoted\", r#\"raw\"#".to_string(),
             parameters: vec![],
+            column_substitution: None,
             columns: vec![],
         };
 
@@ -1510,6 +1683,7 @@ mod tests {
                 connection_access: ConnectionAccess::Read,
                 sql: "select id, name from users".to_string(),
                 parameters: vec![],
+                column_substitution: None,
                 columns: vec![
                     Column {
                         name: "id".to_string(),
@@ -1572,6 +1746,7 @@ mod tests {
                     column_type: ValueType::DbDateTime,
                     nullable: false,
                 }],
+                column_substitution: None,
                 columns: vec![],
             }],
         };
@@ -1601,6 +1776,7 @@ mod tests {
                 connection_access: ConnectionAccess::Read,
                 sql: "select 1 as value".to_string(),
                 parameters: vec![],
+                column_substitution: None,
                 columns: vec![Column {
                     name: "value".to_string(),
                     field_name: "value".to_string(),
@@ -1616,6 +1792,7 @@ mod tests {
                 connection_access: ConnectionAccess::Read,
                 sql: "select 2 as value".to_string(),
                 parameters: vec![],
+                column_substitution: None,
                 columns: vec![Column {
                     name: "value".to_string(),
                     field_name: "value".to_string(),
@@ -1643,6 +1820,7 @@ mod tests {
                 connection_access: ConnectionAccess::Read,
                 sql: "select 1 as value".to_string(),
                 parameters: vec![],
+                column_substitution: None,
                 columns: vec![Column {
                     name: "value".to_string(),
                     field_name: "value".to_string(),
@@ -1663,6 +1841,7 @@ mod tests {
                     column_type: ValueType::I64,
                     nullable: false,
                 }],
+                column_substitution: None,
                 columns: vec![],
             },
         ];
@@ -1699,6 +1878,7 @@ mod tests {
                 connection_access: ConnectionAccess::Read,
                 sql: "select id, name from orgs".to_string(),
                 parameters: vec![],
+                column_substitution: None,
                 columns: columns.clone(),
             },
             Query {
@@ -1714,6 +1894,7 @@ mod tests {
                     column_type: ValueType::I64,
                     nullable: false,
                 }],
+                column_substitution: None,
                 columns,
             },
         ];
