@@ -75,6 +75,10 @@ pub fn migrate_from_with_tracking_table(
     migrate_connection(&conn, migrations_dir, tracking_table)
 }
 
+pub fn versions_from(migrations_dir: impl AsRef<Path>) -> Result<Vec<String>, MigrationError> {
+    sql_files::read_versions(migrations_dir.as_ref(), FilenameStyle::Numbered).map_err(map_error)
+}
+
 pub fn migrate_connection(
     conn: &Connection,
     migrations_dir: impl AsRef<Path>,

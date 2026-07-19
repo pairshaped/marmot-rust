@@ -263,6 +263,39 @@ cargo run -- generate \
   --check
 ```
 
+### Database validation
+
+Validate a configured database without changing it:
+
+```sh
+marmot validate
+```
+
+Routine validation runs SQLite `quick_check`, checks foreign keys, audits
+Marmot-owned views, and compares the migration tracking table with configured
+migration files. Use the full SQLite integrity check for restore drills and
+scheduled maintenance:
+
+```sh
+marmot validate --full
+```
+
+The report also identifies the bundled SQLite version, compile options, and
+whether planner statistics exist. Planner statistics are informational because
+some healthy databases have not needed `ANALYZE`.
+
+Automation can request the stable versioned JSON shape:
+
+```sh
+marmot validate --json
+```
+
+The top-level object contains `format_version` and `databases`. Each database
+contains its path, required checks, and SQLite runtime information. A failed or
+incomplete required check returns a non-zero exit status in both output modes.
+Validation opens the database read-only and does not checkpoint WAL, repair
+data, reconcile views, create statistics, or apply migrations.
+
 ### Declarative views
 
 Put reusable, permanent SQLite views in `src/db_views`. Each view has one file,

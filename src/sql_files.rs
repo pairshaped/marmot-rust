@@ -103,6 +103,14 @@ fn read_sql_files(
         .collect::<Result<Vec<_>, _>>()
 }
 
+pub(crate) fn read_versions(
+    directory: &Path,
+    filename_style: FilenameStyle,
+) -> Result<Vec<String>, SqlFilesError> {
+    read_sql_files(directory, filename_style)
+        .map(|files| files.into_iter().map(|file| file.version).collect())
+}
+
 fn validate_directory(directory: &Path) -> Result<(), SqlFilesError> {
     match fs::metadata(directory) {
         Ok(metadata) if metadata.is_dir() => Ok(()),

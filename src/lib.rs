@@ -11,6 +11,7 @@ pub mod seeds;
 mod sql_files;
 pub mod sql_text;
 pub mod sqlite;
+pub mod validation;
 pub mod views;
 
 pub use analyzer::{analyze_project, analyze_project_with_init_sql};

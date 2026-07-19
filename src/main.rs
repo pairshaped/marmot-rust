@@ -7,7 +7,9 @@ use marmot::{
     config::{ConfigError, DatabaseReference},
     emit_project, migrations,
     model::{Project, ValueType},
-    reset, schema, seeds, views,
+    reset, schema, seeds,
+    validation::{self, IntegrityMode, ValidationConfig, ValidationOutput},
+    views,
 };
 
 #[derive(Debug, Parser)]
@@ -33,6 +35,7 @@ enum Command {
     Reset(ResetArgs),
     DumpSchema(DumpSchemaArgs),
     AuditViews(AuditViewsArgs),
+    Validate(ValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -162,6 +165,30 @@ struct AuditViewsArgs {
 
     #[arg(long)]
     deny_warnings: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ValidateArgs {
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    #[arg(long)]
+    database_name: Option<String>,
+
+    #[arg(long)]
+    migrations_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    source_root: Option<PathBuf>,
+
+    #[arg(long)]
+    migration_table: Option<String>,
+
+    #[arg(long)]
+    full: bool,
+
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() {
@@ -346,8 +373,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Wrote {}", output.display());
             }
         }
+        Command::Validate(args) => {
+            let targets = database_targets(args.database, args.database_name, &file_config)?;
+            let mut reports = Vec::new();
+            for target in targets {
+                let source_root =
+                    resolved_source_root(&target, args.source_root.as_ref(), &file_config);
+                let migrations_dir = args
+                    .migrations_dir
+                    .clone()
+                    .or(target.migrations_dir.clone())
+                    .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR));
+                let migration_table =
+                    resolved_migration_table(&args.migration_table, &target).to_string();
+                reports.push(validation::validate(&ValidationConfig {
+                    database: target.database,
+                    source_root,
+                    migrations_dir,
+                    migration_table,
+                    integrity_mode: if args.full {
+                        IntegrityMode::Full
+                    } else {
+                        IntegrityMode::Quick
+                    },
+                })?);
+            }
+            let output = ValidationOutput {
+                format_version: 1,
+                databases: reports,
+            };
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                print_validation_output(&output);
+            }
+            if !output.passed() {
+                return Err(std::io::Error::other("database validation failed").into());
+            }
+        }
     }
     Ok(())
+}
+
+fn print_validation_output(output: &ValidationOutput) {
+    for report in &output.databases {
+        println!("Database: {}", report.database);
+        for check in &report.checks {
+            let status = if check.status == validation::CheckStatus::Passed {
+                "passed"
+            } else {
+                "failed"
+            };
+            println!("  {}: {status}", check.name);
+            for detail in &check.details {
+                println!("    {detail}");
+            }
+        }
+        println!("  SQLite: {}", report.runtime.sqlite_version);
+        println!(
+            "  Planner statistics: {} ({} rows)",
+            if report.runtime.planner_statistics.present {
+                "present"
+            } else {
+                "absent"
+            },
+            report.runtime.planner_statistics.rows
+        );
+        println!(
+            "  Compile options: {}",
+            report.runtime.compile_options.join(", ")
+        );
+    }
 }
 
 fn resolved_migration_table<'a>(cli: &'a Option<String>, target: &'a DatabaseTarget) -> &'a str {
