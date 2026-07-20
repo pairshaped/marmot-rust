@@ -118,11 +118,12 @@ pub fn reset_with_views_bootstrap_and_seeds_from(
         tracking_table,
     )?;
     let audit = views::reconcile_database(database_path, source_root.as_ref())?;
-    let mut applied_seeds = Vec::new();
+    let mut seed_directories = Vec::new();
     if let Some(bootstrap_dir) = bootstrap_dir {
-        applied_seeds.extend(seeds::seed_from(database_path, bootstrap_dir)?);
+        seed_directories.push(bootstrap_dir.as_ref().to_path_buf());
     }
-    applied_seeds.extend(seeds::seed_from(database_path, seeds_dir)?);
+    seed_directories.push(seeds_dir.as_ref().to_path_buf());
+    let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
     Ok((applied_migrations, applied_seeds, audit))
 }
 

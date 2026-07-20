@@ -37,7 +37,7 @@ pub enum SqlFilesError {
 }
 
 #[derive(Debug, Clone)]
-struct SqlFile {
+pub(crate) struct SqlFile {
     path: PathBuf,
     version: String,
 }
@@ -54,7 +54,7 @@ pub(crate) fn run_connection(
     tracking_table: Option<&str>,
     filename_style: FilenameStyle,
 ) -> Result<Vec<String>, SqlFilesError> {
-    let files = read_sql_files(directory, filename_style)?;
+    let files = discover_files(directory, filename_style)?;
 
     if let Some(table_name) = tracking_table {
         ensure_tracking_table(conn, table_name)?;
@@ -69,7 +69,7 @@ pub(crate) fn run_connection(
     }
 }
 
-fn read_sql_files(
+pub(crate) fn discover_files(
     directory: &Path,
     filename_style: FilenameStyle,
 ) -> Result<Vec<SqlFile>, SqlFilesError> {
@@ -107,7 +107,7 @@ pub(crate) fn read_versions(
     directory: &Path,
     filename_style: FilenameStyle,
 ) -> Result<Vec<String>, SqlFilesError> {
-    read_sql_files(directory, filename_style)
+    discover_files(directory, filename_style)
         .map(|files| files.into_iter().map(|file| file.version).collect())
 }
 
@@ -221,7 +221,42 @@ fn apply_files(
     Ok(applied)
 }
 
+pub(crate) fn apply_files_in_current_transaction(
+    conn: &Connection,
+    files: Vec<SqlFile>,
+) -> Result<Vec<String>, SqlFilesError> {
+    let mut applied = Vec::new();
+    for file in files {
+        execute_file(conn, None, &file)?;
+        applied.push(file.version);
+    }
+    Ok(applied)
+}
+
 fn apply_file(
+    conn: &Connection,
+    tracking_table: Option<&str>,
+    file: &SqlFile,
+) -> Result<(), SqlFilesError> {
+    conn.execute_batch("begin")
+        .map_err(|source| SqlFilesError::SqlError {
+            path: file.path.clone(),
+            source,
+        })?;
+
+    if let Err(error) = execute_file(conn, tracking_table, file) {
+        let _ = conn.execute_batch("rollback");
+        return Err(error);
+    }
+
+    conn.execute_batch("commit")
+        .map_err(|source| SqlFilesError::SqlError {
+            path: file.path.clone(),
+            source,
+        })
+}
+
+fn execute_file(
     conn: &Connection,
     tracking_table: Option<&str>,
     file: &SqlFile,
@@ -231,36 +266,22 @@ fn apply_file(
         source,
     })?;
 
-    conn.execute_batch("begin")
+    conn.execute_batch(&sql)
         .map_err(|source| SqlFilesError::SqlError {
             path: file.path.clone(),
             source,
         })?;
 
-    if let Err(source) = conn.execute_batch(&sql) {
-        let _ = conn.execute_batch("rollback");
-        return Err(SqlFilesError::SqlError {
-            path: file.path.clone(),
-            source,
-        });
-    }
-
-    if let Some(table_name) = tracking_table
-        && let Err(source) = conn.execute(
+    if let Some(table_name) = tracking_table {
+        conn.execute(
             &format!("insert into {table_name} (version, applied_at) values (?1, datetime('now'))"),
             [&file.version],
         )
-    {
-        let _ = conn.execute_batch("rollback");
-        return Err(SqlFilesError::SqlError {
-            path: file.path.clone(),
-            source,
-        });
-    }
-
-    conn.execute_batch("commit")
         .map_err(|source| SqlFilesError::SqlError {
             path: file.path.clone(),
             source,
-        })
+        })?;
+    }
+
+    Ok(())
 }

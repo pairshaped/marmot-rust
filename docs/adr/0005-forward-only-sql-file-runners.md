@@ -39,9 +39,12 @@ skipped. Failed migrations are rolled back and are not recorded.
 
 Seed filenames use lowercase letters, digits, and underscores with no required
 numeric prefix. Seeds run in lexical filename order every time. Marmot disables
-foreign-key enforcement while loading the complete ordered seed set, then runs
-`PRAGMA foreign_key_check` and fails on any violation. Marmot does not create a
-seed tracking table.
+foreign-key enforcement while loading the complete ordered seed set in one
+transaction, then runs `PRAGMA foreign_key_check` before committing. A failure
+in any file or directory, or any reported foreign-key violation, rolls back the
+complete set. Marmot restores the caller's original foreign-key enforcement
+setting on both success and failure. Marmot does not create a seed tracking
+table.
 
 Reset deletes the configured SQLite database file and companion SQLite files
 (`-wal`, `-shm`, and `-journal`), then runs migrations, reconciles declarative

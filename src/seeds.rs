@@ -46,6 +46,14 @@ pub enum SeedError {
 
     #[error("seed data violates foreign keys:\n{violations}")]
     ForeignKeyViolations { violations: String },
+
+    #[error(
+        "{seed_error}\nalso failed to restore the caller's foreign-key setting: {restore_error}"
+    )]
+    ForeignKeyRestoreError {
+        seed_error: Box<SeedError>,
+        restore_error: rusqlite::Error,
+    },
 }
 
 pub fn seed(database_path: impl AsRef<Path>) -> Result<Vec<String>, SeedError> {
@@ -97,33 +105,66 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(|source| SeedError::SeedSqlError {
-            path: PathBuf::from("foreign_keys"),
-            source,
-        })?;
-
-    let mut applied = Vec::new();
+    let mut files = Vec::new();
     for directory in seed_directories {
-        applied.extend(
-            sql_files::run_connection(conn, directory.as_ref(), None, FilenameStyle::Named)
+        files.extend(
+            sql_files::discover_files(directory.as_ref(), FilenameStyle::Named)
                 .map_err(map_error)?,
         );
     }
 
-    let violations = foreign_key_violations(conn)?;
-    conn.pragma_update(None, "foreign_keys", "ON")
+    let foreign_keys_enabled = conn
+        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
         .map_err(|source| SeedError::SeedSqlError {
             path: PathBuf::from("foreign_keys"),
             source,
         })?;
-    if violations.is_empty() {
-        Ok(applied)
-    } else {
-        Err(SeedError::ForeignKeyViolations {
-            violations: violations.join("\n"),
-        })
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("foreign_keys"),
+            source,
+        })?;
+
+    let result = seed_files(conn, files);
+    match conn.pragma_update(None, "foreign_keys", foreign_keys_enabled) {
+        Ok(()) => result,
+        Err(restore_error) => match result {
+            Ok(_) => Err(SeedError::SeedSqlError {
+                path: PathBuf::from("foreign_keys"),
+                source: restore_error,
+            }),
+            Err(seed_error) => Err(SeedError::ForeignKeyRestoreError {
+                seed_error: Box::new(seed_error),
+                restore_error,
+            }),
+        },
     }
+}
+
+fn seed_files(conn: &Connection, files: Vec<sql_files::SqlFile>) -> Result<Vec<String>, SeedError> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("seed transaction"),
+            source,
+        })?;
+
+    let applied =
+        sql_files::apply_files_in_current_transaction(&transaction, files).map_err(map_error)?;
+    let violations = foreign_key_violations(&transaction)?;
+    if !violations.is_empty() {
+        return Err(SeedError::ForeignKeyViolations {
+            violations: violations.join("\n"),
+        });
+    }
+
+    transaction
+        .commit()
+        .map_err(|source| SeedError::SeedSqlError {
+            path: PathBuf::from("seed transaction"),
+            source,
+        })?;
+    Ok(applied)
 }
 
 fn foreign_key_violations(conn: &Connection) -> Result<Vec<String>, SeedError> {
@@ -135,10 +176,13 @@ fn foreign_key_violations(conn: &Connection) -> Result<Vec<String>, SeedError> {
             })?;
     let rows = statement
         .query_map([], |row| {
+            let rowid = row
+                .get::<_, Option<i64>>(1)?
+                .map_or_else(|| "NULL".to_string(), |rowid| rowid.to_string());
             Ok(format!(
                 "{} rowid {} references {}({})",
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
+                rowid,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?
             ))
@@ -254,6 +298,204 @@ mod tests {
 
         assert!(error.contains("seed data violates foreign keys"));
         assert!(error.contains("children rowid 1 references parents"));
+
+        let conn = Connection::open(&database).unwrap();
+        assert_eq!(table_count(&conn, "children"), 1);
+        assert_eq!(
+            conn.query_row("select count(*) from children", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn rolls_back_earlier_seed_files_when_a_later_file_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            seeds_dir.join("001_add_lucy.sql"),
+            "insert into users (id, name) values (1, 'Lucy')",
+        )
+        .unwrap();
+        fs::write(
+            seeds_dir.join("002_invalid.sql"),
+            "insert into missing_table (id) values (1)",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "create table users (id integer primary key, name text not null)",
+            [],
+        )
+        .unwrap();
+
+        let error = seed_connection(&conn, &seeds_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SeedError::SeedSqlError { path, .. }
+                if path == seeds_dir.join("002_invalid.sql")
+        ));
+        assert_eq!(user_count(&conn), 0);
+    }
+
+    #[test]
+    fn rolls_back_earlier_seed_directories_when_a_later_directory_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap_dir = temp.path().join("db/bootstrap");
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&bootstrap_dir).unwrap();
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            bootstrap_dir.join("users.sql"),
+            "insert into users (id, name) values (1, 'Lucy')",
+        )
+        .unwrap();
+        fs::write(
+            seeds_dir.join("invalid.sql"),
+            "insert into missing_table (id) values (1)",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "create table users (id integer primary key, name text not null)",
+            [],
+        )
+        .unwrap();
+
+        let error = seed_directories_connection(&conn, [&bootstrap_dir, &seeds_dir]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SeedError::SeedSqlError { path, .. }
+                if path == seeds_dir.join("invalid.sql")
+        ));
+        assert_eq!(user_count(&conn), 0);
+    }
+
+    #[test]
+    fn restores_enabled_foreign_keys_after_seed_discovery_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("missing");
+        let conn = Connection::open_in_memory().unwrap();
+        set_foreign_keys(&conn, true);
+
+        assert!(matches!(
+            seed_connection(&conn, &seeds_dir),
+            Err(SeedError::MissingSeedDirectory { path }) if path == seeds_dir
+        ));
+        assert!(foreign_keys_enabled(&conn));
+    }
+
+    #[test]
+    fn restores_enabled_foreign_keys_after_seed_sql_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            seeds_dir.join("invalid.sql"),
+            "insert into missing_table (id) values (1)",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_foreign_keys(&conn, true);
+
+        assert!(matches!(
+            seed_connection(&conn, &seeds_dir),
+            Err(SeedError::SeedSqlError { .. })
+        ));
+        assert!(foreign_keys_enabled(&conn));
+    }
+
+    #[test]
+    fn preserves_disabled_foreign_keys_after_successful_seeding() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(seeds_dir.join("valid.sql"), "select 1").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_foreign_keys(&conn, false);
+        assert!(!foreign_keys_enabled(&conn));
+
+        seed_connection(&conn, &seeds_dir).unwrap();
+
+        assert!(!foreign_keys_enabled(&conn));
+    }
+
+    #[test]
+    fn preserves_disabled_foreign_keys_after_seed_sql_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            seeds_dir.join("invalid.sql"),
+            "insert into missing_table (id) values (1)",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_foreign_keys(&conn, false);
+
+        assert!(matches!(
+            seed_connection(&conn, &seeds_dir),
+            Err(SeedError::SeedSqlError { .. })
+        ));
+        assert!(!foreign_keys_enabled(&conn));
+    }
+
+    #[test]
+    fn restores_foreign_keys_after_a_seed_transaction_cannot_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(seeds_dir.join("valid.sql"), "select 1").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        set_foreign_keys(&conn, true);
+        conn.execute_batch("begin").unwrap();
+
+        let error = seed_connection(&conn, &seeds_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SeedError::SeedSqlError { path, .. }
+                if path == Path::new("seed transaction")
+        ));
+        assert!(foreign_keys_enabled(&conn));
+        conn.execute_batch("rollback").unwrap();
+    }
+
+    #[test]
+    fn reports_foreign_key_violations_for_without_rowid_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            seeds_dir.join("invalid.sql"),
+            "insert into children (id, parent_id) values (1, 99)",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table parents (id integer primary key);
+             create table children (
+               id integer primary key,
+               parent_id integer not null references parents(id)
+             ) without rowid;",
+        )
+        .unwrap();
+        set_foreign_keys(&conn, true);
+
+        let error = seed_connection(&conn, &seeds_dir).unwrap_err().to_string();
+
+        assert!(error.contains("children rowid NULL references parents(0)"));
+        assert_eq!(
+            conn.query_row("select count(*) from children", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(foreign_keys_enabled(&conn));
     }
 
     #[test]
@@ -395,5 +637,14 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn set_foreign_keys(conn: &Connection, enabled: bool) {
+        conn.pragma_update(None, "foreign_keys", enabled).unwrap();
+    }
+
+    fn foreign_keys_enabled(conn: &Connection) -> bool {
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap()
     }
 }
