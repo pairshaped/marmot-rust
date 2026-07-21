@@ -3,6 +3,7 @@ pub mod config;
 pub mod discovery;
 pub mod emit;
 pub mod error;
+pub mod maintenance;
 pub mod migrations;
 pub mod model;
 pub mod reset;

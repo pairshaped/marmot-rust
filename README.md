@@ -46,7 +46,7 @@ It currently:
 - emits typed direct `rusqlite` functions using `prepare_cached`
 - requires immutable connections for reads and stronger mutation-capable connections for writes
 - lowers source-level SQL parameters to dense positional binds in generated Rust
-- runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`
+- runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`, with bounded planner-statistics optimization after schema-changing workflows
 - owns declarative SQLite views under `src/db_views` and reconciles them after migrations
 - supports named database references for multi-database projects
 - can enforce configured temporal suffixes and generate checked Rust date/datetime boundary types for those columns
