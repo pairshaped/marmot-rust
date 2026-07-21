@@ -1959,7 +1959,9 @@ seeds_dir = "db/seeds/curling"
 
 fn table_names(conn: &Connection) -> Vec<String> {
     let mut stmt = conn
-        .prepare("select name from sqlite_master where type = 'table' order by name")
+        .prepare(
+            "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' order by name",
+        )
         .unwrap();
     stmt.query_map([], |row| row.get::<_, String>(0))
         .unwrap()

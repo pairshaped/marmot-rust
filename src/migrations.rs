@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use crate::maintenance::{self, OptimizeScope};
 use crate::sql_files::{self, FilenameStyle, SqlFilesError};
 
 pub const MIGRATION_DIR: &str = "db/migrations";
@@ -48,6 +49,12 @@ pub enum MigrationError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+
+    #[error("could not optimize SQLite planner statistics after migrations in {path}: {source}")]
+    OptimizationError {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
 }
 
 pub fn migrate(database_path: impl AsRef<Path>) -> Result<Vec<String>, MigrationError> {
@@ -90,13 +97,22 @@ pub fn migrate_connection(
             path: migrations_dir.as_ref().to_path_buf(),
             source,
         })?;
-    sql_files::run_connection(
+    let applied = sql_files::run_connection(
         conn,
         migrations_dir.as_ref(),
         Some(tracking_table),
         FilenameStyle::Numbered,
     )
-    .map_err(map_error)
+    .map_err(map_error)?;
+    if !applied.is_empty() {
+        maintenance::optimize(conn, OptimizeScope::SchemaChange).map_err(|source| {
+            MigrationError::OptimizationError {
+                path: migrations_dir.as_ref().to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(applied)
 }
 
 fn validate_tracking_table(name: &str) -> Result<(), MigrationError> {
@@ -202,6 +218,36 @@ mod tests {
 
         let conn = Connection::open(&database).unwrap();
         assert_eq!(applied_versions(&conn), ["001_create_users"]);
+    }
+
+    #[test]
+    fn successful_migrations_optimize_planner_statistics() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations_dir = temp.path().join("db/migrations");
+        let database = temp.path().join("app.db");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::write(
+            migrations_dir.join("001_create_teams.sql"),
+            "create table teams (id integer primary key, name text not null);\
+             create index teams_name on teams(name);\
+             with recursive numbers(value) as (\
+               select 1 union all select value + 1 from numbers where value < 1000\
+             )\
+             insert into teams(name) select printf('team-%04d', value) from numbers",
+        )
+        .unwrap();
+
+        migrate_from(&database, &migrations_dir).unwrap();
+
+        let conn = Connection::open(&database).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_stat1 where tbl = 'teams'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rows > 0);
     }
 
     #[test]

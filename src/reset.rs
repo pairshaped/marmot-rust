@@ -1,7 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{migrations, seeds, views};
+use rusqlite::Connection;
+
+use crate::{
+    maintenance::{self, OptimizeScope},
+    migrations, seeds, views,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResetError {
@@ -22,6 +27,12 @@ pub enum ResetError {
 
     #[error(transparent)]
     ViewError(#[from] views::ViewError),
+
+    #[error("could not optimize SQLite planner statistics after reset of {path}: {source}")]
+    OptimizationError {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
 }
 
 pub fn reset(database_path: impl AsRef<Path>) -> Result<(Vec<String>, Vec<String>), ResetError> {
@@ -61,6 +72,7 @@ where
         tracking_table,
     )?;
     let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
+    optimize_reset_database(database_path)?;
     Ok((applied_migrations, applied_seeds))
 }
 
@@ -99,6 +111,7 @@ where
     )?;
     let audit = views::reconcile_database(database_path, source_root.as_ref())?;
     let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
+    optimize_reset_database(database_path)?;
     Ok((applied_migrations, applied_seeds, audit))
 }
 
@@ -124,7 +137,22 @@ pub fn reset_with_views_bootstrap_and_seeds_from(
     }
     seed_directories.push(seeds_dir.as_ref().to_path_buf());
     let applied_seeds = seeds::seed_directories_from(database_path, seed_directories)?;
+    optimize_reset_database(database_path)?;
     Ok((applied_migrations, applied_seeds, audit))
+}
+
+fn optimize_reset_database(database_path: &Path) -> Result<(), ResetError> {
+    let conn = Connection::open(database_path).map_err(|source| ResetError::OptimizationError {
+        path: database_path.to_path_buf(),
+        source,
+    })?;
+    maintenance::optimize(&conn, OptimizeScope::SchemaChange).map_err(|source| {
+        ResetError::OptimizationError {
+            path: database_path.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(())
 }
 
 fn drop_database(database_path: &Path) -> Result<(), ResetError> {
@@ -230,9 +258,47 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn reset_optimizes_after_loading_seed_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("app.db");
+        let migrations_dir = temp.path().join("db/migrations");
+        let seeds_dir = temp.path().join("db/seeds");
+        fs::create_dir_all(&migrations_dir).unwrap();
+        fs::create_dir_all(&seeds_dir).unwrap();
+        fs::write(
+            migrations_dir.join("001_create_users.sql"),
+            "create table users (id integer primary key, name text not null);\
+             create index users_name on users(name)",
+        )
+        .unwrap();
+        fs::write(
+            seeds_dir.join("001_add_users.sql"),
+            "with recursive numbers(value) as (\
+               select 1 union all select value + 1 from numbers where value < 1000\
+             )\
+             insert into users(name) select printf('user-%04d', value) from numbers",
+        )
+        .unwrap();
+
+        reset_from(&database, &migrations_dir, &seeds_dir).unwrap();
+
+        let conn = Connection::open(&database).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_stat1 where tbl = 'users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rows > 0);
+    }
+
     fn table_names(conn: &Connection) -> Vec<String> {
         let mut stmt = conn
-            .prepare("select name from sqlite_master where type = 'table' order by name")
+            .prepare(
+                "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' order by name",
+            )
             .unwrap();
         stmt.query_map([], |row| row.get::<_, String>(0))
             .unwrap()
