@@ -995,6 +995,12 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     );
     write_sql_file(
         &module_dir,
+        "insert_user.sql",
+        "insert into users (name, active, avatar, score, nickname) \
+         values (@name, @active, @avatar, @score, @nickname)",
+    );
+    write_sql_file(
+        &module_dir,
         "list_active_users.sql",
         "select id, name, active, avatar, score, nickname \
          from users where active = @active order by id",
@@ -1460,6 +1466,35 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(app::count_users_one(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn generated_batch_mutations_prepare_once_inside_the_callers_transaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        let rows = [
+            app::InsertUserParams {
+                name: "alice",
+                active: true,
+                avatar: &[1],
+                score: 1.0,
+                nickname: None,
+            },
+            app::InsertUserParams {
+                name: "bob",
+                active: false,
+                avatar: &[2],
+                score: 2.0,
+                nickname: Some("bobby"),
+            },
+        ];
+        assert_eq!(app::insert_user_batch(&tx, &rows).unwrap(), 2);
+        assert_eq!(app::count_users_one(&tx).unwrap(), 2);
+        tx.rollback().unwrap();
+
+        assert_eq!(app::count_users_one(&conn).unwrap(), 0);
     }
 
     #[test]
