@@ -614,7 +614,17 @@ fn generated_function_names_for(query: &Query) -> Vec<String> {
     if matches!(query.return_type, ReturnType::Rows) && query.columns.len() == 1 {
         names.push(format!("{}_one", query.name));
     }
+    if supports_batch_helper(query) {
+        names.push(format!("{}_batch", query.name));
+    }
     names
+}
+
+fn supports_batch_helper(query: &Query) -> bool {
+    matches!(query.return_type, ReturnType::Execute)
+        && matches!(query.connection_access, ConnectionAccess::Mutation)
+        && !query.parameters.is_empty()
+        && query.column_substitution.is_none()
 }
 
 fn render_import_macros(queries: &[&Query]) -> String {
@@ -807,7 +817,7 @@ fn render_execute(
 ) -> String {
     let params = render_params(query);
     let bindings = render_bindings(query, lowered);
-    format!(
+    let mut output = format!(
         "pub fn {name}({connection_param}{params}) -> Result<usize> {{\n\
              {connection_binding}\
              {sql_selection}\
@@ -816,7 +826,24 @@ fn render_execute(
         name = query.name,
         connection_param = render_connection_param(query),
         connection_binding = render_connection_binding(query),
-    )
+    );
+    if supports_batch_helper(query) {
+        let params_type = parameter_struct_usage(query);
+        output.push_str(&format!(
+            "\n\
+             pub fn {name}_batch(conn: impl MutationConnection, params: &[{params_type}]) -> Result<usize> {{\n\
+                 let conn = conn.as_connection();\n\
+                 let mut stmt = conn.prepare_cached({sql_expression})?;\n\
+                 let mut changed = 0;\n\
+                 for params in params {{\n\
+                     changed += stmt.execute({bindings})?;\n\
+                 }}\n\
+                 Ok(changed)\n\
+             }}\n",
+            name = query.name,
+        ));
+    }
+    output
 }
 
 fn render_connection_param(query: &Query) -> &'static str {
@@ -1462,6 +1489,44 @@ mod tests {
         assert!(output.contains("pub bio: Option<&'a str>"));
         assert!(output.contains("pub id: i64"));
         assert!(!output.contains("impl rusqlite::ToSql"));
+    }
+
+    #[test]
+    fn renders_a_prepared_batch_helper_for_parameterized_mutations() {
+        let query = Query {
+            source_path: PathBuf::from("src/users/sql/insert.sql"),
+            module_name: "users".to_string(),
+            name: "insert_user".to_string(),
+            return_type: ReturnType::Execute,
+            connection_access: ConnectionAccess::Mutation,
+            sql: "insert into users (id, name) values (@id, @name)".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "id".to_string(),
+                    sql_names: vec!["@id".to_string()],
+                    column_type: ValueType::I64,
+                    nullable: false,
+                },
+                Parameter {
+                    name: "name".to_string(),
+                    sql_names: vec!["@name".to_string()],
+                    column_type: ValueType::String,
+                    nullable: false,
+                },
+            ],
+            column_substitution: None,
+            columns: vec![],
+        };
+
+        let output = render_query(&query);
+
+        assert!(output.contains(
+            "pub fn insert_user_batch(conn: impl MutationConnection, params: &[InsertUserParams<'_>])"
+        ));
+        assert!(output.contains("let mut stmt = conn.prepare_cached(INSERT_USER_SQL)?;"));
+        assert!(output.contains("for params in params"));
+        assert!(output.contains("changed += stmt.execute(params![params.id, params.name])?;"));
+        assert!(output.contains("Ok(changed)"));
     }
 
     #[test]
