@@ -2685,11 +2685,7 @@ fn result_columns(
             path: path.to_path_buf(),
             source,
         })?;
-    let connection_access = if stmt.readonly() {
-        ConnectionAccess::Read
-    } else {
-        ConnectionAccess::Mutation
-    };
+    let connection_access = statement_connection_access(sql, stmt.readonly());
     let mut seen = BTreeSet::new();
     let mut duplicate_names = BTreeSet::new();
     let mut seen_field_names = BTreeSet::new();
@@ -2768,6 +2764,23 @@ fn result_columns(
     }
 
     Ok((columns, connection_access))
+}
+
+fn statement_connection_access(sql: &str, sqlite_readonly: bool) -> ConnectionAccess {
+    let tokens = tokenize(sql);
+    let pragma_optimize = matches!(
+        (tokens.first(), tokens.get(1), tokens.get(2)),
+        (
+            Some(Token::Word(pragma)),
+            Some(Token::Word(optimize)),
+            None | Some(Token::Semicolon | Token::OpenParen | Token::Eq),
+        ) if pragma.eq_ignore_ascii_case("pragma") && optimize.eq_ignore_ascii_case("optimize")
+    );
+    if pragma_optimize || !sqlite_readonly {
+        ConnectionAccess::Mutation
+    } else {
+        ConnectionAccess::Read
+    }
 }
 
 fn outer_join_nullable_tables(sql: &str) -> BTreeSet<String> {
@@ -3991,6 +4004,22 @@ mod tests {
         .unwrap();
 
         project.queries[0].parameters.clone()
+    }
+
+    #[test]
+    fn pragma_optimize_is_a_mutation_even_when_sqlite_reports_it_readonly() {
+        assert_eq!(
+            statement_connection_access("PRAGMA optimize", true),
+            ConnectionAccess::Mutation
+        );
+        assert_eq!(
+            statement_connection_access("pragma optimize(0xffff)", true),
+            ConnectionAccess::Mutation
+        );
+        assert_eq!(
+            statement_connection_access("PRAGMA optimize=0x10002", true),
+            ConnectionAccess::Mutation
+        );
     }
 
     #[test]
