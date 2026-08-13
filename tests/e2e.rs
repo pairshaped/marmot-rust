@@ -358,7 +358,7 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
 
     write_temporal_runtime_crate(dir.path());
 
-    let output = Command::new("cargo")
+    let output = isolated_cargo()
         .arg("test")
         .current_dir(dir.path().join("runtime"))
         .output()
@@ -1145,7 +1145,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
 
     write_runtime_crate(dir.path());
 
-    let output = Command::new("cargo")
+    let output = isolated_cargo()
         .arg("test")
         .current_dir(dir.path().join("runtime"))
         .output()
@@ -1173,7 +1173,7 @@ fn main() {
 "#,
     )
     .unwrap();
-    let output = Command::new("cargo")
+    let output = isolated_cargo()
         .args(["check", "--bin", "immutable_mutation"])
         .current_dir(dir.path().join("runtime"))
         .output()
@@ -1184,6 +1184,21 @@ fn main() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("MutationConnection"), "{stderr}");
+}
+
+fn isolated_cargo() -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    for variable in [
+        "CARGO_BUILD_BUILD_DIR",
+        "CARGO_TARGET_DIR",
+        "RUSTC_WRAPPER",
+        "SPORTS_CARGO_RUSTC_WRAPPER",
+        "SPORTS_SHARED_BUILD_DIR",
+        "SPORTS_WORKTREE_TARGET_DIR",
+    ] {
+        command.env_remove(variable);
+    }
+    command
 }
 
 fn create_runtime_schema(conn: &Connection) {
