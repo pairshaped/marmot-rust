@@ -1,4 +1,4 @@
-# 0004. Async Applications Use a Blocking Database Boundary
+# 0005. Async Applications Use a Blocking Database Boundary
 
 ## Status
 

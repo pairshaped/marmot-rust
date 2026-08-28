@@ -1,5 +1,9 @@
 # Marmot Rust SQLite Benchmark Report
 
+This is dated benchmark evidence for the direct-rusqlite decision. Hardware,
+dependencies, and workloads can change, so rerun the benchmark before using
+these numbers as a current performance claim.
+
 ## Summary
 
 This benchmark compares Marmot-generated Rust `rusqlite` calls against a few

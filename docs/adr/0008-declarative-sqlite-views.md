@@ -1,4 +1,4 @@
-# 0007. Treat SQLite Views as Declarative Database Code
+# 0008. Treat SQLite Views as Declarative Database Code
 
 ## Status
 
