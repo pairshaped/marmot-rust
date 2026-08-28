@@ -9,7 +9,11 @@ use crate::error::{Error, Result};
 use crate::model::{ConnectionAccess, Parameter, Project, Query, ReturnType, ValueType};
 use crate::sqlite::tokenize::{Token, tokenize_spans};
 
-pub fn emit(config: &Config, project: &Project) -> Result<()> {
+pub fn emit(
+    config: &Config,
+    project: &Project,
+    serialize_modules: &BTreeSet<String>,
+) -> Result<()> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
     for query in &project.queries {
         by_module.entry(&query.module_name).or_default().push(query);
@@ -34,7 +38,10 @@ pub fn emit(config: &Config, project: &Project) -> Result<()> {
                 source,
             })?;
         }
-        let content = render_module(module, queries)?;
+        let mut content = render_module(module, queries)?;
+        if serialize_modules.contains(module) {
+            content = add_serialize_to_row_structs(content);
+        }
         if config.check {
             ensure_file_current(&path, &content)?;
             continue;
@@ -50,6 +57,13 @@ pub fn emit(config: &Config, project: &Project) -> Result<()> {
     }
 
     emit_mod_rs(&config.output, modules, include_temporal, config.check)
+}
+
+fn add_serialize_to_row_structs(content: String) -> String {
+    content.replace(
+        "#[derive(Debug, Clone, PartialEq)]\npub struct ",
+        "#[derive(Debug, Clone, PartialEq, serde::Serialize)]\npub struct ",
+    )
 }
 
 fn generated_module_path(output: &Path, module: &str) -> PathBuf {
@@ -1152,6 +1166,19 @@ fn raw_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialize_opt_in_changes_generated_row_structs_only() {
+        let content = "#[derive(Debug)]\npub struct Params {}\n\
+                       #[derive(Debug, Clone, PartialEq)]\npub struct Row {}\n";
+
+        let output = add_serialize_to_row_structs(content.to_string());
+
+        assert!(output.contains("#[derive(Debug)]\npub struct Params"));
+        assert!(
+            output.contains("#[derive(Debug, Clone, PartialEq, serde::Serialize)]\npub struct Row")
+        );
+    }
     use crate::model::{
         Column, ColumnChoice, ColumnSubstitution, ConnectionAccess, Parameter, Query, ValueType,
     };
@@ -1775,7 +1802,7 @@ mod tests {
         };
 
         assert!(matches!(
-            emit(&check_config, &project),
+            emit(&check_config, &project, &BTreeSet::new()),
             Err(Error::StaleGeneratedFile { .. })
         ));
 
@@ -1784,12 +1811,12 @@ mod tests {
             temporal: Default::default(),
             ..check_config.clone()
         };
-        emit(&write_config, &project).unwrap();
-        emit(&check_config, &project).unwrap();
+        emit(&write_config, &project, &BTreeSet::new()).unwrap();
+        emit(&check_config, &project, &BTreeSet::new()).unwrap();
 
         fs::write(output.join("users.rs"), "stale").unwrap();
         assert!(matches!(
-            emit(&check_config, &project),
+            emit(&check_config, &project, &BTreeSet::new()),
             Err(Error::StaleGeneratedFile { .. })
         ));
     }
@@ -1825,7 +1852,7 @@ mod tests {
         };
 
         assert!(matches!(
-            emit(&config, &project),
+            emit(&config, &project, &BTreeSet::new()),
             Err(Error::GeneratedTemporalModuleCollision)
         ));
     }

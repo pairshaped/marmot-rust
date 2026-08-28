@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,7 @@ pub struct FileConfig {
     pub migration_table: Option<String>,
     pub schema_output: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
+    pub serialize_modules: BTreeSet<String>,
     pub temporal: TemporalConfig,
 }
 
@@ -146,6 +147,11 @@ impl FileConfig {
             migration_table: toml_string(marmot, "migration_table"),
             schema_output: toml_path(marmot, "schema_output"),
             databases: toml_database_references(marmot)?,
+            serialize_modules: marmot
+                .and_then(|table| toml_string_array(table, "serialize_modules"))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             temporal: toml_temporal_config(marmot)?,
         })
     }
@@ -339,6 +345,22 @@ mod tests {
         assert_eq!(config.seeds_dir, Some(PathBuf::from("db/seeds/app")));
         assert_eq!(config.migration_table.as_deref(), Some("schema_versions"));
         assert_eq!(config.schema_output, Some(PathBuf::from("db/schema.sql")));
+    }
+
+    #[test]
+    fn parses_opt_in_serializable_modules() {
+        let config = FileConfig::from_toml_str(
+            r#"
+            [tools.marmot]
+            serialize_modules = ["contacts", "orders/history"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.serialize_modules,
+            BTreeSet::from(["contacts".to_string(), "orders/history".to_string()])
+        );
     }
 
     #[test]
