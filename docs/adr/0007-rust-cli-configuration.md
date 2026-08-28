@@ -1,4 +1,4 @@
-# 0006. Rust CLI Configuration
+# 0007. Rust CLI Configuration
 
 ## Status
 

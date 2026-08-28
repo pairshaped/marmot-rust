@@ -1,9 +1,12 @@
 # Marmot
 
-Experimental Rust port of Marmot.
+Marmot analyzes SQL against SQLite and generates typed Rust database code. It
+also owns the migration, seed, reset, schema-dump, and declarative-view tooling
+used by repository applications.
 
-See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for the Rust SQLite benchmark
-summary.
+The [architecture decision index](docs/adr/README.md) governs its design. The
+[Rust SQLite benchmark](docs/evidence/rusqlite-benchmark.md) is dated supporting
+evidence, not a current performance guarantee.
 
 The goal is to keep Marmot's source layout:
 
@@ -30,11 +33,13 @@ query model
         +-- Gleam / sqlight
 ```
 
-## Current Status
+## Public boundary
 
-This is an active Rust port, not a complete replacement for Gleam Marmot yet.
+Marmot's supported boundary is the CLI plus the public modules and re-exports
+in `src/lib.rs`. Applications provide SQL files, SQLite schema, and
+`marmot.toml`; generated Rust and schema dumps are derived output.
 
-It currently:
+Marmot:
 
 - finds module companion SQL files like `src/items.rs` plus `src/items.sql`
 - supports multiple `-- func:` blocks per companion SQL file
@@ -51,7 +56,17 @@ It currently:
 - supports named database references for multi-database projects
 - can enforce configured temporal suffixes and generate checked Rust date/datetime boundary types for those columns
 
-The remaining work is deeper SQL coverage and polish around diagnostics and edge-case inference.
+Unsupported SQL shapes fail analysis rather than silently generating an
+untyped runtime fallback.
+
+## Implementation navigation
+
+- `src/analyzer.rs`, `src/sqlite/`, and `src/model.rs` build the
+  language-neutral query model.
+- `src/emit/` generates target code.
+- `src/config.rs` and `src/main.rs` own configuration and the CLI.
+- `src/migrations.rs`, `src/seeds.rs`, `src/reset.rs`, `src/schema.rs`, and
+  `src/views.rs` own database lifecycle tooling.
 
 ### Declared types are semantic input
 
@@ -75,7 +90,7 @@ An unnamed 0/1 check remains an integer because that shape can represent an inde
 Inspect discovered queries:
 
 ```sh
-cargo run -- inspect --database path/to/app.db --source-root path/to/src
+bin/cargo run -p marmot -- inspect --database path/to/app.db --source-root path/to/src
 ```
 
 Project defaults can live in `marmot.toml`:
@@ -163,7 +178,7 @@ support it.
 Generate Rust files:
 
 ```sh
-cargo run -- generate \
+bin/cargo run -p marmot -- generate \
   --database path/to/app.db \
   --source-root path/to/src \
   --output path/to/src/generated/sql
@@ -256,7 +271,7 @@ module for that file.
 Check generated files without writing:
 
 ```sh
-cargo run -- generate \
+bin/cargo run -p marmot -- generate \
   --database path/to/app.db \
   --source-root path/to/src \
   --output path/to/src/generated/sql \
@@ -337,8 +352,8 @@ Removing a source file does not drop the installed view. Add an explicit
 forward migration with `DROP VIEW IF EXISTS`, then run the audit:
 
 ```sh
-cargo run -- audit-views --database path/to/app.db --source-root path/to/src
-cargo run -- audit-views --database path/to/app.db --source-root path/to/src --deny-warnings
+bin/cargo run -p marmot -- audit-views --database path/to/app.db --source-root path/to/src
+bin/cargo run -p marmot -- audit-views --database path/to/app.db --source-root path/to/src --deny-warnings
 ```
 
 The audit prints copyable migration SQL for database-only `view_*` objects. It
@@ -354,7 +369,7 @@ definition when an expression needs a stable generated type.
 Run migrations:
 
 ```sh
-cargo run -- migrate \
+bin/cargo run -p marmot -- migrate \
   --database path/to/app.db \
   --migrations-dir db/migrations
 ```
@@ -362,7 +377,7 @@ cargo run -- migrate \
 Run seeds:
 
 ```sh
-cargo run -- seed \
+bin/cargo run -p marmot -- seed \
   --database path/to/app.db \
   --seeds-dir db/seeds
 ```
@@ -370,7 +385,7 @@ cargo run -- seed \
 Production-safe bootstrap data is separate from development and test fixtures:
 
 ```sh
-cargo run -- bootstrap \
+bin/cargo run -p marmot -- bootstrap \
   --database path/to/app.db \
   --bootstrap-dir db/bootstrap
 ```
@@ -383,7 +398,7 @@ every file in lexical filename order.
 Reset a database, then run migrations and seeds:
 
 ```sh
-cargo run -- reset \
+bin/cargo run -p marmot -- reset \
   --database path/to/app.db \
   --migrations-dir db/migrations \
   --seeds-dir db/seeds
@@ -393,8 +408,8 @@ Write the database schema in deterministic object order, or verify that a
 committed dump is current:
 
 ```sh
-cargo run -- dump-schema --database path/to/app.db --output db/schema.sql
-cargo run -- dump-schema --database path/to/app.db --output db/schema.sql --check
+bin/cargo run -p marmot -- dump-schema --database path/to/app.db --output db/schema.sql
+bin/cargo run -p marmot -- dump-schema --database path/to/app.db --output db/schema.sql --check
 ```
 
 The dump contains schema only. It has no timestamps or migration data, so a
@@ -413,3 +428,9 @@ SQLx's SQLite analyzer is useful reference material for closing inference gaps. 
 - offline metadata shape
 
 Marmot should borrow ideas carefully, and only copy code when there is a clear reason and the license notice is preserved. SQLx should not be part of generated runtime code.
+
+## Source ownership
+
+This monorepo is Marmot's editable source of truth. A public repository may be
+derived with filtered history under the [repository export decision](../../docs/adr/0001-private-monorepo-and-public-library-exports.md),
+but changes come back through this directory.

@@ -1,4 +1,4 @@
-# 0003. Rust Output Targets rusqlite Directly
+# 0004. Rust Output Targets rusqlite Directly
 
 ## Status
 
