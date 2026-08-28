@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use marmot::{
     Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
     config::{ConfigError, DatabaseReference},
-    emit_project, migrations,
+    emit_project_with_serialize_modules, migrations,
     model::{Project, ValueType},
     reset, schema, seeds,
     validation::{self, IntegrityMode, ValidationConfig, ValidationOutput},
@@ -233,11 +233,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for target in configs {
                 let project =
                     analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
-                analyzed.push((target.config, project));
+                analyzed.push((target.config, project, target.serialize_modules));
             }
             ensure_generated_outputs_do_not_collide(&analyzed)?;
-            for (config, project) in analyzed {
-                emit_project(&config, &project)?;
+            for (config, project, serialize_modules) in analyzed {
+                emit_project_with_serialize_modules(&config, &project, &serialize_modules)?;
                 let definitions = views::discover(&config.source_root)?;
                 views::emit_generated_sql(&definitions, &config.output, config.check)?;
                 let audit = views::audit_database(&config.database, &config.source_root)?;
@@ -478,10 +478,10 @@ fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
 }
 
 fn ensure_generated_outputs_do_not_collide(
-    analyzed: &[(Config, Project)],
+    analyzed: &[(Config, Project, BTreeSet<String>)],
 ) -> Result<(), MarmotError> {
     let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
-    for (target_index, (config, project)) in analyzed.iter().enumerate() {
+    for (target_index, (config, project, _)) in analyzed.iter().enumerate() {
         for path in generated_output_paths(config, project) {
             by_path.entry(path).or_default().insert(target_index);
         }
@@ -546,6 +546,7 @@ fn generated_module_path(output: &Path, module: &str) -> PathBuf {
 struct AnalysisTarget {
     config: Config,
     init_sql: Option<PathBuf>,
+    serialize_modules: BTreeSet<String>,
 }
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, ConfigError> {
@@ -573,6 +574,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                     temporal: file_config.temporal.clone(),
                 },
                 init_sql: database_target.init_sql,
+                serialize_modules: file_config.serialize_modules.clone(),
             }
         })
         .collect())
