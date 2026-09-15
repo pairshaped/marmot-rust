@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use marmot::{
-    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
+    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql, builtin_themes,
     config::{ConfigError, DatabaseReference},
     emit_project_with_serialize_modules, migrations,
     model::{Project, ValueType},
@@ -36,6 +36,7 @@ enum Command {
     DumpSchema(DumpSchemaArgs),
     AuditViews(AuditViewsArgs),
     Validate(ValidateArgs),
+    SyncBuiltinThemes(SyncBuiltinThemesArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -97,6 +98,18 @@ struct SeedArgs {
 
 #[derive(Debug, Parser)]
 struct BootstrapArgs {
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    #[arg(long)]
+    database_name: Option<String>,
+
+    #[arg(long)]
+    bootstrap_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct SyncBuiltinThemesArgs {
     #[arg(long)]
     database: Option<PathBuf>,
 
@@ -302,6 +315,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     })?;
                 let applied = seeds::seed_from(target.database, bootstrap_dir)?;
                 print_applied("Ran", &applied);
+            }
+        }
+        Command::SyncBuiltinThemes(args) => {
+            for target in database_targets(args.database, args.database_name, &file_config)? {
+                let bootstrap_dir = args
+                    .bootstrap_dir
+                    .clone()
+                    .or(target.bootstrap_dir)
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "missing bootstrap directory; pass --bootstrap-dir or configure bootstrap_dir",
+                        )
+                    })?;
+                let report = builtin_themes::sync_builtin_themes_from(target.database, bootstrap_dir)?;
+                println!(
+                    "Built-in themes synced: {} updated, {} inserted",
+                    report.updated.len(),
+                    report.inserted.len()
+                );
+                for slug in &report.updated {
+                    println!("  updated {slug}");
+                }
+                for slug in &report.inserted {
+                    println!("  inserted {slug}");
+                }
             }
         }
         Command::Reset(args) => {

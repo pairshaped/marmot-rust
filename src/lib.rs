@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod builtin_themes;
 pub mod config;
 pub mod discovery;
 pub mod emit;
