@@ -3,7 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use marmot::{
-    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql, builtin_themes,
+    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
+    builtin_themes,
     config::{ConfigError, DatabaseReference},
     emit_project_with_serialize_modules, migrations,
     model::{Project, ValueType},
@@ -328,7 +329,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "missing bootstrap directory; pass --bootstrap-dir or configure bootstrap_dir",
                         )
                     })?;
-                let report = builtin_themes::sync_builtin_themes_from(target.database, bootstrap_dir)?;
+                let report =
+                    builtin_themes::sync_builtin_themes_from(target.database, bootstrap_dir)?;
                 println!(
                     "Built-in themes synced: {} updated, {} inserted",
                     report.updated.len(),

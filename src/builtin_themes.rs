@@ -59,9 +59,14 @@ pub enum BuiltinThemeError {
     NoThemes { path: PathBuf },
 
     #[error("built-in theme sync failed for {slug}: {source}")]
-    SyncSqlError { slug: String, source: rusqlite::Error },
+    SyncSqlError {
+        slug: String,
+        source: rusqlite::Error,
+    },
 
-    #[error("built-in theme {slug} did not match the source after sync: database has {actual:?}, source has {expected:?}")]
+    #[error(
+        "built-in theme {slug} did not match the source after sync: database has {actual:?}, source has {expected:?}"
+    )]
     VerificationFailed {
         slug: String,
         expected: String,
@@ -139,24 +144,22 @@ enum ThemeChange {
 
 /// Applies the bootstrap source to a scratch database so SQLite parses it, then reads the
 /// canonical rows back in file order.
-fn read_canonical_themes(
-    bootstrap_dir: &Path,
-) -> Result<Vec<BuiltinTheme>, BuiltinThemeError> {
+fn read_canonical_themes(bootstrap_dir: &Path) -> Result<Vec<BuiltinTheme>, BuiltinThemeError> {
     let path = bootstrap_dir.join(BUILTIN_THEMES_FILE);
     if !path.is_file() {
         return Err(BuiltinThemeError::MissingSource { path });
     }
-    let source = std::fs::read_to_string(&path).map_err(|source| {
-        BuiltinThemeError::SourceReadError {
+    let source =
+        std::fs::read_to_string(&path).map_err(|source| BuiltinThemeError::SourceReadError {
             path: path.clone(),
             source,
-        }
-    })?;
+        })?;
 
-    let scratch = Connection::open_in_memory().map_err(|source| BuiltinThemeError::SourceSqlError {
-        path: path.clone(),
-        source,
-    })?;
+    let scratch =
+        Connection::open_in_memory().map_err(|source| BuiltinThemeError::SourceSqlError {
+            path: path.clone(),
+            source,
+        })?;
     scratch
         .execute_batch(SCRATCH_THEMES_TABLE)
         .map_err(|source| BuiltinThemeError::SourceSqlError {
@@ -205,7 +208,10 @@ fn read_canonical_themes(
 /// Writes one canonical theme into the platform row with that slug. A row that already
 /// matches the source is left alone, so a repeated sync reports no work and does not
 /// churn `updated_at`.
-fn sync_one_theme(conn: &Connection, theme: &BuiltinTheme) -> Result<ThemeChange, BuiltinThemeError> {
+fn sync_one_theme(
+    conn: &Connection,
+    theme: &BuiltinTheme,
+) -> Result<ThemeChange, BuiltinThemeError> {
     let updated = conn
         .execute(
             "UPDATE themes
@@ -280,14 +286,14 @@ fn verify_canonical_themes(
                     slug: theme.slug.clone(),
                     expected: format!("{}/{}-byte css", theme.name, theme.css.len()),
                     actual: format!("{}/{}-byte css", name, css.len()),
-                })
+                });
             }
             None => {
                 return Err(BuiltinThemeError::VerificationFailed {
                     slug: theme.slug.clone(),
                     expected: format!("{}/{}-byte css", theme.name, theme.css.len()),
                     actual: "missing".into(),
-                })
+                });
             }
         }
     }
