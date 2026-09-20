@@ -21,3 +21,4 @@ pub use config::{Config, FileConfig, Target};
 pub use discovery::discover_sql_files;
 pub use emit::{emit_project, emit_project_with_serialize_modules};
 pub use error::{Error, Result};
+pub use marmot_derive::FromSqlRow;
