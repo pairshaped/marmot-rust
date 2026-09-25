@@ -175,6 +175,13 @@ starts. Use it for setup the analyzer needs, such as `ATTACH`, temporary tables,
 PRAGMAs, or native SQLite extension loading when your SQLite build and driver
 support it.
 
+An application-owned Rust SQLite scalar function can be declared to Marmot in
+`init_sql` with `-- marmot: scalar FUNCTION_NAME ARITY`. Marmot registers a
+prepare-only stub on its analysis connection, so SQLite can prepare the queries.
+The application still registers the real function on every runtime connection.
+The stub is never used to run a query and does not define the function's result
+type; cast results when they appear in a query's selected columns.
+
 Generate Rust files:
 
 ```sh

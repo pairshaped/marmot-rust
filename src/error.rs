@@ -69,6 +69,12 @@ pub enum Error {
         source: rusqlite::Error,
     },
 
+    InvalidAnalysisFunction {
+        path: PathBuf,
+        line: usize,
+        reason: String,
+    },
+
     InspectDatabase {
         source: rusqlite::Error,
     },
@@ -208,6 +214,13 @@ impl std::fmt::Display for Error {
             }
             Self::RunInitSql { path, source } => {
                 write!(f, "could not run init_sql {}: {source}", path.display())
+            }
+            Self::InvalidAnalysisFunction { path, line, reason } => {
+                write!(
+                    f,
+                    "invalid analysis function in {} at line {line}: {reason}",
+                    path.display()
+                )
             }
             Self::InspectDatabase { source } => {
                 write!(f, "could not inspect sqlite schema: {source}")
