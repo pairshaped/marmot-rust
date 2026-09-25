@@ -117,6 +117,12 @@ pub enum ViewError {
         source: std::io::Error,
     },
 
+    #[error("could not read generated view SQL {path}: {source}")]
+    ReadGeneratedFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("could not write generated view SQL {path}: {source}")]
     WriteGeneratedFile {
         path: PathBuf,
@@ -279,6 +285,14 @@ pub fn emit_generated_sql(
         path: output.to_path_buf(),
         source,
     })?;
+    match fs::read_to_string(&path) {
+        Ok(current) if current == expected => return Ok(()),
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ViewError::ReadGeneratedFile { path, source });
+        }
+    }
     fs::write(&path, expected).map_err(|source| ViewError::WriteGeneratedFile { path, source })
 }
 
@@ -495,6 +509,7 @@ fn database_only_error_message(names: &[String], source_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn write_view(source_root: &Path, name: &str, declaration: &str, sql: &str) {
         let directory = source_root.join(VIEW_DIR);
@@ -809,9 +824,37 @@ mod tests {
 
         emit_generated_sql(&definitions, &output, false).unwrap();
         emit_generated_sql(&definitions, &output, true).unwrap();
-        let generated = fs::read_to_string(output.join(GENERATED_FILE)).unwrap();
+        let generated_path = output.join(GENERATED_FILE);
+        let generated = fs::read_to_string(&generated_path).unwrap();
         assert!(generated.contains("DROP VIEW IF EXISTS \"view_users\";"));
         assert!(generated.contains("CREATE VIEW view_users (id) AS"));
+
+        let old_mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&generated_path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        emit_generated_sql(&definitions, &output, false).unwrap();
+        assert_eq!(
+            fs::metadata(&generated_path).unwrap().modified().unwrap(),
+            old_mtime
+        );
+
+        write_view(
+            &source_root,
+            "view_users",
+            "view_users(id)",
+            "SELECT id + 1 FROM users",
+        );
+        let changed_definitions = discover(&source_root).unwrap();
+        assert!(matches!(
+            emit_generated_sql(&changed_definitions, &output, true),
+            Err(ViewError::StaleGeneratedFile { .. })
+        ));
+        emit_generated_sql(&changed_definitions, &output, false).unwrap();
+        assert_ne!(fs::read_to_string(&generated_path).unwrap(), generated);
 
         assert!(matches!(
             emit_generated_sql(&[], &output, true),

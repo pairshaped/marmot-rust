@@ -133,6 +133,10 @@ pub enum Error {
         path: PathBuf,
     },
 
+    FormatGeneratedOutput {
+        reason: String,
+    },
+
     GeneratedOutputCollision {
         paths: Vec<PathBuf>,
     },
@@ -285,6 +289,9 @@ impl std::fmt::Display for Error {
             }
             Self::StaleGeneratedFile { path } => {
                 write!(f, "generated file is stale: {}", path.display())
+            }
+            Self::FormatGeneratedOutput { reason } => {
+                write!(f, "could not format generated Rust: {reason}")
             }
             Self::GeneratedOutputCollision { paths } => {
                 write!(f, "generated output collision: {paths:?}")
