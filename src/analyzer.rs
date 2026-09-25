@@ -31,6 +31,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
             path: init_sql.to_path_buf(),
             source,
         })?;
+        register_analysis_functions(&conn, init_sql, &sql)?;
         conn.execute_batch(&sql)
             .map_err(|source| Error::RunInitSql {
                 path: init_sql.to_path_buf(),
@@ -118,6 +119,43 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
     }
 
     Ok(Project { queries })
+}
+
+fn register_analysis_functions(conn: &Connection, path: &Path, sql: &str) -> Result<()> {
+    const DIRECTIVE: &str = "-- marmot: scalar ";
+    for (index, line) in sql.lines().enumerate() {
+        let Some(declaration) = line.trim().strip_prefix(DIRECTIVE) else {
+            continue;
+        };
+        let mut parts = declaration.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        let arity = parts.next().and_then(|value| value.parse::<i32>().ok());
+        if parts.next().is_some()
+            || !name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || !matches!(arity, Some(0..=127))
+        {
+            return Err(Error::InvalidAnalysisFunction {
+                path: path.to_path_buf(),
+                line: index + 1,
+                reason: "expected `-- marmot: scalar FUNCTION_NAME ARITY` with arity 0..127"
+                    .to_string(),
+            });
+        }
+        conn.create_scalar_function(
+            name,
+            arity.expect("validated arity"),
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_| Ok(rusqlite::types::Null),
+        )
+        .map_err(|source| Error::RunInitSql {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3959,6 +3997,20 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn declared_app_scalar_functions_are_available_only_for_analysis_preparation() {
+        let conn = Connection::open_in_memory().unwrap();
+        let path = Path::new("marmot_init.sql");
+        assert!(conn.prepare("select search_fold('ÉQUIPE')").is_err());
+
+        register_analysis_functions(&conn, path, "-- marmot: scalar search_fold 1\n").unwrap();
+        conn.prepare("select search_fold('ÉQUIPE')").unwrap();
+        assert!(matches!(
+            register_analysis_functions(&conn, path, "-- marmot: scalar invalid-name 1\n"),
+            Err(Error::InvalidAnalysisFunction { line: 1, .. })
+        ));
+    }
 
     fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
         fs::create_dir_all(module_path.parent().unwrap()).unwrap();
