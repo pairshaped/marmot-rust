@@ -61,6 +61,9 @@ fn derives_the_same_projection_from_collection_and_detail_rows() {
         id: 8,
         label: "Detail".to_string(),
     });
-    assert_eq!((collection.id, collection.label.as_str()), (7, "Collection"));
+    assert_eq!(
+        (collection.id, collection.label.as_str()),
+        (7, "Collection")
+    );
     assert_eq!((detail.id, detail.label.as_str()), (8, "Detail"));
 }
