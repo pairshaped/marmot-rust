@@ -253,6 +253,27 @@ pub fn emit_generated_sql(
     output: &Path,
     check: bool,
 ) -> Result<(), ViewError> {
+    if check {
+        return emit_generated_sql_staged(definitions, output, true);
+    }
+    crate::publication::publish(output, |staged| {
+        emit_generated_sql_staged(definitions, staged, false)?;
+        Ok(())
+    })
+    .map_err(|source| match source.downcast::<ViewError>() {
+        Ok(source) => *source,
+        Err(source) => ViewError::WriteGeneratedFile {
+            path: output.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        },
+    })
+}
+
+pub(crate) fn emit_generated_sql_staged(
+    definitions: &[ViewDefinition],
+    output: &Path,
+    check: bool,
+) -> Result<(), ViewError> {
     let path = output.join(GENERATED_FILE);
     if definitions.is_empty() {
         if check {

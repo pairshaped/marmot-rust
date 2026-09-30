@@ -7,6 +7,7 @@ pub mod error;
 pub mod maintenance;
 pub mod migrations;
 pub mod model;
+mod publication;
 pub mod reset;
 pub mod schema;
 pub mod seeds;

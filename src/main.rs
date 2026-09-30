@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use marmot::{
     Config, Error as MarmotError, FileConfig, Target, analyze_project_with_sources, builtin_themes,
     config::{ConfigError, DatabaseReference},
-    emit_project_with_serialize_modules, migrations,
+    emit::emit_project_with_views,
+    migrations,
     model::{Project, ValueType},
     reset, schema, seeds,
     validation::{self, IntegrityMode, ValidationConfig, ValidationOutput},
@@ -261,9 +262,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             ensure_generated_outputs_do_not_collide(&analyzed)?;
             for (config, project, serialize_modules, view_source_root) in analyzed {
-                emit_project_with_serialize_modules(&config, &project, &serialize_modules)?;
                 let definitions = views::discover(&config.source_root)?;
-                views::emit_generated_sql(&definitions, &config.output, config.check)?;
+                emit_project_with_views(&config, &project, &serialize_modules, &definitions)?;
                 let audit = views::audit_database(&config.database, &view_source_root)?;
                 if config.check {
                     audit.deny_warnings(&view_source_root)?;

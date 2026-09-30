@@ -15,6 +15,29 @@ pub fn emit(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
 ) -> Result<()> {
+    if config.check {
+        return emit_staged(config, project, serialize_modules);
+    }
+    crate::publication::publish(&config.output, |output| {
+        let mut staged_config = config.clone();
+        staged_config.output = output.to_path_buf();
+        emit_staged(&staged_config, project, serialize_modules)?;
+        Ok(())
+    })
+    .map_err(|source| match source.downcast::<Error>() {
+        Ok(source) => *source,
+        Err(source) => Error::WriteFile {
+            path: config.output.clone(),
+            source: std::io::Error::other(source.to_string()),
+        },
+    })
+}
+
+pub(super) fn emit_staged(
+    config: &Config,
+    project: &Project,
+    serialize_modules: &BTreeSet<String>,
+) -> Result<()> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
     for query in &project.queries {
         by_module.entry(&query.module_name).or_default().push(query);

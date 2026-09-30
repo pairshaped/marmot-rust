@@ -275,6 +275,14 @@ src/registrations/form.sql          -> src/generated/sql/registrations/form.rs
 Each `-- func:` block in one companion file becomes a function in the generated
 module for that file.
 
+Generation stages an owner's Rust bindings and view installation SQL together
+before replacing its output directory. Failed staging leaves the published files
+intact. A failed directory replacement restores the prior tree; if restoration
+also fails, the error names the retained backup. Unchanged files keep their bytes
+and modification times. Each configured owner publishes separately. This recovery
+covers returned I/O errors; process interruption and concurrent readers are
+outside that guarantee.
+
 Check generated files without writing:
 
 ```sh
