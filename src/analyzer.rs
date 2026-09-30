@@ -4085,6 +4085,60 @@ mod tests {
     }
 
     #[test]
+    fn owner_relative_output_keeps_other_owners_unchanged() {
+        let dir = tempdir().unwrap();
+        let database = std::path::PathBuf::from(format!(
+            "file:marmot-owner-{}?mode=memory&cache=shared",
+            dir.path().file_name().unwrap().to_string_lossy()
+        ));
+        let keeper = Connection::open(&database).unwrap();
+        keeper
+            .execute_batch("create table resources (id integer primary key);")
+            .unwrap();
+        let app = dir.path().join("app/src");
+        let feature = dir.path().join("feature/src");
+        write_sql_file(
+            &app.join("pages/settings/resources/index"),
+            "list_resources.sql",
+            "select id from resources",
+        );
+        write_sql_file(
+            &feature.join("reorder/update"),
+            "resource_ids.sql",
+            "select id from resources",
+        );
+        let config = |source: &std::path::Path| Config {
+            database: database.clone(),
+            source_root: source.to_path_buf(),
+            output: source.join("generated/sql"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        };
+        let app_config = config(&app);
+        crate::emit_project(&app_config, &analyze_project(&app_config).unwrap()).unwrap();
+        let app_binding = app_config.output.join("pages/settings/resources/index.rs");
+        let app_bytes = fs::read(&app_binding).unwrap();
+        let app_mtime = fs::metadata(&app_binding).unwrap().modified().unwrap();
+        let feature_config = config(&feature);
+        let project = analyze_project(&feature_config).unwrap();
+        assert_eq!(project.queries.len(), 1);
+        assert_eq!(project.queries[0].module_name, "reorder/update");
+        crate::emit_project(&feature_config, &project).unwrap();
+        let binding = feature_config.output.join("reorder/update.rs");
+        assert!(fs::read_to_string(&binding).unwrap().contains("pub fn"));
+        let mtime = fs::metadata(&binding).unwrap().modified().unwrap();
+        crate::emit_project(&feature_config, &analyze_project(&feature_config).unwrap()).unwrap();
+        assert_eq!(fs::metadata(&binding).unwrap().modified().unwrap(), mtime);
+        assert_eq!(fs::read(&app_binding).unwrap(), app_bytes);
+        assert_eq!(
+            fs::metadata(&app_binding).unwrap().modified().unwrap(),
+            app_mtime
+        );
+        assert!(!feature_config.output.join("pages").exists());
+    }
+
+    #[test]
     fn feature_companions_use_the_declared_view_owner() {
         let dir = tempdir().unwrap();
         let database = std::path::PathBuf::from(format!(
