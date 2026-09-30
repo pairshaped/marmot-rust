@@ -178,9 +178,12 @@ support it.
 An application-owned Rust SQLite scalar function can be declared to Marmot in
 `init_sql` with `-- marmot: scalar FUNCTION_NAME ARITY`. Marmot registers a
 prepare-only stub on its analysis connection, so SQLite can prepare the queries.
-The application still registers the real function on every runtime connection.
-The stub is never used to run a query and does not define the function's result
-type; cast results when they appear in a query's selected columns.
+Reset and view audit also read these declarations to prepare views. Their
+validation connections do not execute other statements from `init_sql`. A stub
+returns an error if a query tries to execute it; it cannot supply a value to seed
+or application data. Register the real function on every application connection.
+Cast function results when they appear in selected columns, because the stub
+does not define a result type.
 
 Generate Rust files:
 

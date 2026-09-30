@@ -123,6 +123,26 @@ pub fn reset_with_views_bootstrap_and_seeds_from(
     source_root: impl AsRef<Path>,
     tracking_table: &str,
 ) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
+    reset_with_views_bootstrap_and_seeds_with_init_sql_from(
+        database_path,
+        migrations_dir,
+        bootstrap_dir,
+        seeds_dir,
+        source_root,
+        tracking_table,
+        None,
+    )
+}
+
+pub fn reset_with_views_bootstrap_and_seeds_with_init_sql_from(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    bootstrap_dir: Option<impl AsRef<Path>>,
+    seeds_dir: impl AsRef<Path>,
+    source_root: impl AsRef<Path>,
+    tracking_table: &str,
+    init_sql: Option<&Path>,
+) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
     let database_path = database_path.as_ref();
     drop_database(database_path)?;
     let applied_migrations = migrations::migrate_from_with_tracking_table(
@@ -130,7 +150,8 @@ pub fn reset_with_views_bootstrap_and_seeds_from(
         migrations_dir,
         tracking_table,
     )?;
-    let audit = views::reconcile_database(database_path, source_root.as_ref())?;
+    let audit =
+        views::reconcile_database_with_init_sql(database_path, source_root.as_ref(), init_sql)?;
     let mut seed_directories = Vec::new();
     if let Some(bootstrap_dir) = bootstrap_dir {
         seed_directories.push(bootstrap_dir.as_ref().to_path_buf());

@@ -44,6 +44,11 @@ impl ViewAudit {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ViewError {
+    #[error("could not register view-analysis functions from {path}: {source}")]
+    AnalysisFunctions {
+        path: PathBuf,
+        source: Box<crate::Error>,
+    },
     #[error("could not read view directory {path}: {source}")]
     ReadDirectory {
         path: PathBuf,
@@ -194,11 +199,20 @@ pub fn reconcile_database(
     database_path: &Path,
     source_root: &Path,
 ) -> Result<ViewAudit, ViewError> {
+    reconcile_database_with_init_sql(database_path, source_root, None)
+}
+
+pub fn reconcile_database_with_init_sql(
+    database_path: &Path,
+    source_root: &Path,
+    init_sql: Option<&Path>,
+) -> Result<ViewAudit, ViewError> {
     let mut connection =
         Connection::open(database_path).map_err(|source| ViewError::OpenDatabase {
             path: database_path.to_path_buf(),
             source,
         })?;
+    register_view_analysis_functions(&connection, init_sql)?;
     reconcile_connection(&mut connection, source_root)
 }
 
@@ -240,12 +254,40 @@ pub fn reconcile_connection(
 }
 
 pub fn audit_database(database_path: &Path, source_root: &Path) -> Result<ViewAudit, ViewError> {
+    audit_database_with_init_sql(database_path, source_root, None)
+}
+
+pub fn audit_database_with_init_sql(
+    database_path: &Path,
+    source_root: &Path,
+    init_sql: Option<&Path>,
+) -> Result<ViewAudit, ViewError> {
     let connection = Connection::open(database_path).map_err(|source| ViewError::OpenDatabase {
         path: database_path.to_path_buf(),
         source,
     })?;
+    register_view_analysis_functions(&connection, init_sql)?;
     let definitions = discover(source_root)?;
     audit_connection(&connection, &definitions)
+}
+
+fn register_view_analysis_functions(
+    connection: &Connection,
+    init_sql: Option<&Path>,
+) -> Result<(), ViewError> {
+    let Some(path) = init_sql else {
+        return Ok(());
+    };
+    let sql = fs::read_to_string(path).map_err(|source| ViewError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    crate::analyzer::register_analysis_functions(connection, path, &sql).map_err(|source| {
+        ViewError::AnalysisFunctions {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        }
+    })
 }
 
 pub fn emit_generated_sql(
@@ -897,5 +939,34 @@ mod tests {
             discover(temp.path()),
             Err(ViewError::InvalidDeclaration { .. })
         ));
+    }
+    #[test]
+    fn scalar_view_validation_reads_declarations_without_executing_init_statements() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("src");
+        let database = temp.path().join("app.db");
+        Connection::open(&database).unwrap().execute_batch("create table users(id integer primary key,name text); insert into users values(1,'Lucy');").unwrap();
+        write_view(
+            &source,
+            "view_users",
+            "view_users(id,name)",
+            "select id,cast(example_key(name) as text) from users",
+        );
+        let init = temp.path().join("init.sql");
+        fs::write(
+            &init,
+            "-- marmot: scalar example_key 1\ndrop table users;\n",
+        )
+        .unwrap();
+        reconcile_database_with_init_sql(&database, &source, Some(&init)).unwrap();
+        audit_database_with_init_sql(&database, &source, Some(&init)).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("select name from users", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "Lucy"
+        );
+        assert!(connection.prepare("select * from view_users").is_err());
     }
 }

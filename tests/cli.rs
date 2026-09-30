@@ -1983,3 +1983,69 @@ fn create_users_database(path: &std::path::Path, name: &str) {
     conn.execute("insert into users (name) values (?1)", [name])
         .unwrap();
 }
+
+#[test]
+fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    let migrations = dir.path().join("db/migrations");
+    let seeds = dir.path().join("db/seeds");
+    fs::create_dir_all(source.join("db_views")).unwrap();
+    fs::create_dir_all(&migrations).unwrap();
+    fs::create_dir_all(&seeds).unwrap();
+    fs::write(
+        migrations.join("001_create_values.sql"),
+        "create table values_source(id integer primary key,label text not null);",
+    )
+    .unwrap();
+    fs::write(
+        seeds.join("001_values.sql"),
+        "insert into values_source values (1,'Source');",
+    )
+    .unwrap();
+    fs::write(source.join("db_views/view_canonical_values.sql"),"create view view_canonical_values (id,label) as select id,cast(example_key(label) as text) from values_source;").unwrap();
+    fs::write(source.join("values.rs"), "").unwrap();
+    fs::write(
+        source.join("values.sql"),
+        "-- func: load_values\nselect id,label from view_canonical_values",
+    )
+    .unwrap();
+    let init = dir.path().join("db/init.sql");
+    fs::write(
+        &init,
+        "-- marmot: scalar example_key 1\ncreate temp table analysis_only(value text);\n",
+    )
+    .unwrap();
+    let config = dir.path().join("marmot.toml");
+    fs::write(&config,format!("[tools.marmot]\ndatabase = {:?}\nsource_root = {:?}\noutput = {:?}\nmigrations_dir = {:?}\nseeds_dir = {:?}\ninit_sql = {:?}\n",dir.path().join("db/app.sqlite3"),source,source.join("generated"),migrations,seeds,init)).unwrap();
+    for command in ["reset", "generate", "audit-views"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+            .arg("--config")
+            .arg(&config)
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let conn = rusqlite::Connection::open(dir.path().join("db/app.sqlite3")).unwrap();
+    assert_eq!(
+        conn.query_row("select label from values_source", [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        "Source"
+    );
+    assert_eq!(
+        conn.query_row(
+            "select count(*) from sqlite_master where name='analysis_only'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(source.join("generated/values.rs").is_file());
+}

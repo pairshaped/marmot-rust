@@ -121,7 +121,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
     Ok(Project { queries })
 }
 
-fn register_analysis_functions(conn: &Connection, path: &Path, sql: &str) -> Result<()> {
+pub(crate) fn register_analysis_functions(conn: &Connection, path: &Path, sql: &str) -> Result<()> {
     const DIRECTIVE: &str = "-- marmot: scalar ";
     for (index, line) in sql.lines().enumerate() {
         let Some(declaration) = line.trim().strip_prefix(DIRECTIVE) else {
@@ -148,7 +148,11 @@ fn register_analysis_functions(conn: &Connection, path: &Path, sql: &str) -> Res
             name,
             arity.expect("validated arity"),
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            |_| Ok(rusqlite::types::Null),
+            |_| -> rusqlite::Result<rusqlite::types::Null> {
+                Err(rusqlite::Error::UserFunctionError(Box::new(
+                    std::io::Error::other("analysis-only scalar cannot execute"),
+                )))
+            },
         )
         .map_err(|source| Error::RunInitSql {
             path: path.to_path_buf(),
@@ -4006,6 +4010,11 @@ mod tests {
 
         register_analysis_functions(&conn, path, "-- marmot: scalar search_fold 1\n").unwrap();
         conn.prepare("select search_fold('ÉQUIPE')").unwrap();
+        assert!(
+            conn.query_row("select search_fold('ÉQUIPE')", [], |row| row
+                .get::<_, Option<String>>(0))
+                .is_err()
+        );
         assert!(matches!(
             register_analysis_functions(&conn, path, "-- marmot: scalar invalid-name 1\n"),
             Err(Error::InvalidAnalysisFunction { line: 1, .. })

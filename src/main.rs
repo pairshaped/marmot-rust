@@ -220,8 +220,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for target in configs(args, &file_config)? {
                 let project =
                     analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
-                let audit =
-                    views::audit_database(&target.config.database, &target.config.source_root)?;
+                let audit = views::audit_database_with_init_sql(
+                    &target.config.database,
+                    &target.config.source_root,
+                    target.init_sql.as_deref(),
+                )?;
                 print_view_warnings(&audit, &target.config.source_root);
                 for query in project.queries {
                     println!(
@@ -247,14 +250,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for target in configs {
                 let project =
                     analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
-                analyzed.push((target.config, project, target.serialize_modules));
+                analyzed.push((
+                    target.config,
+                    project,
+                    target.serialize_modules,
+                    target.init_sql,
+                ));
             }
             ensure_generated_outputs_do_not_collide(&analyzed)?;
-            for (config, project, serialize_modules) in analyzed {
+            for (config, project, serialize_modules, init_sql) in analyzed {
                 emit_project_with_serialize_modules(&config, &project, &serialize_modules)?;
                 let definitions = views::discover(&config.source_root)?;
                 views::emit_generated_sql(&definitions, &config.output, config.check)?;
-                let audit = views::audit_database(&config.database, &config.source_root)?;
+                let audit = views::audit_database_with_init_sql(
+                    &config.database,
+                    &config.source_root,
+                    init_sql.as_deref(),
+                )?;
                 if config.check {
                     audit.deny_warnings(&config.source_root)?;
                 } else {
@@ -278,7 +290,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     migration_table,
                 )?;
                 print_applied("Applied", &applied);
-                let audit = views::reconcile_database(&target.database, &source_root)?;
+                let audit = views::reconcile_database_with_init_sql(
+                    &target.database,
+                    &source_root,
+                    target.init_sql.as_deref(),
+                )?;
                 if args.deny_view_warnings {
                     audit.deny_warnings(&source_root)?;
                 } else {
@@ -361,13 +377,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .or(target.seeds_dir.clone())
                     .unwrap_or_else(|| PathBuf::from(seeds::SEED_DIR));
                 let (applied_migrations, applied_seeds, audit) =
-                    reset::reset_with_views_bootstrap_and_seeds_from(
+                    reset::reset_with_views_bootstrap_and_seeds_with_init_sql_from(
                         &target.database,
                         migrations_dir,
                         bootstrap_dir,
                         seeds_dir,
                         &source_root,
                         migration_table,
+                        target.init_sql.as_deref(),
                     )?;
                 print_applied("Applied", &applied_migrations);
                 print_applied("Ran", &applied_seeds);
@@ -388,7 +405,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for target in database_targets(args.database, args.database_name, &file_config)? {
                 let source_root =
                     resolved_source_root(&target, args.source_root.as_ref(), &file_config);
-                let audit = views::audit_database(&target.database, &source_root)?;
+                let audit = views::audit_database_with_init_sql(
+                    &target.database,
+                    &source_root,
+                    target.init_sql.as_deref(),
+                )?;
                 if args.deny_warnings {
                     audit.deny_warnings(&source_root)?;
                 } else {
@@ -518,10 +539,10 @@ fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
 }
 
 fn ensure_generated_outputs_do_not_collide(
-    analyzed: &[(Config, Project, BTreeSet<String>)],
+    analyzed: &[(Config, Project, BTreeSet<String>, Option<PathBuf>)],
 ) -> Result<(), MarmotError> {
     let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
-    for (target_index, (config, project, _)) in analyzed.iter().enumerate() {
+    for (target_index, (config, project, _, _)) in analyzed.iter().enumerate() {
         for path in generated_output_paths(config, project) {
             by_path.entry(path).or_default().insert(target_index);
         }
