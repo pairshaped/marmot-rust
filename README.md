@@ -320,6 +320,17 @@ data, reconcile views, create statistics, or apply migrations.
 
 ### Declarative views
 
+A companion package that shares an application database can set
+`[tools.marmot].view_source_root` to the schema owner's source directory.
+`inspect` and `generate` reconcile and audit views from that directory while
+SQL companion discovery and generated output stay under `source_root`.
+Generated `views.sql` contains only declarations owned by `source_root`, so
+referencing another view owner doesn't copy its declarations into the package.
+The default view source is each target's resolved `source_root`. Paths use the
+command's working directory. Keep `migrate`, `reset` and `audit-views` with the
+schema owner; this analysis setting doesn't change their source selection.
+
+
 Put reusable, permanent SQLite views in `src/db_views`. Each view has one file,
 and its filename must match the physical view name:
 
