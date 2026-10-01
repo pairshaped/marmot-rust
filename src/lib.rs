@@ -7,6 +7,7 @@ pub mod error;
 pub mod maintenance;
 pub mod migrations;
 pub mod model;
+mod publication;
 pub mod reset;
 pub mod schema;
 pub mod seeds;
@@ -16,7 +17,7 @@ pub mod sqlite;
 pub mod validation;
 pub mod views;
 
-pub use analyzer::{analyze_project, analyze_project_with_init_sql};
+pub use analyzer::{analyze_project, analyze_project_with_sources};
 pub use config::{Config, FileConfig, Target};
 pub use discovery::discover_sql_files;
 pub use emit::{emit_project, emit_project_with_serialize_modules};

@@ -18,10 +18,20 @@ use crate::sqlite::tokenize::{SpannedToken, Token, tokenize, tokenize_spans};
 use crate::views;
 
 pub fn analyze_project(config: &Config) -> Result<Project> {
-    analyze_project_with_init_sql(config, None)
+    analyze_project_with_sources(config, None, &config.source_root)
 }
 
-pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -> Result<Project> {
+pub fn analyze_project_with_sources(
+    config: &Config,
+    init_sql: Option<&Path>,
+    view_source_root: &Path,
+) -> Result<Project> {
+    if !view_source_root.is_dir() {
+        return Err(views::ViewError::SourcePathIsNotDirectory {
+            path: view_source_root.to_path_buf(),
+        }
+        .into());
+    }
     let mut conn = Connection::open(&config.database).map_err(|source| Error::OpenDatabase {
         path: config.database.clone(),
         source,
@@ -38,7 +48,7 @@ pub fn analyze_project_with_init_sql(config: &Config, init_sql: Option<&Path>) -
                 source,
             })?;
     }
-    views::reconcile_connection(&mut conn, &config.source_root)?;
+    views::reconcile_connection(&mut conn, view_source_root)?;
     let schema = load_schema(&conn, &config.temporal)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
@@ -4080,6 +4090,126 @@ mod tests {
         assert_eq!(
             statement_connection_access("PRAGMA optimize=0x10002", true),
             ConnectionAccess::Mutation
+        );
+    }
+
+    #[test]
+    fn owner_relative_output_keeps_other_owners_unchanged() {
+        let dir = tempdir().unwrap();
+        let database = std::path::PathBuf::from(format!(
+            "file:marmot-owner-{}?mode=memory&cache=shared",
+            dir.path().file_name().unwrap().to_string_lossy()
+        ));
+        let keeper = Connection::open(&database).unwrap();
+        keeper
+            .execute_batch("create table resources (id integer primary key);")
+            .unwrap();
+        let app = dir.path().join("app/src");
+        let feature = dir.path().join("feature/src");
+        write_sql_file(
+            &app.join("pages/settings/resources/index"),
+            "list_resources.sql",
+            "select id from resources",
+        );
+        write_sql_file(
+            &feature.join("reorder/update"),
+            "resource_ids.sql",
+            "select id from resources",
+        );
+        let config = |source: &std::path::Path| Config {
+            database: database.clone(),
+            source_root: source.to_path_buf(),
+            output: source.join("generated/sql"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        };
+        let app_config = config(&app);
+        crate::emit_project(&app_config, &analyze_project(&app_config).unwrap()).unwrap();
+        let app_binding = app_config.output.join("pages/settings/resources/index.rs");
+        let app_bytes = fs::read(&app_binding).unwrap();
+        let app_mtime = fs::metadata(&app_binding).unwrap().modified().unwrap();
+        let feature_config = config(&feature);
+        let project = analyze_project(&feature_config).unwrap();
+        assert_eq!(project.queries.len(), 1);
+        assert_eq!(project.queries[0].module_name, "reorder/update");
+        crate::emit_project(&feature_config, &project).unwrap();
+        let binding = feature_config.output.join("reorder/update.rs");
+        assert!(fs::read_to_string(&binding).unwrap().contains("pub fn"));
+        let mtime = fs::metadata(&binding).unwrap().modified().unwrap();
+        crate::emit_project(&feature_config, &analyze_project(&feature_config).unwrap()).unwrap();
+        assert_eq!(fs::metadata(&binding).unwrap().modified().unwrap(), mtime);
+        assert_eq!(fs::read(&app_binding).unwrap(), app_bytes);
+        assert_eq!(
+            fs::metadata(&app_binding).unwrap().modified().unwrap(),
+            app_mtime
+        );
+        assert!(!feature_config.output.join("pages").exists());
+    }
+
+    #[test]
+    fn feature_companions_use_the_declared_view_owner() {
+        let dir = tempdir().unwrap();
+        let database = std::path::PathBuf::from(format!(
+            "file:marmot-views-{}?mode=memory&cache=shared",
+            dir.path().file_name().unwrap().to_string_lossy()
+        ));
+        let keeper = Connection::open(&database).unwrap();
+        keeper
+            .execute_batch(
+                "create table resources (id integer primary key, position integer not null);",
+            )
+            .unwrap();
+        let schema = dir.path().join("app/src");
+        fs::create_dir_all(schema.join("db_views")).unwrap();
+        fs::write(
+            schema.join("db_views/view_resource_order.sql"),
+            "create view view_resource_order (id, position) as select id, position from resources;",
+        )
+        .unwrap();
+        write_sql_file(&schema.join("unused"), "app_only.sql", "select 99");
+        let feature = dir.path().join("feature/src");
+        write_sql_file(
+            &feature.join("reorder"),
+            "resource_ids.sql",
+            "select id from view_resource_order",
+        );
+        let file = crate::FileConfig::from_toml_str(&format!(
+            "[tools.marmot]\nview_source_root = {:?}\n",
+            schema.to_string_lossy()
+        ))
+        .unwrap();
+        let config = Config {
+            database: database.clone(),
+            source_root: feature.clone(),
+            output: feature.join("generated/sql"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        };
+        let project =
+            analyze_project_with_sources(&config, None, file.view_source_root.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(project.queries.len(), 1);
+        assert_eq!(project.queries[0].name, "resource_ids");
+        assert_eq!(project.queries[0].columns[0].name, "id");
+        assert!(
+            views::audit_database(&database, &schema)
+                .unwrap()
+                .database_only
+                .is_empty()
+        );
+        assert_eq!(
+            views::audit_database(&database, &feature)
+                .unwrap()
+                .database_only,
+            ["view_resource_order"]
+        );
+        assert!(views::discover(&feature).unwrap().is_empty());
+        let missing = dir.path().join("missing-owner");
+        assert!(
+            matches!(analyze_project_with_sources(&config, None, &missing),
+            Err(Error::View { source: views::ViewError::SourcePathIsNotDirectory { path } }) if path == missing)
         );
     }
 

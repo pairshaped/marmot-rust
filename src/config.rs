@@ -21,6 +21,7 @@ pub struct Config {
 pub struct FileConfig {
     pub database: Option<PathBuf>,
     pub source_root: Option<PathBuf>,
+    pub view_source_root: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub init_sql: Option<PathBuf>,
     pub migrations_dir: Option<PathBuf>,
@@ -139,6 +140,7 @@ impl FileConfig {
         Ok(Self {
             database: toml_path(marmot, "database"),
             source_root: toml_path(marmot, "source_root"),
+            view_source_root: toml_path(marmot, "view_source_root"),
             output: toml_path(marmot, "output"),
             init_sql: toml_path(marmot, "init_sql"),
             migrations_dir: toml_path(marmot, "migrations_dir"),

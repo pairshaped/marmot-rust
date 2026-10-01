@@ -2048,4 +2048,45 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
         0
     );
     assert!(source.join("generated/values.rs").is_file());
+
+    let feature = dir.path().join("feature/src");
+    fs::create_dir_all(&feature).unwrap();
+    fs::write(feature.join("values.rs"), "").unwrap();
+    fs::write(
+        feature.join("values.sql"),
+        "-- func: load_values\nselect id,label from view_canonical_values",
+    )
+    .unwrap();
+    let feature_config = dir.path().join("feature.toml");
+    fs::write(
+        &feature_config,
+        format!(
+            "[tools.marmot]\ndatabase = {:?}\nsource_root = {:?}\nview_source_root = {:?}\noutput = {:?}\ninit_sql = {:?}\n",
+            dir.path().join("db/app.sqlite3"),
+            feature,
+            source,
+            feature.join("generated"),
+            init,
+        ),
+    )
+    .unwrap();
+    for args in [
+        vec!["inspect"],
+        vec!["generate"],
+        vec!["generate", "--check"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+            .arg("--config")
+            .arg(&feature_config)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "feature {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(feature.join("generated/values.rs").is_file());
+    assert!(!feature.join("generated/db_views").exists());
 }

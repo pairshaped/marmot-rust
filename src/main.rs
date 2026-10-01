@@ -3,10 +3,10 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use marmot::{
-    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_init_sql,
-    builtin_themes,
+    Config, Error as MarmotError, FileConfig, Target, analyze_project_with_sources, builtin_themes,
     config::{ConfigError, DatabaseReference},
-    emit_project_with_serialize_modules, migrations,
+    emit::emit_project_with_views,
+    migrations,
     model::{Project, ValueType},
     reset, schema, seeds,
     validation::{self, IntegrityMode, ValidationConfig, ValidationOutput},
@@ -218,14 +218,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Inspect(args) => {
             for target in configs(args, &file_config)? {
-                let project =
-                    analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
+                let project = analyze_project_with_sources(
+                    &target.config,
+                    target.init_sql.as_deref(),
+                    &target.view_source_root,
+                )?;
                 let audit = views::audit_database_with_init_sql(
                     &target.config.database,
-                    &target.config.source_root,
+                    &target.view_source_root,
                     target.init_sql.as_deref(),
                 )?;
-                print_view_warnings(&audit, &target.config.source_root);
+                print_view_warnings(&audit, &target.view_source_root);
                 for query in project.queries {
                     println!(
                         "{}::{} params={} columns={} source={}",
@@ -248,29 +251,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             for target in configs {
-                let project =
-                    analyze_project_with_init_sql(&target.config, target.init_sql.as_deref())?;
-                analyzed.push((
-                    target.config,
-                    project,
-                    target.serialize_modules,
-                    target.init_sql,
-                ));
+                let project = analyze_project_with_sources(
+                    &target.config,
+                    target.init_sql.as_deref(),
+                    &target.view_source_root,
+                )?;
+                analyzed.push(AnalyzedTarget { target, project });
             }
             ensure_generated_outputs_do_not_collide(&analyzed)?;
-            for (config, project, serialize_modules, init_sql) in analyzed {
-                emit_project_with_serialize_modules(&config, &project, &serialize_modules)?;
+            for AnalyzedTarget { target, project } in analyzed {
+                let config = &target.config;
                 let definitions = views::discover(&config.source_root)?;
-                views::emit_generated_sql(&definitions, &config.output, config.check)?;
+                emit_project_with_views(config, &project, &target.serialize_modules, &definitions)?;
                 let audit = views::audit_database_with_init_sql(
                     &config.database,
-                    &config.source_root,
-                    init_sql.as_deref(),
+                    &target.view_source_root,
+                    target.init_sql.as_deref(),
                 )?;
                 if config.check {
-                    audit.deny_warnings(&config.source_root)?;
+                    audit.deny_warnings(&target.view_source_root)?;
                 } else {
-                    print_view_warnings(&audit, &config.source_root);
+                    print_view_warnings(&audit, &target.view_source_root);
                 }
             }
         }
@@ -538,12 +539,11 @@ fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
     }
 }
 
-fn ensure_generated_outputs_do_not_collide(
-    analyzed: &[(Config, Project, BTreeSet<String>, Option<PathBuf>)],
-) -> Result<(), MarmotError> {
+fn ensure_generated_outputs_do_not_collide(analyzed: &[AnalyzedTarget]) -> Result<(), MarmotError> {
     let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
-    for (target_index, (config, project, _, _)) in analyzed.iter().enumerate() {
-        for path in generated_output_paths(config, project) {
+    for (target_index, analyzed_target) in analyzed.iter().enumerate() {
+        for path in generated_output_paths(&analyzed_target.target.config, &analyzed_target.project)
+        {
             by_path.entry(path).or_default().insert(target_index);
         }
     }
@@ -604,9 +604,16 @@ fn generated_module_path(output: &Path, module: &str) -> PathBuf {
 }
 
 #[derive(Debug)]
+struct AnalyzedTarget {
+    target: AnalysisTarget,
+    project: Project,
+}
+
+#[derive(Debug)]
 struct AnalysisTarget {
     config: Config,
     init_sql: Option<PathBuf>,
+    view_source_root: PathBuf,
     serialize_modules: BTreeSet<String>,
 }
 
@@ -634,6 +641,10 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                     check,
                     temporal: file_config.temporal.clone(),
                 },
+                view_source_root: file_config
+                    .view_source_root
+                    .clone()
+                    .unwrap_or(config_source_root),
                 init_sql: database_target.init_sql,
                 serialize_modules: file_config.serialize_modules.clone(),
             }
