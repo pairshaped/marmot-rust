@@ -13,7 +13,7 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.8"
 walkdir = "2"
-marmot-derive = { path = "../marmot-derive" }
+marmot-derive = { path = "derive" }
 tempfile = "3"
 
 [dev-dependencies]
