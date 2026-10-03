@@ -347,13 +347,18 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
     let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
     assert_eq!(mod_rs, "pub mod app;\npub mod temporal;\n");
     let app_rs = fs::read_to_string(config.output.join("app.rs")).unwrap();
-    assert!(app_rs.contains("use super::temporal as temporal;"));
+    // The emitted module is rustfmt-normalized, which drops the redundant `as temporal` alias.
+    assert!(app_rs.contains("use super::temporal;"));
     assert!(app_rs.contains("pub starts_at: temporal::DbDateTime"));
     assert!(app_rs.contains("pub registration_closes_on: Option<temporal::DbDate>"));
     assert!(app_rs.contains("pub starts_at: &'a temporal::DbDateTime"));
     assert!(app_rs.contains("pub registration_closes_on: Option<&'a temporal::DbDate>"));
-    assert!(app_rs.contains(
-        "params![params.title, params.starts_at.as_str(), params.registration_closes_on.map(|value| value.as_str())]"
+    // rustfmt wraps long macro calls, so compare without whitespace.
+    let compact_app_rs = app_rs.split_whitespace().collect::<String>();
+    assert!(compact_app_rs.contains(
+        &"params![params.title, params.starts_at.as_str(), params.registration_closes_on.map(|value| value.as_str())]"
+            .split_whitespace()
+            .collect::<String>()
     ));
 
     write_temporal_runtime_crate(dir.path());

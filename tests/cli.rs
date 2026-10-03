@@ -961,6 +961,8 @@ fn generate_command_rejects_empty_database_flag_value() {
 fn generate_command_reports_database_open_errors() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("missing/app.sqlite3");
+    // The view source root must be a directory before the database opens (43e104c93).
+    fs::create_dir(dir.path().join("src")).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .arg("generate")
