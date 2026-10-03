@@ -630,6 +630,74 @@ init_sql = "{}"
 }
 
 #[test]
+fn migrate_cli_init_sql_validates_application_function_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let migrations = dir.path().join("migrations");
+    let source = dir.path().join("src");
+    fs::create_dir_all(&migrations).unwrap();
+    fs::create_dir_all(source.join("db_views")).unwrap();
+    fs::write(
+        migrations.join("001_users.sql"),
+        "CREATE TABLE users (email TEXT NOT NULL);",
+    )
+    .unwrap();
+    fs::write(
+        source.join("db_views/view_user_keys.sql"),
+        "CREATE VIEW view_user_keys (key) AS SELECT CAST(email_identity_key(email) AS TEXT) FROM users;",
+    )
+    .unwrap();
+    let init = dir.path().join("analysis.sql");
+    fs::write(&init, "-- marmot: scalar email_identity_key 1\n").unwrap();
+    let args = [
+        "migrate",
+        "--database",
+        database.to_str().unwrap(),
+        "--migrations-dir",
+        migrations.to_str().unwrap(),
+        "--source-root",
+        source.to_str().unwrap(),
+        "--deny-view-warnings",
+    ];
+    let missing = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no such function: email_identity_key"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let valid = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .current_dir(dir.path())
+        .args(args)
+        .arg("--init-sql")
+        .arg(&init)
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    let connection = Connection::open(database).unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name='view_user_keys'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(
+        connection.prepare("SELECT * FROM view_user_keys").is_err(),
+        "Analysis declarations must not persist a fake runtime function"
+    );
+}
+
+#[test]
 fn generate_command_cli_flags_override_marmot_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_database = dir.path().join("config.sqlite3");

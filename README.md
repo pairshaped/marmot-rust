@@ -166,7 +166,9 @@ Unknown storage values are rejected.
 `init_sql` is optional setup for Marmot's analysis connection. Marmot runs the
 file after opening SQLite and before reading schema metadata or preparing query
 blocks. Named databases inherit `[tools.marmot].init_sql` unless they set their
-own `init_sql`.
+own `init_sql`. The `--init-sql PATH` CLI option overrides both defaults and
+named targets. Packaged applications can supply their analysis declarations
+without a development configuration file.
 
 Warning: `init_sql` is an escape hatch. Marmot does not sandbox it, roll it
 back, or check whether it mutates schema or data. It is not a migration system,

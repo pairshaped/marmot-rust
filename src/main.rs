@@ -22,6 +22,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "marmot.toml")]
     config: PathBuf,
 
+    /// SQL declarations used to prepare application views and queries.
+    #[arg(long, global = true)]
+    init_sql: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -214,7 +218,13 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let file_config = FileConfig::read_optional(&cli.config)?;
+    let mut file_config = FileConfig::read_optional(&cli.config)?;
+    if let Some(init_sql) = cli.init_sql {
+        for target in file_config.databases.values_mut() {
+            target.init_sql = Some(init_sql.clone());
+        }
+        file_config.init_sql = Some(init_sql);
+    }
     match cli.command {
         Command::Inspect(args) => {
             for target in configs(args, &file_config)? {
