@@ -460,6 +460,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     resolved_migration_table(&args.migration_table, &target).to_string();
                 reports.push(validation::validate(&ValidationConfig {
                     database: target.database,
+                    init_sql: target.init_sql,
                     source_root,
                     migrations_dir,
                     migration_table,

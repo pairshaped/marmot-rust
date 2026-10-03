@@ -15,6 +15,7 @@ pub enum IntegrityMode {
 #[derive(Debug, Clone)]
 pub struct ValidationConfig {
     pub database: PathBuf,
+    pub init_sql: Option<PathBuf>,
     pub source_root: PathBuf,
     pub migrations_dir: PathBuf,
     pub migration_table: String,
@@ -100,7 +101,7 @@ pub fn validate(config: &ValidationConfig) -> Result<ValidationReport, Validatio
     let checks = vec![
         integrity_check(&connection, config.integrity_mode),
         foreign_key_check(&connection),
-        view_check(&connection, &config.source_root),
+        view_check(&connection, &config.source_root, config.init_sql.as_deref()),
         migration_check(&connection, &config.migrations_dir, &config.migration_table),
     ];
     let runtime = runtime_report(&connection)?;
@@ -149,8 +150,13 @@ fn foreign_key_check(connection: &Connection) -> ValidationCheck {
     }
 }
 
-fn view_check(connection: &Connection, source_root: &Path) -> ValidationCheck {
-    let result = views::discover(source_root)
+fn view_check(
+    connection: &Connection,
+    source_root: &Path,
+    init_sql: Option<&Path>,
+) -> ValidationCheck {
+    let result = views::register_view_analysis_functions(connection, init_sql)
+        .and_then(|()| views::discover(source_root))
         .and_then(|definitions| views::audit_connection(connection, &definitions));
     match result {
         Ok(audit) if audit.database_only.is_empty() => passed("views"),
@@ -312,6 +318,7 @@ mod tests {
             temporary,
             ValidationConfig {
                 database,
+                init_sql: None,
                 source_root,
                 migrations_dir,
                 migration_table: "schema_versions".to_string(),

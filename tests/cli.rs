@@ -682,6 +682,44 @@ fn migrate_cli_init_sql_validates_application_function_views() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
+    // Validation must read declarations without executing any initialization SQL.
+    fs::write(
+        &init,
+        "-- marmot: scalar email_identity_key 1\nINVALID SQL;\n",
+    )
+    .unwrap();
+    let mut validation_command = Command::new(env!("CARGO_BIN_EXE_marmot"));
+    validation_command.current_dir(dir.path()).args([
+        "validate",
+        "--database",
+        database.to_str().unwrap(),
+        "--migrations-dir",
+        migrations.to_str().unwrap(),
+        "--source-root",
+        source.to_str().unwrap(),
+        "--init-sql",
+        init.to_str().unwrap(),
+    ]);
+    let validation = validation_command.output().unwrap();
+    assert!(
+        validation.status.success(),
+        "validate failed: {} {}",
+        String::from_utf8_lossy(&validation.stdout),
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    for (declarations, expected) in [
+        ("", "no such function: email_identity_key"),
+        ("-- marmot: scalar email_identity_key -1\n", "arity 0..127"),
+    ] {
+        fs::write(&init, declarations).unwrap();
+        let rejected = validation_command.output().unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stdout).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&rejected.stdout)
+        );
+    }
     let connection = Connection::open(database).unwrap();
     let count: i64 = connection
         .query_row(

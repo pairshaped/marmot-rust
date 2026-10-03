@@ -271,7 +271,7 @@ pub fn audit_database_with_init_sql(
     audit_connection(&connection, &definitions)
 }
 
-fn register_view_analysis_functions(
+pub(crate) fn register_view_analysis_functions(
     connection: &Connection,
     init_sql: Option<&Path>,
 ) -> Result<(), ViewError> {
