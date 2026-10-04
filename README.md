@@ -158,7 +158,7 @@ The storage keys are explicit because they are part of the project contract,
 but they are not a menu of equally supported backends yet. The only supported
 values today are:
 
-- `datetime_storage = "text_second_utc"` for `YYYY-MM-DD HH:MM:SS` UTC datetime text
+- `datetime_storage = "text_second_utc"` for `YYYY-MM-DD HH:MM:SS` UTC datetime text, optionally followed by a decimal point and 1 through 9 fractional-second digits. Decoding retains the original precision.
 - `date_storage = "text_ymd"` for `YYYY-MM-DD` date text
 
 Unknown storage values are rejected.

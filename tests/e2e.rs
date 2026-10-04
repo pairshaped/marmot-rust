@@ -1320,6 +1320,14 @@ mod tests {
 
     #[test]
     fn generated_types_reject_invalid_temporal_values() {
+        for raw in ["2026-06-11 09:30:00", "2026-06-11 09:30:00.123456", "2026-06-11 09:30:00.123456789"] {
+            let stamp=DbDateTime::new(raw).unwrap();
+            let conn=Connection::open_in_memory().unwrap();
+            let roundtrip:DbDateTime=conn.query_row("select ?1", [&stamp], |row|row.get(0)).unwrap();
+            assert_eq!(roundtrip.as_str(),raw);
+        }
+        for invalid in ["2026-06-11 09:30:00.", "2026-06-11 09:30:00.1234567890", "2026-06-11 09:30:00.1Z", "2026-06-11 09:30:00.é"] {assert!(DbDateTime::new(invalid).is_err());}
+
         assert!(DbDate::new("2026-02-29").is_err());
         assert!(DbDateTime::new("2026-06-11T09:30:00Z").is_err());
 

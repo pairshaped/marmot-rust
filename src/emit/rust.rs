@@ -397,8 +397,13 @@ pub(crate) fn with_field<T>(
 }
 
 fn validate_datetime(value: &str) -> Result<(), TemporalParseError> {
-    if value.len() != 19 || value.as_bytes().get(10) != Some(&b' ') {
-        return Err(temporal_error(value, "YYYY-MM-DD HH:MM:SS"));
+    let bytes = value.as_bytes();
+    let valid_fraction = value.len() == 19
+        || ((21..=29).contains(&value.len())
+            && bytes.get(19) == Some(&b'.')
+            && bytes[20..].iter().all(u8::is_ascii_digit));
+    if !valid_fraction || bytes.get(10) != Some(&b' ') || !value.is_ascii() {
+        return Err(temporal_error(value, "YYYY-MM-DD HH:MM:SS[.fraction]"));
     }
     validate_date(&value[..10]).map_err(|_| temporal_error(value, "YYYY-MM-DD HH:MM:SS"))?;
     let bytes = value.as_bytes();
