@@ -1198,11 +1198,12 @@ fn generate_command_check_reports_missing_generated_files_without_writing() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("generated file is stale"),
+        String::from_utf8_lossy(&output.stderr).contains("generated file is missing"),
         "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!generated.join("users.rs").exists());
+    assert!(!source_root.join("users.generated.rs").exists());
+    assert!(!generated.exists());
 }
 
 #[test]
@@ -1234,6 +1235,11 @@ fn generate_command_check_passes_after_generation_and_fails_after_changes() {
         String::from_utf8_lossy(&generate.stderr)
     );
 
+    fs::write(
+        source_root.join("users.rs"),
+        "#[path = \"users.generated.rs\"]\nmod sql;\n",
+    )
+    .unwrap();
     let check = Command::new(env!("CARGO_BIN_EXE_marmot"))
         .arg("generate")
         .arg("--database")
@@ -2113,7 +2119,11 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
     )
     .unwrap();
     fs::write(source.join("db_views/view_canonical_values.sql"),"create view view_canonical_values (id,label) as select id,cast(example_key(label) as text) from values_source;").unwrap();
-    fs::write(source.join("values.rs"), "").unwrap();
+    fs::write(
+        source.join("values.rs"),
+        "#[path = \"values.generated.rs\"]\nmod sql;\n",
+    )
+    .unwrap();
     fs::write(
         source.join("values.sql"),
         "-- func: load_values\nselect id,label from view_canonical_values",
@@ -2160,7 +2170,11 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
 
     let feature = dir.path().join("feature/src");
     fs::create_dir_all(&feature).unwrap();
-    fs::write(feature.join("values.rs"), "").unwrap();
+    fs::write(
+        feature.join("values.rs"),
+        "#[path = \"values.generated.rs\"]\nmod sql;\n",
+    )
+    .unwrap();
     fs::write(
         feature.join("values.sql"),
         "-- func: load_values\nselect id,label from view_canonical_values",

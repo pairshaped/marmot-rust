@@ -139,16 +139,21 @@ pub enum Error {
         path: PathBuf,
     },
 
-    StaleGeneratedFile {
-        path: PathBuf,
-    },
-
     FormatGeneratedOutput {
         reason: String,
     },
 
     GeneratedOutputCollision {
         paths: Vec<PathBuf>,
+    },
+
+    GeneratedCheckFailed {
+        problems: Vec<crate::check::Problem>,
+    },
+
+    ParseRust {
+        path: PathBuf,
+        reason: String,
     },
 
     View {
@@ -307,14 +312,21 @@ impl std::fmt::Display for Error {
                     path.display()
                 )
             }
-            Self::StaleGeneratedFile { path } => {
-                write!(f, "generated file is stale: {}", path.display())
-            }
             Self::FormatGeneratedOutput { reason } => {
                 write!(f, "could not format generated Rust: {reason}")
             }
             Self::GeneratedOutputCollision { paths } => {
                 write!(f, "generated output collision: {paths:?}")
+            }
+            Self::GeneratedCheckFailed { problems } => {
+                write!(f, "generated SQL bindings are not current:")?;
+                for problem in problems {
+                    write!(f, "\n  {problem}")?;
+                }
+                Ok(())
+            }
+            Self::ParseRust { path, reason } => {
+                write!(f, "could not parse Rust file {}: {reason}", path.display())
             }
             Self::View { source } => source.fmt(f),
         }

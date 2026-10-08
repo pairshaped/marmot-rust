@@ -47,16 +47,12 @@ fn emit(
             path: config.output.clone(),
             source,
         })?;
-        return match changes.paths().into_iter().next() {
-            None => Ok(()),
-            Some(path) if path == views_path(config) => Err(Error::View {
-                source: views::ViewError::StaleGeneratedFile {
-                    path: path.to_path_buf(),
-                },
-            }),
-            Some(path) => Err(Error::StaleGeneratedFile {
-                path: path.to_path_buf(),
-            }),
+        let desired = plan.desired.keys().cloned().collect();
+        let problems = crate::check::problems(config, project, &changes, &desired)?;
+        return if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::GeneratedCheckFailed { problems })
         };
     }
     let source_root =
@@ -294,10 +290,11 @@ mod tests {
         let project = project(&fixture, "update days set day = @day");
         let mut check = fixture.config.clone();
         check.check = true;
+        let declare = |text: &str, file: &str| fs::write(fixture.root.join(file), text).unwrap();
 
         let missing = emit_project(&check, &project).unwrap_err();
         assert!(
-            matches!(missing, Error::StaleGeneratedFile { .. }),
+            matches!(missing, Error::GeneratedCheckFailed { .. }),
             "{missing}"
         );
         assert_eq!(
@@ -308,15 +305,22 @@ mod tests {
         assert_eq!(fs::read_dir(&fixture.config.output).unwrap().count(), 0);
 
         emit_project(&fixture.config, &project).unwrap();
+        declare("#[path = \"users.generated.rs\"]\nmod sql;\n", "users.rs");
+        declare(
+            "#[path = \"days.generated.rs\"]\nmod sql;\n",
+            "events/days.rs",
+        );
         let current = stamp_everything(&fixture);
         emit_project(&check, &project).unwrap();
         assert_untouched(&current);
 
         fs::write(fixture.root.join("users.generated.rs"), "stale").unwrap();
-        fs::write(fixture.root.join("gone.generated.rs"), "orphan").unwrap();
         let stale = stamp_everything(&fixture);
         let error = emit_project(&check, &project).unwrap_err();
-        assert!(matches!(error, Error::StaleGeneratedFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains("generated file is stale"),
+            "{error}"
+        );
         assert_untouched(&stale);
         assert_eq!(
             fs::read_dir(fixture.root.parent().unwrap())

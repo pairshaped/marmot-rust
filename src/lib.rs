@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod builtin_themes;
+pub mod check;
 pub mod config;
 pub mod discovery;
 pub mod emit;
