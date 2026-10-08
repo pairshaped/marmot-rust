@@ -1,0 +1,261 @@
+{
+  "receipt": "adjacent-bindings-delivery-receipt",
+  "kind": "records-only; no source change",
+  "epic": "sports-4qt8 (Generate Marmot SQL bindings beside their SQL); Milestones sports-fwxx (QW-M1), sports-blut (QW-M2); Tasks sports-1zma, azct, xdwq, 8f93, fb80, pv7a. All Beans were deleted in d83b321c4; their full text is retained in git at de701805e (git show de701805e:.beans/<file>).",
+  "evidenceNote": "Reviewer verdicts below are transcribed from the reviewers' completion reports as received by the implementer chat; the verbatim reports were not stored as files. Nothing here is a restated PASS: where a pass reported NEEDS CHANGES, that is stated. Lost evidence: verbatim reviewer reports; /tmp/qwm1-scratch gate logs (gate.log, gate2.log, land.log) and the scratch copy of the base audit report were deleted at cleanup. Retained: the original 59-finding base report and the QW-M2 gate/final-audit text on the Epic at de701805e, the QW-MARMOT disposition on sports-fwxx at de701805e, and the commits and bin/land verification list named below.",
+  "base": {
+    "master": "db2ac0e3c17a53cfaff07c476b5030fd4efff18e",
+    "master_at_landing": "unchanged (origin/master was still db2ac0e3c when the branch landed)"
+  },
+  "branch": "f/5-marmot-adjacent-bindings (deleted after landing)",
+  "implementer": "Marmot Adjacent Bindings - 4qt8 chat (Claude Code Sonnet 5.5, implementer role)",
+  "reviewer": {
+    "role": "reviewer",
+    "identity": "configured Claude Code reviewer subagent, model claude-opus-5-5, effort high (per ~/.codex/agents/ROLES.md), fresh history for every pass, read-only from git objects",
+    "passes": 4
+  },
+  "qwM1": {
+    "release": "Orchestrator3 release of sports-fwxx; run started at commit b7adf6432 (parent of the first Task commit)",
+    "commits": [
+      "83fff16fadd3426c204c5ddc2a05f8589508aefa sports-1zma",
+      "052cc3b35f0b1d333405b4e92b5c74ee43d43b9e sports-azct",
+      "9093f796d327c2e60f6d302e06bd320b864d922e sports-xdwq",
+      "de64fefcc2ae8ad2eb66524c222fd90c1514683e QW-MARMOT repairs",
+      "38c0a61ca9898c5f752f4900b06aa028831cf69e accepted QW-M1 tip",
+      "3e188848fba8a0791fc699b19133d95253fa103d audit comparison gate",
+      "c1231664e702b7ab29d34196cd66c03fc5518a26 gate repair: zero-exit audit fails closed"
+    ],
+    "review_QW_MARMOT": {
+      "pass1": {
+        "range": "b7adf6432..9093f796d",
+        "verdict": "NEEDS CHANGES",
+        "findings": 12,
+        "severity": "1 high, 4 medium, 7 low",
+        "kept_and_repaired_in": "de64fefcc",
+        "list": [
+          "1 high: temporal module not rustfmt-formatted (repaired)",
+          "2 medium: temporal output path spelling made Marmot delete temporal.rs on alternate runs (repaired)",
+          "3 medium: cross-feature #[path] declaration passed the section audit (repaired; sections audit resolves generated #[path] declarations)",
+          "4 medium: #[cfg] on an enclosing inline module counted as live (repaired)",
+          "5 medium: global temporal output broke multi-database targets (repaired)",
+          "6 low dead ViewError variants (removed)",
+          "7 low README claims (corrected)",
+          "8 low output == source_root deletion risk (rejected in config)",
+          "11 low self/super temporal module path (rejected)",
+          "12 low button audit scanned adjacent bindings (excluded)",
+          "9 low #[path] edge cases (crate roots other than lib/main, raw identifiers, cfg_attr, cfg gating set in another file): accepted follow-up, fails closed",
+          "10 low restoring a removal after failed publish has no dedicated test: accepted follow-up"
+        ]
+      },
+      "pass2": {
+        "range": "9093f796d..de64fefcc",
+        "verdict": "NEEDS CHANGES",
+        "reason": "all repairs fixed, no regressions, one test gap: the path-spelling test passed without the fix",
+        "resolution": "CLI test with a leading ./ output spelling added in 38c0a61ca and verified by the implementer to fail with the fix reverted; findings 9 and 10 accepted as recorded follow-ups; one very low note (two targets spelling the same shared folder differently skip the temporal collision check) accepted"
+      },
+      "note": "No third pass was run for the test-only repair; the implementer's revert check is the evidence."
+    }
+  },
+  "qwM2": {
+    "windowReceipt": {
+      "id": "sports-4qt8-QW-M2-20261008T210506Z",
+      "at": "2026-10-08T21:05:06Z",
+      "inventoryTips": {
+        "f/1": "3ae9611ddbcb08e8cd9bca26bcf4a3d408c992a9",
+        "f/2": "5d6a417a74426107f7e14d78398a531f77ff8340",
+        "f/3": "5debee4a31836e64c281ef5a359f0d9520c81695 (paused/transferred; R1+A1 overlay preserved, never composed)",
+        "f/4": "0139ad0ae32f763704b98c141bc9fd9d6dbf84f0",
+        "f/41": "ea2567fe1ce14f0d4a7e938b335a4bd215ce857f",
+        "master": "db2ac0e3c17a53cfaff07c476b5030fd4efff18e"
+      },
+      "exportSchemaSha256": "f6641bc189478dcdc0c03476e3b958006c6fd2844269af103f558f6948100aa5"
+    },
+    "commits": [
+      "7bd5ed4a56224562e4acab2f9f5c109720119400 window receipt recorded",
+      "3ac78e97b77d1cab2784ba8efebbe919d7acfa2c sports-8f93 Curling platform, agent_knowledge_db, curling_admin_resources",
+      "2b32b60e7c021946d5f8b76d491a17e4db2c0096 sports-fb80 Operations service/agent and v2-migration",
+      "e69ee8e13b1e275b2b90dc092075fe6c3c9dd22d sports-pv7a gate record, final audit comparison, handoff draft (reviewed tip of QW-SWITCH pass 1)",
+      "ee3a303bdb5dd3f3aebe9ab56e2117279202df5e QW-SWITCH pass 1 repairs",
+      "5ab40db012106d307687f0717fe0be85e730b34a Proute exception record (reviewed tip of QW-SWITCH pass 2)",
+      "de701805e9359ba94250d167a3a003aabb021f1e pass 2 repairs; landed source tip"
+    ],
+    "review_QW_SWITCH": {
+      "pass1": {
+        "range": "38c0a61ca..e69ee8e13",
+        "includesGateRepairCommits": [
+          "3e188848f",
+          "c1231664e"
+        ],
+        "verdict": "NEEDS CHANGES",
+        "findings": [
+          {
+            "n": 1,
+            "severity": "BLOCKER",
+            "finding": "crates/proute discovery read adjacent *.generated.rs files as route modules (invalid page segment index.generated), breaking bin/generate-proute, contracts:check and bin/build while cargo check still passed (43 public, 89 admin and 5 curling_admin_resources files per the reviewer's simulation; the implementer reproduced the failure with generate-proute --check)",
+            "disposition": "kept; repaired in ee3a303bd: should_ignore_file skips *.generated.rs plus ignores_adjacent_marmot_bindings fixture; generate-proute --check, cargo test -p curling_codegen and contracts:check joined the gate and bin/land list"
+          },
+          {
+            "n": 2,
+            "severity": "MEDIUM",
+            "finding": "audit-code-drift-compare.mjs main guard compared import.meta.url with file://argv[1], exiting 0 silently under a symlink or odd path",
+            "disposition": "kept; repaired in ee3a303bd (pathToFileURL(realpathSync(argv[1])) guard + symlink test)"
+          },
+          {
+            "n": 3,
+            "severity": "LOW",
+            "finding": "comparison used Sets, so a duplicate of a baseline finding passed",
+            "disposition": "kept; repaired in ee3a303bd (counted comparison + test)"
+          },
+          {
+            "n": 4,
+            "severity": "LOW",
+            "finding": "settings/product_types/shared/common.rs declaration over-widened to pub(crate)",
+            "disposition": "kept; made private in ee3a303bd"
+          },
+          {
+            "n": 5,
+            "severity": "LOW",
+            "finding": "Bean ledger numbers wrong (widened 204 of 471; 47 renames)",
+            "disposition": "kept; corrected in ee3a303bd (160 widened, 311 private by the implementer's count; 48 renames besides calendar.sql)"
+          },
+          {
+            "n": 6,
+            "severity": "LOW",
+            "finding": "docs still name old v2-migration SQL files (export-ledger-financial-source-dependency.md, storage-budget.md, export-input-field-inventory.md)",
+            "disposition": "dropped: point-in-time evidence; no tool reads them"
+          }
+        ],
+        "settledQuestions": [
+          "pages::public::products::shared::common widening judged justified (reach unchanged versus the old central tree)",
+          "declarations appended at EOF in 10 files judged acceptable, not a defect (finding text stays identical for the line-number-sensitive audit comparison)"
+        ],
+        "criteriaStatus": "declarations PARTIAL (ledger/over-widening), SQL equality PROVEN, central trees removed PROVEN, wrapper/tooling PROVEN, audit gate PARTIAL, runtime-only breakage FAIL (finding 1)"
+      },
+      "pass2": {
+        "range": "e69ee8e13..5ab40db01",
+        "verdict": "NEEDS CHANGES",
+        "findings": [
+          {
+            "severity": "HIGH",
+            "finding": "the new sports-blut bin/land --verify row 'apps/curling/platform/bin/generate-proute --check' fails from where bin/land runs it (repo root; generate-proute uses cwd-relative src/ paths)",
+            "disposition": "kept; resolved in de701805e: row is '(cd apps/curling/platform && bin/generate-proute --check)' in the Beans and in the executed bin/land command"
+          },
+          {
+            "severity": "LOW",
+            "finding": "Epic ledger line still said 48 paired/46 runtime; correct is 49 paired and 47 runtime",
+            "disposition": "kept; corrected in de701805e"
+          },
+          {
+            "severity": "LOW",
+            "finding": "Proute exception provenance worded inconsistently in the Epic",
+            "disposition": "kept; reconciled in de701805e (found by QW-SWITCH, admitted by root as an exact exception)"
+          }
+        ],
+        "repairVerdicts": "findings 1-4 of pass 1 FIXED, finding 5 partly fixed (the Epic line, resolved in de701805e), finding 6 left as evidence; residual: running the compare script under node --preserve-symlinks-main through a symlink could still exit 0 silently (unlikely, no change required)",
+        "note": "No third pass was run on de701805e (a cwd wrapper in the verification command, Bean text, and no source change). The executed bin/land verification list is the proof of the corrected row."
+      }
+    },
+    "scopeException": {
+      "what": "crates/proute/src/lib.rs should_ignore_file skips *.generated.rs, with ignores_adjacent_marmot_bindings",
+      "why": "without it generate-proute --check, contracts:check and bin/build failed on the otherwise compiling switch (original red: \"invalid page path segment index.generated\")",
+      "admittedBy": "Orchestrator3 explicit bounded scope admission, 2026-10-08; route ownership redesign stays out of scope",
+      "focusedProof": "bin/cargo test -p proute ignores_adjacent_marmot_bindings (1 passed); bin/cargo clippy -p proute --all-targets -- -D warnings clean; bin/cargo test -p proute 52 passed"
+    }
+  },
+  "landings": {
+    "switch": {
+      "commit": "de701805e9359ba94250d167a3a003aabb021f1e",
+      "how": "bin/land from f/5-marmot-adjacent-bindings, fast-forward of origin/master from db2ac0e3c; main checkout fast-forwarded",
+      "verifyList": [
+        "apps/curling/platform/bin/reset",
+        "apps/curling/platform/bin/generate-sql check",
+        "apps/operations/service/bin/generate-sql --check",
+        "apps/operations/agent/bin/generate-sql generate --check",
+        "bin/cargo check -p curling --all-targets --all-features",
+        "bin/cargo check -p v2-migration --all-targets --all-features",
+        "node apps/curling/platform/bin/audit-code-drift page-sql-companion domain-owned-sql-deletes positional-sql-parameters generated-sql-orphan section-boundaries canonical-button-class",
+        "node apps/curling/platform/bin/audit-code-drift-compare.mjs <exact-base report>",
+        "bin/cargo test -p proute ignores_adjacent_marmot_bindings",
+        "(cd apps/curling/platform && bin/generate-proute --check)",
+        "bin/cargo test -p curling_codegen",
+        "pnpm --filter curling run contracts:check"
+      ],
+      "result": "all rows passed; bin/land reported landed (evidence pruning warning on protected old files only)"
+    },
+    "beanDeletion": {
+      "commit": "d83b321c42bca50cd84d7e5d040beeae9f2fa6f4",
+      "content": "deleted the completed Beans only (and removed dangling references in other Beans); no source change; landed with 'beans check'"
+    }
+  },
+  "fullGateBeforeLanding": "every row exit 0 on the merged tip: cargo check --all-targets --all-features for curling, curling_admin_resources, sports-operations, sports-operations-agent, curling_codegen, v2-migration; cargo test -p marmot (383 lib, 48 cli, 20 e2e at QW-M1 close); generate-sql checks for platform/service/agent; v2-migration marmot generate --check; broadened central-path rg found nothing in platform, operations, v2-migration; six selected audit rules zero findings; audit-compare; pnpm test:code-drift; cargo fmt --check; then generate-proute --check, codegen tests, proute tests, contracts:check, check-doc-links, beans check",
+  "auditDisposition": {
+    "fullAuditBase": "59 findings at db2ac0e3c17a53cfaff07c476b5030fd4efff18e (admin-product-list-query-shape 4, admin-report-csv-helper-ownership 1, canonical-island-tests 1, financial-disputes-report-query-shape 7, handwritten-production-sql 1, registration-spares-report-query-shape 4, registration-teams-report-query-shape 7, route-handler-sibling-delegation 17, standard-accounting-report-query-shape 2, typed-closed-set-fields 15)",
+    "originalReportRetainedAt": "git show de701805e:.beans/sports-4qt8--generate-marmot-sql-bindings-beside-their-sql.md (section 'Audit gate disposition')",
+    "final": "full audit at the switch tip reported the same 59 findings, rule/path/message set identical to base (diffed sorted lists); none new, none disappeared, no path mapping used; no checker relaxation or baseline increase",
+    "reviewerCheck": "QW-SWITCH pass 1 independently confirmed the 59 identical, with the 15 typed-closed-set-fields line numbers pointing at the same fields"
+  },
+  "sqlAndEqualityQualification": {
+    "platform": "the 2,796 -- func: blocks under apps/curling/platform (outside db/, generated/, db_views/) are an identical multiset before and after (checked by the implementer); four function blocks moved between files: list_accounting_transactions_for_export -> src/domain/accounting.sql (common.sql removed), list_product_types -> new src/pages/admin/shared/product_types.sql, update_order_summary_from_line_items -> src/pages/admin/shared/line_item_deletion.sql (actions.sql removed), get_waiver_line_item -> waiver_responses/shared/common.sql (renamed from new.sql, 100%)",
+    "operations": "error_tracking.sql -> error_tracking_queries.sql and incidents.sql -> incident_queries.sql renamed with identical text (shared hosts for the library and daemon trees)",
+    "v2Migration": "calendar.sql changed one marker line (-- statement: count_calendar_blocks -> -- func:); 48 other src/*.sql files renamed *_target.sql at 100% similarity with include_str! updated; rentals_queries.rs (hand-written) kept and reads rentals_target.sql; calendar_queries.rs removed",
+    "independent": "QW-SWITCH pass 1 counted 3,390 func/statement blocks across apps/**/*.sql (outside db/, generated/, migrations/) at base and at the reviewed tip, the only content change being the count_calendar_blocks marker, and found all 257 literal include_str!/include_bytes! targets present",
+    "declarations": "471 generated files, each declared exactly once; implementer count 160 widened and 311 private, reviewer count 159 pub(crate) + 1 pub(super) + 310 mod sql + 1 mod generated alias"
+  },
+  "planGapFound": "v2-migration had 49 paired *.sql files (47 runtime include_str! files, rentals.sql read by hand-written rentals_queries.rs, and calendar.sql), not one; the plan's rename-to-unpaired fix for external_calendars.sql was applied to all 48 others. Audited discovery/reconciliation intent preserved per root's confirmation.",
+  "epicAcceptanceMapping": [
+    {
+      "criterion": "Start gate met",
+      "proof": "Orchestrator3 window receipt 2026-10-08T21:05:06Z; inventory above; f/4 foundation, f/1 producer consumed; Export overlay paused"
+    },
+    {
+      "criterion": "Marmot writes every query's bindings to x.generated.rs with @generated header; no central tree or override",
+      "proof": "crates/marmot emit (83fff16fa); fixtures in emit/mod.rs and tests/cli.rs, e2e; 471 generated files at de701805e"
+    },
+    {
+      "criterion": "Check requires exactly one owner declaration per query, detects stale/orphan files, writes nothing",
+      "proof": "crates/marmot/src/check.rs (052cc3b35, de64fefcc); fixtures for missing, duplicate, no-file, orphan, stale, clean, cfg, inline path; checking_writes_nothing; QW-MARMOT reviews; generate-sql checks in the landing list"
+    },
+    {
+      "criterion": "Temporal types keep their public path; generated files import the configured absolute path; views.sql fixed",
+      "proof": "temporal module/output config (83fff16fa, de64fefcc); platform, admin_resources, agent emit mod.rs + temporal.rs, service has none; v2 uses crate::calendar_support::temporal; rustfmt-stable test; compiled project-supplied fixture"
+    },
+    {
+      "criterion": "Publication failure preserves the prior output; unchanged content keeps bytes and mtimes",
+      "proof": "crates/marmot/src/publication.rs tests: failure at second directory restores the first, unchanged regeneration, failed restoration retains backup; emit tests assert bytes and mtimes"
+    },
+    {
+      "criterion": "v2-migration's calendar bindings follow the adjacent rule",
+      "proof": "2b32b60e7: marmot.toml, calendar.generated.rs, declaration in calendar.rs; v2-migration marmot generate --check and cargo check -p v2-migration in the landing list"
+    },
+    {
+      "criterion": "Completion gate passes with zero query-tree hits outside temporal and views",
+      "proof": "full gate before landing and the bin/land verify list; broadened rg found nothing; audit gate per the disposition above (six selected rules zero, 59 identical to base)"
+    },
+    {
+      "criterion": "slice-size, section audit and SQL orphan audit handle *.generated.rs with tests",
+      "proof": "9093f796d, de64fefcc: slice-size.test.mjs, audit-code-drift-sections.test.mjs, audit-code-drift-generated.test.mjs, generate-sql.test.mjs; generated-sql-orphan rule in the landing list"
+    },
+    {
+      "criterion": "Marmot README, ADR 0001 and feature-crates.md describe the adjacent layout",
+      "proof": "9093f796d plus ADRs 0007, 0008, Curling ADR 0015, database.md; bin/check-doc-links"
+    }
+  ],
+  "handoff": {
+    "recipe": "crates/marmot/README.md section 'Rebasing a branch onto the adjacent layout'",
+    "sentTo": {
+      "root": "Orchestrator3",
+      "f/4": "session f8819b7a (delivered)",
+      "f/3": "session 7b2a7ea3 (delivered)",
+      "f/2": "session d4845fda (delivered)",
+      "f/41": "session 57da4674 (delivered)",
+      "f/1": "owner session not identified; relay requested from root"
+    },
+    "content": "landed commit, merge/reset/regenerate/declare/check steps, v2-migration *_target.sql renames, the four moved SQL blocks, shared hosts, the Proute ignore, Export overlay never composed"
+  },
+  "followUps": [
+    "#[path] resolution gaps in Marmot check (crate roots other than lib.rs/main.rs, raw identifiers, cfg_attr(path), cfg gating declared in another file)",
+    "no dedicated test for restoring a removal after a failed publish",
+    "docs naming old v2-migration SQL file names remain as point-in-time evidence",
+    "a future no-new-finding comparison needs a fresh baseline: the 59-finding base report is retained in git history at de701805e"
+  ]
+}
