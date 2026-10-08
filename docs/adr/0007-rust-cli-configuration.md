@@ -59,12 +59,14 @@ Named references can omit paths. Marmot derives defaults from the database name:
 ```text
 database       db/NAME.sqlite
 source_root    src/NAME
-output         src/NAME/generated/sql
+output         src/NAME/generated/sql   (shared folder: views.sql and temporal)
 migrations_dir db/migrations/NAME
 seeds_dir      db/seeds/NAME
 ```
 
-If a named reference sets `source_root`, its default output is derived from that source root. For example, `source_root = "src/app"` gives `src/app/generated/sql` when the named reference omits `output`.
+`output` names the shared output folder for `views.sql` and the temporal module; query bindings are written beside their SQL files. If a named reference sets `source_root`, its default shared folder is derived from that source root. For example, `source_root = "src/app"` gives `src/app/generated/sql` when the named reference omits `output`.
+
+`[tools.marmot.temporal]` takes `module`, the absolute path generated bindings import temporal types from, and an optional `output`, the temporal file inside the shared folder. When `output` is omitted the project supplies the module and Marmot emits neither it nor its fixed declaration.
 
 If a global `migrations_dir`, `bootstrap_dir`, or `seeds_dir` is configured,
 named references without their own value append the database name to that path.
@@ -77,9 +79,9 @@ Global `output` applies only to unnamed generation. Named references use their o
 
 `[tools.marmot].database` cannot be combined with named database references. Use a single top-level database config or named references, not both.
 
-Generated output must be under `source_root` after lexical path normalization. This keeps generated Rust in the source tree that owns the SQL files and prevents accidental writes to unrelated directories.
+The shared output folder must be under `source_root` after lexical path normalization. This keeps generated Rust in the source tree that owns the SQL files and prevents accidental writes to unrelated directories.
 
-`generate` checks generated output paths across all selected database targets before writing files. If two targets would write the same Rust module or `mod.rs`, generation fails instead of allowing a later target to overwrite an earlier one.
+`generate` checks generated output paths across all selected database targets before writing files. If two targets would write the same binding file, temporal module or shared `mod.rs`, generation fails instead of allowing a later target to overwrite an earlier one.
 
 Missing `marmot.toml` is allowed. In that case Marmot uses built-in defaults for source, output, migrations, and seeds, while still requiring a database from `--database` or `DATABASE_URL`.
 

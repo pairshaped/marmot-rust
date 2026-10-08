@@ -43,7 +43,7 @@ reusable declarative view. Marmot annotations are reserved for cases where
 ordinary SQL and source conventions cannot express the required ownership or
 reuse semantics. Parameters are not supported.
 
-Marmot generates the aggregate installation SQL under its configured generated output:
+Marmot generates the aggregate installation SQL in its configured shared output folder:
 
 ```text
 src/generated/sql/views.sql

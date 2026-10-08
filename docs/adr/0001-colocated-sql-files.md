@@ -44,22 +44,30 @@ select id, name from items where id = @id;
 select id, name from items order by name;
 ```
 
-The companion SQL path becomes the generated module path under the generated
-SQL namespace:
+Marmot writes each companion file's bindings beside it, as `NAME.generated.rs`
+with an `@generated` header:
 
 ```text
-src/items.sql -> src/generated/sql/items.rs
-src/registrations/index.sql -> src/generated/sql/registrations/index.rs
-src/registrations/form.sql -> src/generated/sql/registrations/form.rs
+src/items.sql -> src/items.generated.rs
+src/registrations/index.sql -> src/registrations/index.generated.rs
+src/registrations/form.sql -> src/registrations/form.generated.rs
 ```
 
-Generated `mod.rs` files mirror the directory tree needed for those generated
-modules.
+The module that owns the SQL declares its bindings with
+`#[path = "items.generated.rs"] mod sql;`. The declaration is private by
+default and widens to `pub(crate)` only where a caller outside the module needs
+it. Marmot's check requires exactly one declaration per discovered query,
+pointing at an existing file, because the compiler never loads an undeclared
+generated file. There is no central query tree, no generated `mod.rs` tree and
+no per-query output override.
 
 `mod.sql` is rejected. SQL files under directories named `sql` are rejected.
 Query names come from `-- func:` blocks, not filenames.
 
-Generated code belongs outside the hand-written domain module, initially under:
+Generated bindings sit beside the SQL that owns them, so a feature owns its SQL
+and its bindings in one place. The only shared generated files are the
+configured temporal module (with a fixed `mod.rs` declaring it) and the
+aggregate `views.sql`, under the configured shared output folder, for example:
 
 ```text
 src/generated/sql/
