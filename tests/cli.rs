@@ -911,6 +911,38 @@ fn generate_command_rejects_output_outside_source_root() {
 }
 
 #[test]
+fn generate_command_rejects_output_equal_to_source_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    create_users_database(&database, "app_name");
+
+    let source_root = dir.path().join("src");
+    let users = source_root.join("users");
+    fs::create_dir_all(&users).unwrap();
+    write_sql_file(&users, "find_user.sql", "select name from users");
+    let output_dir = source_root.clone();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+        .arg("generate")
+        .arg("--database")
+        .arg(&database)
+        .arg("--source-root")
+        .arg(&source_root)
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("is the source root"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(source_root.join("users.sql").exists());
+}
+
+#[test]
 fn generate_command_accepts_output_with_current_dir_segments() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");

@@ -813,7 +813,9 @@ fn join_namespace(base: PathBuf, name: &str) -> PathBuf {
 fn validate_output_under_source_root(source_root: &Path, output: &Path) -> Result<(), ConfigError> {
     let source_root = normalize_for_comparison(source_root);
     let output = normalize_for_comparison(output);
-    if output.starts_with(&source_root) {
+    if output == source_root {
+        Err(ConfigError::OutputIsSourceRoot { output })
+    } else if output.starts_with(&source_root) {
         Ok(())
     } else {
         Err(ConfigError::OutputOutsideSourceRoot {

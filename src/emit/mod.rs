@@ -246,6 +246,54 @@ mod tests {
     }
 
     #[test]
+    fn the_temporal_module_is_rustfmt_stable_and_survives_spelled_out_paths() {
+        let mut fixture = fixture(false);
+        let spelled = fixture.root.join("generated/./sql");
+        fixture.config.output = spelled;
+        let project = project(&fixture, "update days set day = @day");
+        for _ in 0..2 {
+            emit_project(&fixture.config, &project).unwrap();
+        }
+        let temporal = fixture.root.join("generated/sql/temporal.rs");
+        assert!(
+            temporal.is_file(),
+            "a second run must not delete the module"
+        );
+        let formatted = std::process::Command::new("rustfmt")
+            .args(["--edition", "2024", "--check"])
+            .arg(&temporal)
+            .output()
+            .unwrap();
+        assert!(
+            formatted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&formatted.stdout)
+        );
+    }
+
+    #[test]
+    fn a_target_without_temporal_queries_ignores_another_owners_temporal_folder() {
+        let mut fixture = fixture(false);
+        fixture.config.output = fixture.root.join("other/generated");
+        let project = Project {
+            queries: vec![query(
+                &fixture.root,
+                "users",
+                "update users set a = 1",
+                false,
+            )],
+        };
+        emit_project(&fixture.config, &project).unwrap();
+        assert!(!fixture.root.join("generated/sql/temporal.rs").exists());
+        let error = emit_project(
+            &fixture.config,
+            &self::project(&fixture, "update d set a = @day"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidTemporalConfig { .. }));
+    }
+
+    #[test]
     fn project_supplied_temporal_emits_no_module_and_no_declaration() {
         let fixture = fixture(true);
         let project = project(&fixture, "update days set day = @day");

@@ -116,12 +116,6 @@ pub enum ViewError {
         source_root: PathBuf,
     },
 
-    #[error("could not create generated view directory {path}: {source}")]
-    CreateGeneratedDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
     #[error("could not read generated view SQL {path}: {source}")]
     ReadGeneratedFile {
         path: PathBuf,
@@ -130,12 +124,6 @@ pub enum ViewError {
 
     #[error("could not write generated view SQL {path}: {source}")]
     WriteGeneratedFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[error("could not remove generated view SQL {path}: {source}")]
-    RemoveGeneratedFile {
         path: PathBuf,
         source: std::io::Error,
     },

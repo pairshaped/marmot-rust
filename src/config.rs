@@ -127,6 +127,11 @@ pub enum ConfigError {
     #[error("unknown temporal date_storage {0}")]
     UnknownTemporalDateStorage(String),
 
+    #[error(
+        "output {output} is the source root; it must be a folder below it, because Marmot removes stale generated Rust from the shared output folder"
+    )]
+    OutputIsSourceRoot { output: PathBuf },
+
     #[error("output path must be under source root: output {output}, source root {source_root}")]
     OutputOutsideSourceRoot {
         output: PathBuf,

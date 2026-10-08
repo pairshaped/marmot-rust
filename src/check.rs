@@ -275,7 +275,7 @@ fn scan_declarations(source_root: &Path) -> Result<Vec<Declaration>> {
             reason: error.to_string(),
         })?;
         let mut nesting = Vec::new();
-        collect(&file.items, path, &mut nesting, &mut declarations);
+        collect(&file.items, path, &mut nesting, false, &mut declarations);
     }
     Ok(declarations)
 }
@@ -284,6 +284,7 @@ fn collect(
     items: &[syn::Item],
     file: &Path,
     nesting: &mut Vec<String>,
+    under_cfg: bool,
     out: &mut Vec<Declaration>,
 ) {
     for item in items {
@@ -294,7 +295,8 @@ fn collect(
         match &module.content {
             Some((_, inner)) => {
                 nesting.push(attribute_path.unwrap_or_else(|| module.ident.to_string()));
-                collect(inner, file, nesting, out);
+                let gated = under_cfg || has_cfg(&module.attrs);
+                collect(inner, file, nesting, gated, out);
                 nesting.pop();
             }
             None => {
@@ -307,11 +309,17 @@ fn collect(
                 out.push(Declaration {
                     file: file.to_path_buf(),
                     resolved: resolve(file, nesting, &attribute_path),
-                    conditional: module.attrs.iter().any(|a| a.path().is_ident("cfg")),
+                    conditional: under_cfg || has_cfg(&module.attrs),
                 });
             }
         }
     }
+}
+
+fn has_cfg(attributes: &[syn::Attribute]) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| attribute.path().is_ident("cfg"))
 }
 
 fn path_attribute(attributes: &[syn::Attribute]) -> Option<String> {
@@ -582,6 +590,23 @@ mod tests {
             [
                 "events/more.sql has no owner declaration for events/more.generated.rs; add `#[path = \"more.generated.rs\"] mod sql;` to events/more.rs (a declaration under #[cfg] in events/more.rs does not count)",
                 "generated file is stale: users.generated.rs; run generate",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_declaration_inside_a_cfg_gated_module_does_not_count() {
+        let fixture = fixture();
+        declare_everything(&fixture);
+        write(
+            &fixture,
+            "events/more.rs",
+            "#[cfg(test)]\nmod tests {\n    #[path = \"../../more.generated.rs\"]\n    mod sql;\n}\n",
+        );
+        assert_eq!(
+            check(&fixture),
+            [
+                "events/more.sql has no owner declaration for events/more.generated.rs; add `#[path = \"more.generated.rs\"] mod sql;` to events/more.rs (a declaration under #[cfg] in events/more.rs does not count)"
             ]
         );
     }

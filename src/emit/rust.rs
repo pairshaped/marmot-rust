@@ -38,7 +38,7 @@ pub(super) fn render_project(
     if uses_temporal && temporal_module.is_none() {
         return Err(Error::TemporalModuleNotConfigured);
     }
-    let temporal_output = temporal_output(config)?;
+    let temporal_output = temporal_output(config, uses_temporal)?;
 
     let mut desired = BTreeMap::new();
     for (module, queries) in by_module {
@@ -49,8 +49,6 @@ pub(super) fn render_project(
         }
         desired.insert(path, content);
     }
-    format_generated_files(&mut desired)?;
-
     if let Some(temporal) = temporal_output {
         let declaration = if uses_temporal {
             format!("pub mod {};\n", temporal.name)
@@ -62,6 +60,7 @@ pub(super) fn render_project(
             desired.insert(temporal.module_file, render_temporal_module().to_string());
         }
     }
+    format_generated_files(&mut desired)?;
     Ok(desired)
 }
 
@@ -100,7 +99,8 @@ pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
         .iter()
         .map(adjacent_binding_path)
         .collect::<BTreeSet<_>>();
-    if let Ok(Some(temporal)) = temporal_output(config) {
+    let uses_temporal = project_uses_temporal(project);
+    if let Ok(Some(temporal)) = temporal_output(config, uses_temporal) {
         paths.insert(temporal.declaration_file);
         if project_uses_temporal(project) {
             paths.insert(temporal.module_file);
@@ -116,13 +116,15 @@ pub(super) fn adjacent_binding_path(query: &Query) -> PathBuf {
 }
 
 fn validate_temporal_module(module: &str) -> Result<()> {
-    let valid = module.split("::").all(|segment| {
-        let mut chars = segment.chars();
-        chars
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    }) && module.split("::").count() > 1;
+    let valid = !matches!(module.split("::").next(), Some("self" | "super"))
+        && module.split("::").all(|segment| {
+            let mut chars = segment.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        && module.split("::").count() > 1;
     if valid {
         Ok(())
     } else {
@@ -134,7 +136,10 @@ fn validate_temporal_module(module: &str) -> Result<()> {
     }
 }
 
-fn temporal_output(config: &Config) -> Result<Option<TemporalOutput>> {
+/// The temporal config is shared by every target of a multi-database project,
+/// but only one shared folder can hold the module. A target that doesn't use
+/// temporal types and doesn't own the configured folder simply emits nothing.
+fn temporal_output(config: &Config, uses_temporal: bool) -> Result<Option<TemporalOutput>> {
     let Some(file) = &config.temporal.output else {
         return Ok(None);
     };
@@ -159,6 +164,9 @@ fn temporal_output(config: &Config) -> Result<Option<TemporalOutput>> {
         (Ok(file), Ok(output)) => file.parent() == Some(output.as_path()),
         _ => false,
     };
+    if !parent_matches && !uses_temporal {
+        return Ok(None);
+    }
     if !parent_matches {
         return invalid(format!(
             "output {} must be directly inside the shared output folder {}",
@@ -167,7 +175,7 @@ fn temporal_output(config: &Config) -> Result<Option<TemporalOutput>> {
         ));
     }
     Ok(Some(TemporalOutput {
-        module_file: file.clone(),
+        module_file: config.output.join(format!("{name}.rs")),
         declaration_file: config.output.join("mod.rs"),
         name,
     }))

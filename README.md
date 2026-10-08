@@ -156,8 +156,11 @@ output = "src/generated/sql/temporal.rs"
 It is required when any query uses a temporal type. `output` is optional. When
 you set it, Marmot writes the temporal module there, directly inside the shared
 output folder and named after the module's last segment, and writes a fixed
-`mod.rs` beside it that declares only `pub mod temporal;`. Marmot never deletes
-that file. When you omit `output`, your project supplies the module: Marmot
+`mod.rs` beside it that declares only `pub mod temporal;` (the file is empty when
+no query uses temporal types). Marmot keeps that file current on every run and
+removes it only when you drop `output`. Only one owner can hold the module: a
+target whose shared folder isn't the configured one and that uses no temporal
+types emits nothing temporal. When you omit `output`, your project supplies the module: Marmot
 emits neither the temporal module nor the declaration, and bindings import
 `module` as written.
 
@@ -316,18 +319,22 @@ declaration per discovered query, pointing at an existing file. Rust resolves
 `mod tests { ... }`, it resolves relative to the nested directory instead (and a
 file that isn't `mod.rs`, `lib.rs` or `main.rs` adds its own name first), so
 `mod tests { #[path = "../../items.generated.rs"] mod sql; }` in `src/items.rs`
-loads the same file. A declaration under `#[cfg(...)]` doesn't count.
+loads the same file. A declaration under `#[cfg(...)]`, on the module itself or
+on an enclosing inline module such as `#[cfg(test)] mod tests`, doesn't count,
+because non-test builds wouldn't load it.
 
 Generation stages every changed file first and then publishes directory by
 directory. If publishing any step fails, Marmot restores the files it already
 replaced, so the prior complete output survives; if restoration also fails, the
 error names the retained backup folder. Unchanged files are never touched, so
 they keep their bytes and modification times, and repeated generation changes
-nothing. Stale `*.generated.rs` files whose `NAME.sql` is gone are removed. The
+nothing. Stale `*.generated.rs` files whose `NAME.sql` is gone are removed, as is any
+Rust file left in the shared output folder (so keep `output` a dedicated folder
+below `source_root`; Marmot rejects `output` equal to `source_root`). The
 guarantee covers returned I/O errors. A process killed mid-publish (SIGKILL,
 power loss) can leave a partly published tree and a `.marmot-publish-*` folder
 next to the source root; rerun `generate` to repair it. Concurrent readers can
-see a mixed tree while publishing.
+briefly see a file missing or a mixed tree while publishing (each replacement is two renames).
 
 Check generated files without writing:
 
@@ -339,13 +346,15 @@ bin/cargo run -p marmot -- generate \
 ```
 
 `--check` compares the bindings, the temporal module and `views.sql` against
-what generation would write and touches no file: no bytes, no modification
-times, no staging folder. It reports every problem with the owning file and the
+what generation would write and touches no generated or source file: no bytes,
+no modification times, no staging folder. It still opens the analysis database
+and, like `generate`, applies `init_sql` and reconciles views there, so point it
+at a disposable or development database. It reports every problem with the owning file and the
 fix, for example:
 
 ```text
 src/items.sql has no owner declaration for src/items.generated.rs; add `#[path = "items.generated.rs"] mod sql;` to src/items.rs
-src/old.generated.rs has no matching .sql file; delete it and remove its declaration in src/old.rs
+orphan generated file src/old.generated.rs has no matching .sql file; delete it and remove its declaration in src/old.rs
 generated file is stale: src/registrations/form.generated.rs; run generate
 ```
 
