@@ -156,8 +156,8 @@ output = "src/generated/sql/temporal.rs"
 It is required when any query uses a temporal type. `output` is optional. When
 you set it, Marmot writes the temporal module there, directly inside the shared
 output folder and named after the module's last segment, and writes a fixed
-`mod.rs` beside it that declares only `pub mod temporal;` (the file is empty when
-no query uses temporal types). Marmot keeps that file current on every run and
+`mod.rs` beside it that declares only `pub mod temporal;` (the file holds a single
+newline when no query uses temporal types). Marmot keeps that file current on every run and
 removes it only when you drop `output`. Only one owner can hold the module: a
 target whose shared folder isn't the configured one and that uses no temporal
 types emits nothing temporal. When you omit `output`, your project supplies the module: Marmot

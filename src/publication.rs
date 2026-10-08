@@ -288,7 +288,7 @@ mod tests {
         let (a, b, stale) = (
             temp.path().join("a/one.rs"),
             temp.path().join("b/two.rs"),
-            temp.path().join("c/stale.rs"),
+            temp.path().join("0/stale.rs"),
         );
         publish(
             &plan(&[(&a, "old one"), (&b, "old two"), (&stale, "stale")]),
@@ -323,7 +323,7 @@ mod tests {
             assert_eq!(modified(path), old_time());
         }
         let leftovers = fs::read_dir(temp.path()).unwrap().count();
-        assert_eq!(leftovers, 3, "only a, b and c remain");
+        assert_eq!(leftovers, 3, "only 0, a and b remain");
     }
 
     #[test]

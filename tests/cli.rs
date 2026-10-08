@@ -511,6 +511,51 @@ schema_output = "db/schema.sql"
 }
 
 #[test]
+fn generate_keeps_the_temporal_module_when_output_is_spelled_with_a_leading_dot() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = Connection::open(dir.path().join("app.sqlite3")).unwrap();
+    conn.execute_batch("create table events (id integer primary key, starts_at text not null);")
+        .unwrap();
+    drop(conn);
+    let events = dir.path().join("src/events");
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    write_sql_file(
+        &events,
+        "list_events.sql",
+        "select id, starts_at from events",
+    );
+    fs::write(
+        dir.path().join("marmot.toml"),
+        r#"
+[tools.marmot]
+database = "app.sqlite3"
+source_root = "src"
+
+[tools.marmot.temporal]
+strict_suffixes = true
+module = "crate::generated::sql::temporal"
+output = "src/generated/sql/temporal.rs"
+"#,
+    )
+    .unwrap();
+
+    for _ in 0..3 {
+        let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+            .current_dir(dir.path())
+            .args(["generate", "--output", "./src/generated/sql"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join("src/generated/sql/temporal.rs").is_file());
+        assert!(dir.path().join("src/generated/sql/mod.rs").is_file());
+    }
+}
+
+#[test]
 fn generate_command_uses_marmot_toml_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");
