@@ -170,4 +170,25 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].module_name, "items/find_user");
     }
+
+    #[test]
+    fn skips_db_views_and_unpaired_files_such_as_schema_sql() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("db_views")).unwrap();
+        fs::write(
+            src.join("db_views/view_users.sql"),
+            "create view v as select 1",
+        )
+        .unwrap();
+        fs::write(src.join("schema.sql"), "create table t (id integer)").unwrap();
+        fs::write(src.join("users.rs"), "").unwrap();
+        fs::write(src.join("users.sql"), "-- func: q\nselect 1").unwrap();
+        fs::write(src.join("users.generated.rs"), "// @generated").unwrap();
+
+        let files = discover_sql_files(&src).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].module_name, "users");
+    }
 }

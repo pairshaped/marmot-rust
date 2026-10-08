@@ -4126,7 +4126,7 @@ mod tests {
         };
         let app_config = config(&app);
         crate::emit_project(&app_config, &analyze_project(&app_config).unwrap()).unwrap();
-        let app_binding = app_config.output.join("pages/settings/resources/index.rs");
+        let app_binding = app.join("pages/settings/resources/index.generated.rs");
         let app_bytes = fs::read(&app_binding).unwrap();
         let app_mtime = fs::metadata(&app_binding).unwrap().modified().unwrap();
         let feature_config = config(&feature);
@@ -4134,7 +4134,7 @@ mod tests {
         assert_eq!(project.queries.len(), 1);
         assert_eq!(project.queries[0].module_name, "reorder/update");
         crate::emit_project(&feature_config, &project).unwrap();
-        let binding = feature_config.output.join("reorder/update.rs");
+        let binding = feature.join("reorder/update.generated.rs");
         assert!(fs::read_to_string(&binding).unwrap().contains("pub fn"));
         let mtime = fs::metadata(&binding).unwrap().modified().unwrap();
         crate::emit_project(&feature_config, &analyze_project(&feature_config).unwrap()).unwrap();
@@ -4144,7 +4144,7 @@ mod tests {
             fs::metadata(&app_binding).unwrap().modified().unwrap(),
             app_mtime
         );
-        assert!(!feature_config.output.join("pages").exists());
+        assert!(!feature.join("pages").exists());
     }
 
     #[test]
@@ -8775,7 +8775,7 @@ mod tests {
             ]
         );
 
-        let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
+        let output = fs::read_to_string(config.source_root.join("reports.generated.rs")).unwrap();
         assert!(output.contains("pub struct LineItemsParams<'a>"));
         assert!(output.contains("pub status: &'a str"));
         assert!(output.contains("pub type_filter: &'a str"));
@@ -8877,7 +8877,7 @@ mod tests {
             ]
         );
 
-        let output = fs::read_to_string(config.output.join("reports.rs")).unwrap();
+        let output = fs::read_to_string(config.source_root.join("reports.generated.rs")).unwrap();
         assert!(output.contains("pub status: &'a str"));
         assert!(output.contains("pub type_filter: &'a str"));
     }

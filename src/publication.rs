@@ -1,273 +1,376 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-type Failure = Box<dyn std::error::Error>;
+pub(crate) type Failure = Box<dyn std::error::Error>;
 
-pub(crate) fn publish(
-    output: &Path,
-    generate: impl FnOnce(&Path) -> Result<(), Failure>,
-) -> Result<(), Failure> {
-    publish_with_rename(output, generate, |from, to| fs::rename(from, to))
+/// The complete set of files one generation owns.
+///
+/// `desired` holds every file with its final contents. `managed` holds the
+/// existing files Marmot is allowed to delete; any managed file missing from
+/// `desired` is stale.
+#[derive(Debug, Default)]
+pub(crate) struct Plan {
+    pub(crate) desired: BTreeMap<PathBuf, String>,
+    pub(crate) managed: BTreeSet<PathBuf>,
+    /// Directories emptied by removals are pruned up to, but not including, this one.
+    pub(crate) prune_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Changes {
+    pub(crate) writes: BTreeMap<PathBuf, String>,
+    pub(crate) removals: BTreeSet<PathBuf>,
+}
+
+impl Changes {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.writes.is_empty() && self.removals.is_empty()
+    }
+
+    /// Every stale path, in path order.
+    pub(crate) fn paths(&self) -> BTreeSet<&Path> {
+        self.writes
+            .keys()
+            .chain(&self.removals)
+            .map(PathBuf::as_path)
+            .collect()
+    }
+}
+
+impl Plan {
+    /// Compare the plan with the disk. Reads only; never touches a path.
+    pub(crate) fn changes(&self) -> io::Result<Changes> {
+        let mut changes = Changes::default();
+        for (path, content) in &self.desired {
+            match fs::read(path) {
+                Ok(current) if current == content.as_bytes() => {}
+                Ok(_) => {
+                    changes.writes.insert(path.clone(), content.clone());
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    changes.writes.insert(path.clone(), content.clone());
+                }
+                Err(source) => return Err(source),
+            }
+        }
+        for path in &self.managed {
+            if !self.desired.contains_key(path) && path.try_exists()? {
+                changes.removals.insert(path.clone());
+            }
+        }
+        Ok(changes)
+    }
+}
+
+/// Publish a plan. Every changed file is staged first. Directories are then
+/// published one at a time; if any step fails, everything already published is
+/// restored so the prior complete output survives. Publication is not atomic
+/// across directories: a process killed mid-publish (SIGKILL, power loss) can
+/// leave a partly published tree, with the replaced files in the
+/// `.marmot-publish-*` folder under `stage_parent`. Rerun generation to repair.
+pub(crate) fn publish(plan: &Plan, stage_parent: &Path) -> Result<(), Failure> {
+    publish_with_rename(plan, stage_parent, |from, to| fs::rename(from, to))
+}
+
+enum Action {
+    Write { target: PathBuf, staged: PathBuf },
+    Remove { target: PathBuf },
+}
+
+impl Action {
+    fn target(&self) -> &Path {
+        match self {
+            Self::Write { target, .. } | Self::Remove { target } => target,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Journal {
+    entries: Vec<Entry>,
+    created_dirs: Vec<PathBuf>,
+}
+
+struct Entry {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+    wrote: bool,
 }
 
 fn publish_with_rename(
-    output: &Path,
-    generate: impl FnOnce(&Path) -> Result<(), Failure>,
-    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    plan: &Plan,
+    stage_parent: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), Failure> {
-    let output = std::path::absolute(output)?;
-    let parent = output
-        .parent()
-        .ok_or_else(|| std::io::Error::other("output has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = tempfile::Builder::new()
-        .prefix(".marmot-publish-")
-        .tempdir_in(parent)?;
-    let staged = temporary.path().join("next");
-    fs::create_dir(&staged)?;
-    let previous = snapshot(&output)?;
-    // Copy, rather than hard-link, because emitters mutate their staged files.
-    for (relative, contents) in &previous {
-        let source = output.join(relative);
-        let destination = staged.join(relative);
-        fs::create_dir_all(destination.parent().expect("file has parent"))?;
-        let Some(contents) = contents else {
-            fs::create_dir_all(&destination)?;
-            continue;
-        };
-        fs::write(&destination, contents)?;
-        let metadata = fs::metadata(&source)?;
-        fs::set_permissions(&destination, metadata.permissions())?;
-        fs::File::open(&destination)?
-            .set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
-    }
-    generate(&staged)?;
-    if snapshot(&staged)? == previous && output.is_dir() {
+    let changes = plan.changes()?;
+    if changes.is_empty() {
         return Ok(());
     }
-    let backup = temporary.path().join("previous");
-    let had_output = output.exists();
-    if had_output {
-        rename(&output, &backup)?;
-    }
-    if let Err(publication) = rename(&staged, &output) {
-        if had_output && let Err(restoration) = rename(&backup, &output) {
-            let retained = temporary.keep();
-            return Err(std::io::Error::other(format!(
-                "could not publish {}: {publication}; could not restore: {restoration}; previous output retained at {}",
-                output.display(), retained.join("previous").display(),
-            )).into());
+    let stage_parent = std::path::absolute(stage_parent)?;
+    fs::create_dir_all(&stage_parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".marmot-publish-")
+        .tempdir_in(&stage_parent)?;
+    let next = temporary.path().join("next");
+    let previous = temporary.path().join("previous");
+    fs::create_dir(&next)?;
+    fs::create_dir(&previous)?;
+
+    let mut by_directory: BTreeMap<PathBuf, Vec<Action>> = BTreeMap::new();
+    for (index, (target, content)) in changes.writes.iter().enumerate() {
+        let staged = next.join(index.to_string());
+        fs::write(&staged, content)?;
+        if let Ok(metadata) = fs::metadata(target) {
+            fs::set_permissions(&staged, metadata.permissions())?;
         }
-        return Err(publication.into());
+        by_directory
+            .entry(parent_of(target))
+            .or_default()
+            .push(Action::Write {
+                target: target.clone(),
+                staged,
+            });
+    }
+    for target in &changes.removals {
+        by_directory
+            .entry(parent_of(target))
+            .or_default()
+            .push(Action::Remove {
+                target: target.clone(),
+            });
+    }
+
+    let mut journal = Journal::default();
+    let mut backups = 0usize;
+    let mut apply = || -> io::Result<()> {
+        for actions in by_directory.values() {
+            for action in actions {
+                let target = action.target();
+                if let Some(directory) = target.parent() {
+                    create_missing_directories(directory, &mut journal)?;
+                }
+                let backup = if target.try_exists()? {
+                    backups += 1;
+                    let backup = previous.join(backups.to_string());
+                    rename(target, &backup)?;
+                    Some(backup)
+                } else {
+                    None
+                };
+                journal.entries.push(Entry {
+                    target: target.to_path_buf(),
+                    backup,
+                    wrote: false,
+                });
+                if let Action::Write { staged, target } = action {
+                    rename(staged, target)?;
+                    journal.entries.last_mut().expect("entry pushed").wrote = true;
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(publication) = apply() {
+        let mut failures = Vec::new();
+        for entry in journal.entries.iter().rev() {
+            if entry.wrote
+                && let Err(error) = fs::remove_file(&entry.target)
+            {
+                failures.push(format!("{}: {error}", entry.target.display()));
+                continue;
+            }
+            if let Some(backup) = &entry.backup
+                && let Err(error) = rename(backup, &entry.target)
+            {
+                failures.push(format!("{}: {error}", entry.target.display()));
+            }
+        }
+        for directory in journal.created_dirs.iter().rev() {
+            let _ = fs::remove_dir(directory);
+        }
+        if failures.is_empty() {
+            return Err(publication.into());
+        }
+        let retained = temporary.keep();
+        return Err(io::Error::other(format!(
+            "could not publish generated files: {publication}; could not restore {}; previous files retained at {}",
+            failures.join(", "),
+            retained.join("previous").display(),
+        ))
+        .into());
+    }
+
+    if let Some(root) = &plan.prune_root {
+        for removed in &changes.removals {
+            for directory in removed.ancestors().skip(1) {
+                if directory == root || !directory.starts_with(root) {
+                    break;
+                }
+                if fs::remove_dir(directory).is_err() {
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, Failure> {
-    if !root.try_exists()? {
-        return Ok(BTreeMap::new());
-    }
-    let mut files = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(root) {
-        let entry = entry?;
-        if entry.path() == root {
-            if !entry.file_type().is_dir() {
-                return Err(std::io::Error::other("generated output is not a directory").into());
-            }
-            continue;
+fn parent_of(path: &Path) -> PathBuf {
+    path.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+fn create_missing_directories(directory: &Path, journal: &mut Journal) -> io::Result<()> {
+    let mut missing = Vec::new();
+    for ancestor in directory.ancestors() {
+        if ancestor.as_os_str().is_empty() || ancestor.try_exists()? {
+            break;
         }
-        if !entry.file_type().is_file() && !entry.file_type().is_dir() {
-            return Err(std::io::Error::other(format!(
-                "generated output contains a non-regular file: {}",
-                entry.path().display(),
-            ))
-            .into());
-        }
-        files.insert(
-            entry.path().strip_prefix(root)?.to_path_buf(),
-            if entry.file_type().is_dir() {
-                None
-            } else {
-                Some(fs::read(entry.path())?)
-            },
-        );
+        missing.push(ancestor.to_path_buf());
     }
-    Ok(files)
+    for path in missing.into_iter().rev() {
+        fs::create_dir(&path)?;
+        journal.created_dirs.push(path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn staging_failure_preserves_the_previous_owner_and_can_recover() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("sql");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("binding.rs"), "old binding").unwrap();
-        fs::write(output.join("views.sql"), "old view").unwrap();
-        fs::write(output.join("stale.rs"), "stale binding").unwrap();
-        let before = fs::metadata(output.join("binding.rs"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        let result = publish(&output, |stage| {
-            fs::write(stage.join("binding.rs"), "new binding")?;
-            fs::remove_file(stage.join("stale.rs"))?;
-            Err(std::io::Error::other("view write failed").into())
-        });
-        assert!(result.is_err());
-        assert_eq!(
-            fs::read_to_string(output.join("binding.rs")).unwrap(),
-            "old binding"
-        );
-        assert_eq!(
-            fs::read_to_string(output.join("stale.rs")).unwrap(),
-            "stale binding"
-        );
-        assert_eq!(
-            fs::metadata(output.join("binding.rs"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            before
-        );
-        publish(&output, |stage| {
-            fs::write(stage.join("binding.rs"), "new binding")?;
-            fs::write(stage.join("views.sql"), "new view")?;
-            fs::remove_file(stage.join("stale.rs"))?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(output.join("views.sql")).unwrap(),
-            "new view"
-        );
-        assert!(!output.join("stale.rs").exists());
+    fn old_time() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_600_000_000)
     }
-    #[test]
-    fn bootstrap_and_noop_preserve_unrelated_file_timestamps() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("sql");
-        publish(&output, |stage| {
-            fs::write(stage.join("mod.rs"), "first binding")?;
-            Ok(())
-        })
-        .unwrap();
-        fs::write(output.join("README.txt"), "keep me").unwrap();
-        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-        for file in ["mod.rs", "README.txt"] {
-            fs::File::open(output.join(file))
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+
+    fn set_old(path: &Path) {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_time()))
+            .unwrap();
+    }
+
+    fn modified(path: &Path) -> SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn plan(files: &[(&Path, &str)]) -> Plan {
+        Plan {
+            desired: files
+                .iter()
+                .map(|(path, content)| (path.to_path_buf(), content.to_string()))
+                .collect(),
+            ..Plan::default()
         }
-        publish(&output, |stage| {
-            fs::write(stage.join("mod.rs"), "first binding")?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            fs::metadata(output.join("mod.rs"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            old
-        );
-        publish(&output, |stage| {
-            fs::write(stage.join("mod.rs"), "changed binding")?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(output.join("README.txt")).unwrap(),
-            "keep me"
-        );
-        assert_eq!(
-            fs::metadata(output.join("README.txt"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            old
-        );
     }
 
     #[test]
-    fn failed_directory_publication_restores_previous_output() {
+    fn unchanged_plan_touches_nothing_and_changed_plan_updates_only_affected_files() {
         let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("sql");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("mod.rs"), "old binding").unwrap();
-        let before = fs::metadata(output.join("mod.rs"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        let mut calls = 0;
-        let result = publish_with_rename(
-            &output,
-            |stage| {
-                fs::write(stage.join("mod.rs"), "new binding")?;
-                Ok(())
-            },
-            |from, to| {
-                calls += 1;
-                if calls == 2 {
-                    Err(std::io::Error::other("publication refused"))
-                } else {
-                    fs::rename(from, to)
-                }
-            },
+        let (a, b) = (temp.path().join("a/one.rs"), temp.path().join("b/two.rs"));
+        publish(&plan(&[(&a, "one"), (&b, "two")]), temp.path()).unwrap();
+        set_old(&a);
+        set_old(&b);
+        publish(&plan(&[(&a, "one"), (&b, "two")]), temp.path()).unwrap();
+        assert_eq!((modified(&a), modified(&b)), (old_time(), old_time()));
+        publish(&plan(&[(&a, "one"), (&b, "changed")]), temp.path()).unwrap();
+        assert_eq!(modified(&a), old_time());
+        assert_ne!(modified(&b), old_time());
+        assert_eq!(fs::read_to_string(&b).unwrap(), "changed");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failure_at_the_second_directory_restores_the_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b, stale) = (
+            temp.path().join("a/one.rs"),
+            temp.path().join("b/two.rs"),
+            temp.path().join("c/stale.rs"),
         );
+        publish(
+            &plan(&[(&a, "old one"), (&b, "old two"), (&stale, "stale")]),
+            temp.path(),
+        )
+        .unwrap();
+        for path in [&a, &b, &stale] {
+            set_old(path);
+        }
+        let fresh = temp.path().join("a/fresh.rs");
+        let mut next = plan(&[(&a, "new one"), (&b, "new two"), (&fresh, "fresh")]);
+        next.managed.insert(stale.clone());
+        let mut failed = false;
+        let result = publish_with_rename(&next, temp.path(), |from, to| {
+            if !failed && to == b {
+                failed = true;
+                return Err(io::Error::other("second directory refused"));
+            }
+            fs::rename(from, to)
+        });
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("publication refused")
+                .contains("second directory refused")
         );
-        assert_eq!(
-            fs::read_to_string(output.join("mod.rs")).unwrap(),
-            "old binding"
-        );
-        assert_eq!(
-            fs::metadata(output.join("mod.rs"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            before
-        );
-        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "old one");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "old two");
+        assert_eq!(fs::read_to_string(&stale).unwrap(), "stale");
+        assert!(!fresh.exists());
+        for path in [&a, &b, &stale] {
+            assert_eq!(modified(path), old_time());
+        }
+        let leftovers = fs::read_dir(temp.path()).unwrap().count();
+        assert_eq!(leftovers, 3, "only a, b and c remain");
     }
 
     #[test]
-    fn failed_restoration_reports_and_retains_the_previous_output() {
+    fn removals_prune_emptied_directories_below_the_root() {
         let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("sql");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("mod.rs"), "old binding").unwrap();
+        let root = temp.path().join("shared");
+        let nested = root.join("pages/users.rs");
+        publish(&plan(&[(&nested, "old")]), temp.path()).unwrap();
+        let mut next = plan(&[]);
+        next.managed.insert(nested.clone());
+        next.prune_root = Some(root.clone());
+        publish(&next, temp.path()).unwrap();
+        assert!(root.is_dir());
+        assert!(!root.join("pages").exists());
+    }
+
+    #[test]
+    fn failed_restoration_reports_and_retains_the_previous_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b) = (temp.path().join("a/one.rs"), temp.path().join("b/two.rs"));
+        publish(&plan(&[(&a, "old one"), (&b, "old two")]), temp.path()).unwrap();
+        let next = plan(&[(&a, "new one"), (&b, "new two")]);
         let mut calls = 0;
-        let result = publish_with_rename(
-            &output,
-            |stage| {
-                fs::write(stage.join("mod.rs"), "new binding")?;
-                Ok(())
-            },
-            |from, to| {
-                calls += 1;
-                if calls > 1 {
-                    Err(std::io::Error::other("rename refused"))
-                } else {
-                    fs::rename(from, to)
-                }
-            },
-        );
+        let result = publish_with_rename(&next, temp.path(), |from, to| {
+            calls += 1;
+            if calls > 3 {
+                Err(io::Error::other("rename refused"))
+            } else {
+                fs::rename(from, to)
+            }
+        });
         let error = result.unwrap_err().to_string();
-        let retained = PathBuf::from(error.split("previous output retained at ").nth(1).unwrap());
-        assert_eq!(
-            fs::read_to_string(retained.join("mod.rs")).unwrap(),
-            "old binding"
-        );
-        assert!(!output.exists());
+        let retained = PathBuf::from(error.split("previous files retained at ").nth(1).unwrap());
+        assert_eq!(fs::read_to_string(retained.join("1")).unwrap(), "old one");
+    }
+
+    #[test]
+    fn changes_reads_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (kept, stale) = (temp.path().join("kept.rs"), temp.path().join("stale.rs"));
+        fs::write(&kept, "kept").unwrap();
+        fs::write(&stale, "stale").unwrap();
+        let mut next = plan(&[(&kept, "kept"), (&temp.path().join("new.rs"), "new")]);
+        next.managed.insert(stale.clone());
+        let changes = next.changes().unwrap();
+        assert_eq!(changes.writes.len(), 1);
+        assert_eq!(changes.removals, BTreeSet::from([stale]));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
     }
 }

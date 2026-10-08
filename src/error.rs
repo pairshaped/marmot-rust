@@ -129,7 +129,11 @@ pub enum Error {
         names: Vec<String>,
     },
 
-    GeneratedTemporalModuleCollision,
+    TemporalModuleNotConfigured,
+
+    InvalidTemporalConfig {
+        reason: String,
+    },
 
     MixedParameterStyles {
         path: PathBuf,
@@ -289,10 +293,13 @@ impl std::fmt::Display for Error {
             Self::DuplicateRowTypeNames { names } => {
                 write!(f, "duplicate generated row type names: {names:?}")
             }
-            Self::GeneratedTemporalModuleCollision => write!(
+            Self::TemporalModuleNotConfigured => write!(
                 f,
-                "temporal types require a generated temporal module, but the project already has a root temporal SQL module"
+                "queries use temporal types; configure [tools.marmot.temporal].module with the absolute path of the temporal module"
             ),
+            Self::InvalidTemporalConfig { reason } => {
+                write!(f, "invalid [tools.marmot.temporal] configuration: {reason}")
+            }
             Self::MixedParameterStyles { path } => {
                 write!(
                     f,

@@ -221,7 +221,7 @@ fn generate_reconciles_declared_views_before_analyzing_consumers() {
         String::from_utf8_lossy(&generated.stderr)
     );
     assert!(output.join("views.sql").exists());
-    assert!(output.join("active_users.rs").exists());
+    assert!(source_root.join("active_users.generated.rs").exists());
     let connection = Connection::open(&database).unwrap();
     let names = connection
         .prepare("SELECT name FROM view_active_users ORDER BY id")
@@ -565,7 +565,7 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(source_root.join("generated/users.rs").exists());
+    assert!(source_root.join("users.generated.rs").exists());
 }
 
 #[test]
@@ -626,7 +626,7 @@ init_sql = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(source_root.join("generated/users.rs").exists());
+    assert!(source_root.join("users.generated.rs").exists());
 }
 
 #[test]
@@ -790,9 +790,10 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!config_source_root.join("users.generated.rs").exists());
     assert!(!config_output.exists());
-    assert!(cli_output.join("users.rs").exists());
-    let generated = fs::read_to_string(cli_output.join("users.rs")).unwrap();
+    assert!(cli_source_root.join("users.generated.rs").exists());
+    let generated = fs::read_to_string(cli_source_root.join("users.generated.rs")).unwrap();
     assert!(generated.contains("FROM_CLI_SQL"));
 }
 
@@ -838,7 +839,7 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let generated = fs::read_to_string(output_dir.join("users.rs")).unwrap();
+    let generated = fs::read_to_string(source_root.join("users.generated.rs")).unwrap();
     assert!(generated.contains("FIND_USER_SQL"));
 }
 
@@ -874,7 +875,7 @@ fn generate_command_cli_database_overrides_database_url() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output_dir.join("users.rs").exists());
+    assert!(source_root.join("users.generated.rs").exists());
 }
 
 #[test]
@@ -937,7 +938,7 @@ fn generate_command_accepts_output_with_current_dir_segments() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/generated/sql/users.rs").exists());
+    assert!(dir.path().join("src/users.generated.rs").exists());
 }
 
 #[test]
@@ -995,7 +996,7 @@ fn generate_command_succeeds_with_no_sql_directories() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/generated/sql/mod.rs").exists());
+    assert!(!dir.path().join("src/generated").exists());
 }
 
 #[test]
@@ -1324,7 +1325,7 @@ output = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/app/generated/users.rs").exists());
+    assert!(dir.path().join("src/app/users.generated.rs").exists());
 }
 
 #[test]
@@ -1381,7 +1382,7 @@ source_root = "{}"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let generated_path = cli_source_root.join("app/generated/sql/users.rs");
+    let generated_path = cli_source_root.join("app/users.generated.rs");
     let generated = fs::read_to_string(generated_path).unwrap();
     assert!(generated.contains("FROM_CLI_SQL"));
     assert!(!generated.contains("FROM_CONFIG_SQL"));
@@ -1444,10 +1445,10 @@ name = "analytics"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/app/generated/sql/users.rs").exists());
+    assert!(dir.path().join("src/app/users.generated.rs").exists());
     assert!(
         dir.path()
-            .join("src/analytics/generated/sql/events.rs")
+            .join("src/analytics/events.generated.rs")
             .exists()
     );
 }
@@ -1511,10 +1512,10 @@ name = "analytics"
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.path().join("src/app/generated/sql/users.rs").exists());
+    assert!(dir.path().join("src/app/users.generated.rs").exists());
     assert!(
         dir.path()
-            .join("src/analytics/generated/sql/events.rs")
+            .join("src/analytics/events.generated.rs")
             .exists()
     );
 }
@@ -2155,7 +2156,7 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
         .unwrap(),
         0
     );
-    assert!(source.join("generated/values.rs").is_file());
+    assert!(source.join("values.generated.rs").is_file());
 
     let feature = dir.path().join("feature/src");
     fs::create_dir_all(&feature).unwrap();
@@ -2195,6 +2196,6 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert!(feature.join("generated/values.rs").is_file());
+    assert!(feature.join("values.generated.rs").is_file());
     assert!(!feature.join("generated/db_views").exists());
 }

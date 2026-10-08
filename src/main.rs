@@ -7,7 +7,7 @@ use marmot::{
     config::{ConfigError, DatabaseReference},
     emit::emit_project_with_views,
     migrations,
-    model::{Project, ValueType},
+    model::Project,
     reset, schema, seeds,
     validation::{self, IntegrityMode, ValidationConfig, ValidationOutput},
     views,
@@ -553,7 +553,8 @@ fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
 fn ensure_generated_outputs_do_not_collide(analyzed: &[AnalyzedTarget]) -> Result<(), MarmotError> {
     let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
     for (target_index, analyzed_target) in analyzed.iter().enumerate() {
-        for path in generated_output_paths(&analyzed_target.target.config, &analyzed_target.project)
+        for path in
+            marmot::emit::output_paths(&analyzed_target.target.config, &analyzed_target.project)
         {
             by_path.entry(path).or_default().insert(target_index);
         }
@@ -569,49 +570,6 @@ fn ensure_generated_outputs_do_not_collide(analyzed: &[AnalyzedTarget]) -> Resul
     } else {
         Err(MarmotError::GeneratedOutputCollision { paths: collisions })
     }
-}
-
-fn generated_output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::new();
-    for query in &project.queries {
-        paths.insert(generated_module_path(&config.output, &query.module_name));
-        let mut prefix = config.output.clone();
-        paths.insert(prefix.join("mod.rs"));
-        let segments = query.module_name.split('/').collect::<Vec<_>>();
-        for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-            prefix.push(segment);
-            paths.insert(prefix.join("mod.rs"));
-        }
-    }
-    paths.insert(config.output.join("mod.rs"));
-    if project_uses_temporal(project) {
-        paths.insert(config.output.join("temporal.rs"));
-    }
-    paths
-}
-
-fn project_uses_temporal(project: &Project) -> bool {
-    project.queries.iter().any(|query| {
-        query
-            .parameters
-            .iter()
-            .any(|param| matches!(param.column_type, ValueType::DbDate | ValueType::DbDateTime))
-            || query.columns.iter().any(|column| {
-                matches!(
-                    column.column_type,
-                    ValueType::DbDate | ValueType::DbDateTime
-                )
-            })
-    })
-}
-
-fn generated_module_path(output: &Path, module: &str) -> PathBuf {
-    let mut path = output.to_path_buf();
-    for segment in module.split('/') {
-        path.push(segment);
-    }
-    path.set_extension("rs");
-    path
 }
 
 #[derive(Debug)]

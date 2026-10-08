@@ -41,6 +41,11 @@ pub struct TemporalConfig {
     pub date_suffixes: Vec<String>,
     pub datetime_storage: TemporalDateTimeStorage,
     pub date_storage: TemporalDateStorage,
+    /// Absolute path of the module generated bindings import temporal types from.
+    pub module: Option<String>,
+    /// File Marmot writes the temporal module to, directly inside the shared
+    /// output folder. When omitted, the project supplies the module.
+    pub output: Option<PathBuf>,
 }
 
 impl Default for TemporalConfig {
@@ -51,6 +56,8 @@ impl Default for TemporalConfig {
             date_suffixes: vec!["_on".to_string()],
             datetime_storage: TemporalDateTimeStorage::TextSecondUtc,
             date_storage: TemporalDateStorage::TextYmd,
+            module: None,
+            output: None,
         }
     }
 }
@@ -196,6 +203,8 @@ fn toml_temporal_config(marmot: Option<&toml::Value>) -> Result<TemporalConfig, 
     };
 
     let mut config = TemporalConfig::default();
+    config.module = toml_string(Some(temporal), "module");
+    config.output = toml_path(Some(temporal), "output");
     config.strict_suffixes = temporal
         .get("strict_suffixes")
         .and_then(|value| value.as_bool())
@@ -390,10 +399,20 @@ mod tests {
             date_suffixes = ["_on", "_date"]
             datetime_storage = "text_second_utc"
             date_storage = "text_ymd"
+            module = "crate::generated::sql::temporal"
+            output = "src/generated/sql/temporal.rs"
             "#,
         )
         .unwrap();
 
+        assert_eq!(
+            config.temporal.module.as_deref(),
+            Some("crate::generated::sql::temporal")
+        );
+        assert_eq!(
+            config.temporal.output,
+            Some(PathBuf::from("src/generated/sql/temporal.rs"))
+        );
         assert!(config.temporal.strict_suffixes);
         assert_eq!(config.temporal.datetime_suffixes, ["_at", "_time"]);
         assert_eq!(config.temporal.date_suffixes, ["_on", "_date"]);

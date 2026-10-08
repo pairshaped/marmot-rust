@@ -295,68 +295,42 @@ pub fn emit_generated_sql(
     output: &Path,
     check: bool,
 ) -> Result<(), ViewError> {
-    if check {
-        return emit_generated_sql_staged(definitions, output, true);
+    let path = output.join(GENERATED_FILE);
+    let mut plan = crate::publication::Plan::default();
+    plan.managed.insert(path.clone());
+    if let Some(content) = render_generated_sql(definitions) {
+        plan.desired.insert(path.clone(), content);
     }
-    crate::publication::publish(output, |staged| {
-        emit_generated_sql_staged(definitions, staged, false)?;
-        Ok(())
-    })
-    .map_err(|source| match source.downcast::<ViewError>() {
-        Ok(source) => *source,
-        Err(source) => ViewError::WriteGeneratedFile {
-            path: output.to_path_buf(),
+    if check {
+        let changes = plan
+            .changes()
+            .map_err(|source| ViewError::ReadGeneratedFile {
+                path: path.clone(),
+                source,
+            })?;
+        return if changes.is_empty() {
+            Ok(())
+        } else {
+            Err(ViewError::StaleGeneratedFile { path })
+        };
+    }
+    let absolute = std::path::absolute(output).map_err(|source| ViewError::WriteGeneratedFile {
+        path: path.clone(),
+        source,
+    })?;
+    let stage_parent = absolute.parent().unwrap_or(&absolute);
+    crate::publication::publish(&plan, stage_parent).map_err(|source| {
+        ViewError::WriteGeneratedFile {
+            path,
             source: std::io::Error::other(source.to_string()),
-        },
+        }
     })
 }
 
-pub(crate) fn emit_generated_sql_staged(
-    definitions: &[ViewDefinition],
-    output: &Path,
-    check: bool,
-) -> Result<(), ViewError> {
-    let path = output.join(GENERATED_FILE);
-    if definitions.is_empty() {
-        if check {
-            return if path.exists() {
-                Err(ViewError::StaleGeneratedFile { path })
-            } else {
-                Ok(())
-            };
-        }
-        return match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(ViewError::RemoveGeneratedFile { path, source }),
-        };
-    }
-
-    let expected = generated_sql(definitions);
-    if check {
-        return match fs::read_to_string(&path) {
-            Ok(actual) if actual == expected => Ok(()),
-            Ok(_) => Err(ViewError::StaleGeneratedFile { path }),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                Err(ViewError::StaleGeneratedFile { path })
-            }
-            Err(source) => Err(ViewError::WriteGeneratedFile { path, source }),
-        };
-    }
-
-    fs::create_dir_all(output).map_err(|source| ViewError::CreateGeneratedDirectory {
-        path: output.to_path_buf(),
-        source,
-    })?;
-    match fs::read_to_string(&path) {
-        Ok(current) if current == expected => return Ok(()),
-        Ok(_) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(ViewError::ReadGeneratedFile { path, source });
-        }
-    }
-    fs::write(&path, expected).map_err(|source| ViewError::WriteGeneratedFile { path, source })
+/// The installation SQL for `definitions`, or `None` when there are no views and
+/// the generated file should not exist.
+pub(crate) fn render_generated_sql(definitions: &[ViewDefinition]) -> Option<String> {
+    (!definitions.is_empty()).then(|| generated_sql(definitions))
 }
 
 pub fn generated_sql(definitions: &[ViewDefinition]) -> String {

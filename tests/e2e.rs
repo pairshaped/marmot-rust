@@ -85,7 +85,7 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let config = Config {
         database,
         source_root,
-        output: dir.path().join("src/generated"),
+        output: dir.path().join("src/generated/sql"),
         target: Target::Rust,
         check: false,
         temporal: Default::default(),
@@ -94,23 +94,16 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
-    assert_eq!(mod_rs, "pub mod admin;\npub mod items;\npub mod users;\n");
+    assert!(!config.output.exists(), "no central tree is created");
 
-    let admin_mod_rs = fs::read_to_string(config.output.join("admin/mod.rs")).unwrap();
-    assert_eq!(admin_mod_rs, "pub mod items;\n");
-
-    let admin_items_mod_rs = fs::read_to_string(config.output.join("admin/items/mod.rs")).unwrap();
-    assert_eq!(admin_items_mod_rs, "pub mod index;\n");
-
-    let users_output = fs::read_to_string(config.output.join("users.rs")).unwrap();
+    let users_output = fs::read_to_string(config.source_root.join("users.generated.rs")).unwrap();
     assert!(users_output.contains("pub struct FindUserRow"));
     assert!(users_output.contains("pub struct FindUserParams"));
     assert!(users_output.contains("pub fn find_user(conn: &Connection, params: FindUserParams)"));
     assert!(users_output.contains("pub struct ListUsersRow"));
     assert!(users_output.contains("pub fn list_users(conn: &Connection)"));
 
-    let items_output = fs::read_to_string(config.output.join("items.rs")).unwrap();
+    let items_output = fs::read_to_string(config.source_root.join("items.generated.rs")).unwrap();
     assert!(items_output.contains("pub struct ListItemsRow"));
     assert!(items_output.contains("pub struct ListItemsParams"));
     assert!(items_output.contains("pub fn list_items(conn: &Connection, params: ListItemsParams)"));
@@ -118,7 +111,7 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
     assert!(items_output.contains("params![params.owner_id]"));
 
     let admin_items_output =
-        fs::read_to_string(config.output.join("admin/items/index.rs")).unwrap();
+        fs::read_to_string(config.source_root.join("admin/items/index.generated.rs")).unwrap();
     assert!(admin_items_output.contains("pub struct ListAdminItemsRow"));
     assert!(admin_items_output.contains("pub fn list_admin_items(conn: &Connection)"));
 }
@@ -169,7 +162,7 @@ fn named_boolean_constraints_emit_bool_types_for_strict_tables() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("settings.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("settings.generated.rs")).unwrap();
     assert!(output.contains("pub enabled: bool"));
     assert!(output.contains("pub featured: Option<bool>"));
     assert!(output.contains("pub winner_side: Option<i64>"));
@@ -232,7 +225,7 @@ fn scalar_subquery_outputs_generate_nullable_rust_fields() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("carts.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("carts.generated.rs")).unwrap();
     assert!(output.contains("pub first_required_waiver_id: Option<i64>"));
     assert!(output.contains("pub first_required_waiver_id_cast: Option<i64>"));
 }
@@ -282,7 +275,7 @@ fn optional_and_sentinel_filters_generate_expected_parameter_types() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("tasks.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("tasks.generated.rs")).unwrap();
     assert!(output.contains("pub struct ListTasksParams<'a>"));
     assert!(output.contains("pub param: Option<i64>"));
     assert!(output.contains("pub param_2: Option<&'a str>"));
@@ -290,9 +283,7 @@ fn optional_and_sentinel_filters_generate_expected_parameter_types() {
     assert!(output.contains("pub fn list_tasks(conn: &Connection, params: ListTasksParams<'_>)"));
 }
 
-#[test]
-fn strict_temporal_suffixes_generate_checked_boundary_types() {
-    let dir = tempfile::tempdir().unwrap();
+fn temporal_fixture_config(dir: &tempfile::TempDir) -> Config {
     let database = dir.path().join("app.sqlite3");
     let conn = Connection::open(&database).unwrap();
     conn.execute_batch(
@@ -308,7 +299,7 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
     .unwrap();
     drop(conn);
 
-    let source_root = dir.path().join("fixture/src");
+    let source_root = dir.path().join("runtime/src");
     let module_dir = source_root.join("app");
     fs::create_dir_all(&module_dir).unwrap();
     write_sql_file(
@@ -329,7 +320,7 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
          order by id",
     );
 
-    let config = Config {
+    Config {
         database,
         source_root,
         output: dir.path().join("runtime/src/generated/sql"),
@@ -337,18 +328,27 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::generated::sql::temporal".to_string()),
+            output: Some(dir.path().join("runtime/src/generated/sql/temporal.rs")),
             ..Default::default()
         },
-    };
+    }
+}
+
+#[test]
+fn strict_temporal_suffixes_generate_checked_boundary_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = temporal_fixture_config(&dir);
 
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
     let mod_rs = fs::read_to_string(config.output.join("mod.rs")).unwrap();
-    assert_eq!(mod_rs, "pub mod app;\npub mod temporal;\n");
-    let app_rs = fs::read_to_string(config.output.join("app.rs")).unwrap();
+    assert_eq!(mod_rs, "pub mod temporal;\n");
+    assert!(config.output.join("temporal.rs").is_file());
+    let app_rs = fs::read_to_string(config.source_root.join("app.generated.rs")).unwrap();
     // The emitted module is rustfmt-normalized, which drops the redundant `as temporal` alias.
-    assert!(app_rs.contains("use super::temporal;"));
+    assert!(app_rs.contains("use crate::generated::sql::temporal;"));
     assert!(app_rs.contains("pub starts_at: temporal::DbDateTime"));
     assert!(app_rs.contains("pub registration_closes_on: Option<temporal::DbDate>"));
     assert!(app_rs.contains("pub starts_at: &'a temporal::DbDateTime"));
@@ -373,6 +373,63 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
         output.status.success(),
         "generated temporal crate tests failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn project_supplied_temporal_module_compiles_without_a_generated_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = temporal_fixture_config(&dir);
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+    let temporal_module = fs::read_to_string(config.output.join("temporal.rs")).unwrap();
+
+    config.temporal.module = Some("crate::calendar_support::temporal".to_string());
+    config.temporal.output = None;
+    emit_project(&config, &project).unwrap();
+    assert_eq!(
+        fs::read_dir(&config.output).unwrap().count(),
+        0,
+        "no generated temporal declaration or module remains"
+    );
+    let app_rs = fs::read_to_string(config.source_root.join("app.generated.rs")).unwrap();
+    assert!(app_rs.contains("use crate::calendar_support::temporal;"));
+
+    write_temporal_runtime_crate(dir.path());
+    let runtime = dir.path().join("runtime/src");
+    fs::remove_dir_all(runtime.join("generated")).unwrap();
+    fs::create_dir_all(runtime.join("calendar_support")).unwrap();
+    fs::write(
+        runtime.join("calendar_support/mod.rs"),
+        "pub mod temporal;\n",
+    )
+    .unwrap();
+    fs::write(
+        runtime.join("calendar_support/temporal.rs"),
+        temporal_module,
+    )
+    .unwrap();
+    let lib = fs::read_to_string(runtime.join("lib.rs")).unwrap();
+    fs::write(
+        runtime.join("lib.rs"),
+        lib.replace("pub mod generated;", "pub mod calendar_support;")
+            .replace(
+                "super::generated::sql::temporal",
+                "super::calendar_support::temporal",
+            ),
+    )
+    .unwrap();
+
+    let output = isolated_cargo()
+        .arg("test")
+        .current_dir(dir.path().join("runtime"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "project-supplied temporal crate failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -411,6 +468,7 @@ fn strict_temporal_suffixes_reject_non_text_storage() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     });
@@ -464,6 +522,7 @@ fn temporal_comparison_expression_infers_datetime_parameter() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     };
@@ -471,7 +530,7 @@ fn temporal_comparison_expression_infers_datetime_parameter() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("registrations.generated.rs")).unwrap();
     assert!(output.contains("pub season_start_at: &'a temporal::DbDateTime"));
 }
 
@@ -498,6 +557,7 @@ fn temporal_suffix_infers_standalone_parameter_type() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     };
@@ -505,7 +565,7 @@ fn temporal_suffix_infers_standalone_parameter_type() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("events.generated.rs")).unwrap();
     assert!(output.contains("pub published_at: &'a temporal::DbDateTime"));
 }
 
@@ -532,6 +592,7 @@ fn temporal_suffix_survives_storage_cast() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     };
@@ -539,7 +600,7 @@ fn temporal_suffix_survives_storage_cast() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("events.generated.rs")).unwrap();
     assert!(output.contains("pub published_at: &'a temporal::DbDateTime"));
 }
 
@@ -566,6 +627,7 @@ fn sqlite_unixepoch_datetime_infers_integer_parameter() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     };
@@ -573,7 +635,7 @@ fn sqlite_unixepoch_datetime_infers_integer_parameter() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("events.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("events.generated.rs")).unwrap();
     assert!(output.contains("season_start: i64"));
 }
 
@@ -613,6 +675,7 @@ fn conflicting_temporal_parameter_evidence_is_rejected() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     });
@@ -665,6 +728,7 @@ fn cte_temporal_alias_infers_datetime_parameter() {
         check: false,
         temporal: marmot::config::TemporalConfig {
             strict_suffixes: true,
+            module: Some("crate::calendar_support::temporal".to_string()),
             ..Default::default()
         },
     };
@@ -672,7 +736,7 @@ fn cte_temporal_alias_infers_datetime_parameter() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("registrations.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("registrations.generated.rs")).unwrap();
     assert!(output.contains("pub season_start_at: &'a temporal::DbDateTime"));
 }
 
@@ -713,7 +777,7 @@ fn guarded_nullable_column_emits_non_null_result() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     assert!(output.contains("Result<Vec<i64>>"));
     assert!(!output.contains("Result<Vec<Option<i64>>>"));
 }
@@ -757,7 +821,7 @@ fn guarded_distinct_nullable_column_emits_non_null_result() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     assert!(output.contains("Result<Vec<i64>>"));
     assert!(!output.contains("Result<Vec<Option<i64>>>"));
 }
@@ -801,7 +865,7 @@ fn guarded_nullable_column_cast_emits_non_null_result() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     assert!(output.contains("Result<Vec<i64>>"));
     assert!(!output.contains("Result<Vec<Option<i64>>>"));
 }
@@ -849,7 +913,7 @@ fn compound_result_stays_nullable_when_any_arm_is_unguarded() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     assert!(output.contains("Result<Vec<Option<i64>>>"));
 }
 
@@ -896,7 +960,7 @@ fn compound_result_is_non_null_when_every_arm_is_guarded() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     assert!(output.contains("Result<Vec<i64>>"));
     assert!(!output.contains("Result<Vec<Option<i64>>>"));
 }
@@ -967,7 +1031,7 @@ fn non_null_guards_do_not_leak_across_query_scopes() {
     let project = analyze_project(&config).unwrap();
     emit_project(&config, &project).unwrap();
 
-    let output = fs::read_to_string(config.output.join("products.rs")).unwrap();
+    let output = fs::read_to_string(config.source_root.join("products.generated.rs")).unwrap();
     for function in [
         "list_unguarded",
         "list_unrelated_guard",
@@ -988,7 +1052,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     create_runtime_schema(&conn);
     drop(conn);
 
-    let source_root = dir.path().join("fixture/src");
+    let source_root = dir.path().join("runtime/src");
     let module_dir = source_root.join("app");
     fs::create_dir_all(&module_dir).unwrap();
     write_sql_file(
@@ -1168,7 +1232,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     fs::write(
         dir.path().join("runtime/src/bin/immutable_mutation.rs"),
         r#"
-use marmot_generated_runtime_test::generated::sql::app;
+use marmot_generated_runtime_test::app;
 use rusqlite::Connection;
 
 fn main() {
@@ -1259,13 +1323,13 @@ rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
         runtime.join("src/lib.rs"),
         r##"
 pub mod generated;
+#[path = "app.generated.rs"]
+pub mod app;
 
 #[cfg(test)]
 mod tests {
-    use super::generated::sql::{
-        app,
-        temporal::{DbDate, DbDateTime},
-    };
+    use super::app;
+    use super::generated::sql::temporal::{DbDate, DbDateTime};
     use rusqlite::Connection;
 
     fn create_schema(conn: &Connection) {
@@ -1366,7 +1430,7 @@ mod tests {
 
 fn write_runtime_crate(root: &std::path::Path) {
     let runtime = root.join("runtime");
-    fs::create_dir_all(runtime.join("src/generated")).unwrap();
+    fs::create_dir_all(runtime.join("src")).unwrap();
     fs::write(
         runtime.join("Cargo.toml"),
         r#"
@@ -1381,15 +1445,15 @@ rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
 "#,
     )
     .unwrap();
-    fs::write(runtime.join("src/generated/mod.rs"), "pub mod sql;\n").unwrap();
     fs::write(
         runtime.join("src/lib.rs"),
         r##"
-pub mod generated;
+#[path = "app.generated.rs"]
+pub mod app;
 
 #[cfg(test)]
 mod tests {
-    use super::generated::sql::app;
+    use super::app;
     use rusqlite::Connection;
 
     fn create_schema(conn: &Connection) {

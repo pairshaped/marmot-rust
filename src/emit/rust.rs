@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use heck::ToPascalCase;
@@ -10,125 +10,185 @@ use crate::error::{Error, Result};
 use crate::model::{ConnectionAccess, Parameter, Project, Query, ReturnType, ValueType};
 use crate::sqlite::tokenize::{Token, tokenize_spans};
 
-pub fn emit(
-    config: &Config,
-    project: &Project,
-    serialize_modules: &BTreeSet<String>,
-) -> Result<()> {
-    if config.check {
-        return emit_staged(config, project, serialize_modules);
-    }
-    crate::publication::publish(&config.output, |output| {
-        let mut staged_config = config.clone();
-        staged_config.output = output.to_path_buf();
-        emit_staged(&staged_config, project, serialize_modules)?;
-        Ok(())
-    })
-    .map_err(|source| match source.downcast::<Error>() {
-        Ok(source) => *source,
-        Err(source) => Error::WriteFile {
-            path: config.output.clone(),
-            source: std::io::Error::other(source.to_string()),
-        },
-    })
+/// The shared temporal module file and the declaration file beside it.
+struct TemporalOutput {
+    module_file: PathBuf,
+    declaration_file: PathBuf,
+    name: String,
 }
 
-pub(super) fn emit_staged(
+/// Render every Rust file this project owns: one `x.generated.rs` beside each
+/// `x.sql`, plus the fixed shared temporal module and its declaration when
+/// Marmot emits the temporal module. The project supplies the temporal module
+/// when `[tools.marmot.temporal].output` is omitted.
+pub(super) fn render_project(
     config: &Config,
     project: &Project,
     serialize_modules: &BTreeSet<String>,
-) -> Result<()> {
+) -> Result<BTreeMap<PathBuf, String>> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
     for query in &project.queries {
         by_module.entry(&query.module_name).or_default().push(query);
     }
-
-    let modules = by_module.keys().copied().collect::<Vec<_>>();
-    let include_temporal = project_uses_temporal(project);
-    if include_temporal && modules.contains(&"temporal") {
-        return Err(Error::GeneratedTemporalModuleCollision);
+    let uses_temporal = project_uses_temporal(project);
+    let temporal_module = config.temporal.module.as_deref();
+    if let Some(module) = temporal_module {
+        validate_temporal_module(module)?;
     }
+    if uses_temporal && temporal_module.is_none() {
+        return Err(Error::TemporalModuleNotConfigured);
+    }
+    let temporal_output = temporal_output(config)?;
 
     let mut desired = BTreeMap::new();
     for (module, queries) in by_module {
-        let path = generated_module_path(&config.output, module);
-        let mut content = render_module(module, queries)?;
+        let path = adjacent_binding_path(queries[0]);
+        let mut content = render_module(&sql_file_name(queries[0]), queries, temporal_module)?;
         if serialize_modules.contains(module) {
             content = add_serialize_to_row_structs(content);
         }
         desired.insert(path, content);
     }
+    format_generated_files(&mut desired)?;
 
-    if include_temporal {
-        desired.insert(
-            config.output.join("temporal.rs"),
-            render_temporal_module().to_string(),
-        );
-    }
-
-    emit_mod_rs(&config.output, modules, include_temporal, &mut desired);
-    format_generated_files(&config.output, &mut desired)?;
-    for (path, content) in &desired {
-        if config.check {
-            ensure_file_current(path, content)?;
+    if let Some(temporal) = temporal_output {
+        let declaration = if uses_temporal {
+            format!("pub mod {};\n", temporal.name)
         } else {
-            write_if_changed(path, content)?;
+            String::new()
+        };
+        desired.insert(temporal.declaration_file, declaration);
+        if uses_temporal {
+            desired.insert(temporal.module_file, render_temporal_module().to_string());
         }
     }
-    remove_stale_generated_files(&config.output, &desired, config.check)
+    Ok(desired)
 }
 
-fn write_if_changed(path: &Path, content: &str) -> Result<()> {
-    match fs::read_to_string(path) {
-        Ok(current) if current == content => return Ok(()),
-        Ok(_) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(Error::ReadFile {
-                path: path.to_path_buf(),
+/// Every Rust file Marmot may delete: any adjacent binding under the source
+/// root and any Rust file in the shared output folder, such as a retired
+/// central tree.
+pub(super) fn managed_files(config: &Config) -> Result<BTreeSet<PathBuf>> {
+    let mut managed = BTreeSet::new();
+    for (root, adjacent_only) in [(&config.source_root, true), (&config.output, false)] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.map_err(|source| Error::WalkDir {
+                path: root.to_path_buf(),
                 source,
-            });
+            })?;
+            let name = entry.file_name().to_string_lossy();
+            let owned = if adjacent_only {
+                name.ends_with(ADJACENT_SUFFIX)
+            } else {
+                name.ends_with(".rs") || name.ends_with(ADJACENT_SUFFIX)
+            };
+            if entry.file_type().is_file() && owned {
+                managed.insert(entry.path().to_path_buf());
+            }
         }
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::write(path, content).map_err(|source| Error::WriteFile {
-        path: path.to_path_buf(),
-        source,
-    })
+    Ok(managed)
 }
 
-fn format_generated_files(output: &Path, desired: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+/// The paths a project writes, for collision checks between targets.
+pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
+    let mut paths = project
+        .queries
+        .iter()
+        .map(adjacent_binding_path)
+        .collect::<BTreeSet<_>>();
+    if let Ok(Some(temporal)) = temporal_output(config) {
+        paths.insert(temporal.declaration_file);
+        if project_uses_temporal(project) {
+            paths.insert(temporal.module_file);
+        }
+    }
+    paths
+}
+
+const ADJACENT_SUFFIX: &str = ".generated.rs";
+
+pub(super) fn adjacent_binding_path(query: &Query) -> PathBuf {
+    query.source_path.with_extension("generated.rs")
+}
+
+fn validate_temporal_module(module: &str) -> Result<()> {
+    let valid = module.split("::").all(|segment| {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }) && module.split("::").count() > 1;
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidTemporalConfig {
+            reason: format!(
+                "module `{module}` must be an absolute path such as crate::generated::sql::temporal"
+            ),
+        })
+    }
+}
+
+fn temporal_output(config: &Config) -> Result<Option<TemporalOutput>> {
+    let Some(file) = &config.temporal.output else {
+        return Ok(None);
+    };
+    let Some(module) = config.temporal.module.as_deref() else {
+        return Err(Error::InvalidTemporalConfig {
+            reason: "output requires module".to_string(),
+        });
+    };
+    let name = module.rsplit("::").next().unwrap_or_default().to_string();
+    let invalid = |reason: String| Err(Error::InvalidTemporalConfig { reason });
+    if file.file_stem().and_then(|stem| stem.to_str()) != Some(name.as_str())
+        || file.extension().and_then(|extension| extension.to_str()) != Some("rs")
+    {
+        return invalid(format!(
+            "output must be named {name}.rs to match module {module}"
+        ));
+    }
+    let parent_matches = match (
+        std::path::absolute(file),
+        std::path::absolute(&config.output),
+    ) {
+        (Ok(file), Ok(output)) => file.parent() == Some(output.as_path()),
+        _ => false,
+    };
+    if !parent_matches {
+        return invalid(format!(
+            "output {} must be directly inside the shared output folder {}",
+            file.display(),
+            config.output.display()
+        ));
+    }
+    Ok(Some(TemporalOutput {
+        module_file: file.clone(),
+        declaration_file: config.output.join("mod.rs"),
+        name,
+    }))
+}
+
+fn format_generated_files(desired: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+    if desired.is_empty() {
+        return Ok(());
+    }
     let staged = tempfile::tempdir().map_err(|source| Error::CreateDir {
         path: std::env::temp_dir(),
         source,
     })?;
     let mut format_paths = Vec::new();
-    for (path, content) in desired.iter() {
-        if path.file_name().is_some_and(|name| name == "mod.rs") {
-            continue;
-        }
-        let staged_path = staged.path().join(
-            path.strip_prefix(output)
-                .expect("generated path under output"),
-        );
-        let parent = staged_path.parent().expect("generated file has parent");
-        fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+    for (index, content) in desired.values().enumerate() {
+        let staged_path = staged.path().join(format!("{index}.rs"));
         fs::write(&staged_path, content).map_err(|source| Error::WriteFile {
             path: staged_path.clone(),
             source,
         })?;
         format_paths.push(staged_path);
-    }
-    if format_paths.is_empty() {
-        return Ok(());
     }
     let formatted = Command::new("rustfmt")
         .arg("--edition")
@@ -145,61 +205,11 @@ fn format_generated_files(output: &Path, desired: &mut BTreeMap<PathBuf, String>
             reason: String::from_utf8_lossy(&formatted.stderr).into_owned(),
         });
     }
-    for (path, content) in desired.iter_mut() {
-        if path.file_name().is_some_and(|name| name == "mod.rs") {
-            continue;
-        }
-        let staged_path = staged.path().join(
-            path.strip_prefix(output)
-                .expect("generated path under output"),
-        );
+    for (content, staged_path) in desired.values_mut().zip(format_paths) {
         *content = fs::read_to_string(&staged_path).map_err(|source| Error::ReadFile {
             path: staged_path,
             source,
         })?;
-    }
-    Ok(())
-}
-
-fn remove_stale_generated_files(
-    output: &Path,
-    desired: &BTreeMap<PathBuf, String>,
-    check: bool,
-) -> Result<()> {
-    if !output.exists() {
-        return Ok(());
-    }
-    for entry in walkdir::WalkDir::new(output).contents_first(true) {
-        let entry = entry.map_err(|source| Error::WalkDir {
-            path: output.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        if entry.file_type().is_file()
-            && path.extension().is_some_and(|extension| extension == "rs")
-            && !desired.contains_key(path)
-        {
-            if check {
-                return Err(Error::StaleGeneratedFile {
-                    path: path.to_path_buf(),
-                });
-            }
-            fs::remove_file(path).map_err(|source| Error::WriteFile {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        } else if !check && entry.file_type().is_dir() && path != output {
-            match fs::remove_dir(path) {
-                Ok(()) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(source) => {
-                    return Err(Error::WriteFile {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -209,15 +219,6 @@ fn add_serialize_to_row_structs(content: String) -> String {
         "#[derive(Debug, Clone, PartialEq)]\npub struct ",
         "#[derive(Debug, Clone, PartialEq, serde::Serialize)]\npub struct ",
     )
-}
-
-fn generated_module_path(output: &Path, module: &str) -> PathBuf {
-    let mut path = output.to_path_buf();
-    for segment in module.split('/') {
-        path.push(segment);
-    }
-    path.set_extension("rs");
-    path
 }
 
 fn render_temporal_module() -> &'static str {
@@ -475,89 +476,26 @@ fn temporal_error(value: &str, expected: &'static str) -> TemporalParseError {
 "#
 }
 
-fn emit_mod_rs(
-    output: &Path,
-    modules: Vec<&str>,
-    include_temporal: bool,
-    desired: &mut BTreeMap<PathBuf, String>,
-) {
-    let mut tree = ModuleTree::default();
-    for module in modules {
-        tree.insert(module);
-    }
-    if include_temporal {
-        tree.insert("temporal");
-    }
-    write_module_tree(output, &tree, desired);
-}
-
-#[derive(Debug, Default)]
-struct ModuleTree {
-    children: BTreeMap<String, ModuleTree>,
-}
-
-impl ModuleTree {
-    fn insert(&mut self, module: &str) {
-        let mut current = self;
-        for segment in module.split('/') {
-            current = current.children.entry(segment.to_string()).or_default();
-        }
-    }
-}
-
-fn write_module_tree(path: &Path, tree: &ModuleTree, desired: &mut BTreeMap<PathBuf, String>) {
-    let mod_path = path.join("mod.rs");
-    let content = tree
-        .children
-        .keys()
-        .map(|module| module_declaration(path, module))
-        .collect::<String>();
-
-    desired.insert(mod_path, content);
-
-    for (module, child) in &tree.children {
-        if !child.children.is_empty() {
-            write_module_tree(&path.join(module), child, desired);
-        }
-    }
-}
-
-fn module_declaration(parent: &Path, module: &str) -> String {
-    let allow_module_inception = parent
+fn sql_file_name(query: &Query) -> String {
+    query
+        .source_path
         .file_name()
-        .is_some_and(|parent_module| parent_module == module);
-    if allow_module_inception {
-        format!("#[allow(clippy::module_inception)]\npub mod {module};\n")
-    } else {
-        format!("pub mod {module};\n")
-    }
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
-fn ensure_file_current(path: &std::path::Path, content: &str) -> Result<()> {
-    match fs::read_to_string(path) {
-        Ok(current) if current == content => Ok(()),
-        Ok(_) => Err(Error::StaleGeneratedFile {
-            path: path.to_path_buf(),
-        }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Err(Error::StaleGeneratedFile {
-                path: path.to_path_buf(),
-            })
-        }
-        Err(source) => Err(Error::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn render_module(module: &str, queries: Vec<&Query>) -> Result<String> {
+fn render_module(
+    sql_file: &str,
+    queries: Vec<&Query>,
+    temporal_module: Option<&str>,
+) -> Result<String> {
     validate_generated_names(&queries)?;
     let import_macros = render_import_macros(&queries);
-    let temporal_import = if queries.iter().any(|query| query_uses_temporal(query)) {
-        format!("use {} as temporal;\n", temporal_module_path(module))
-    } else {
-        String::new()
+    let temporal_import = match temporal_module {
+        Some(module) if queries.iter().any(|query| query_uses_temporal(query)) => {
+            format!("use {module} as temporal;\n")
+        }
+        _ => String::new(),
     };
     let mutation_connection = if queries
         .iter()
@@ -568,7 +506,7 @@ fn render_module(module: &str, queries: Vec<&Query>) -> Result<String> {
         String::new()
     };
     let mut output = format!(
-        "// This file is generated by Marmot. Do not edit by hand.\n\
+        "// @generated by Marmot from {sql_file}. Do not edit by hand.\n\
          #![allow(dead_code)]\n\
          use rusqlite::{{{import_macros}Connection, Result}};\n\
          {temporal_import}\n\
@@ -605,7 +543,7 @@ fn render_mutation_connection() -> String {
         .to_string()
 }
 
-fn project_uses_temporal(project: &Project) -> bool {
+pub(super) fn project_uses_temporal(project: &Project) -> bool {
     project.queries.iter().any(query_uses_temporal)
 }
 
@@ -622,11 +560,6 @@ fn query_uses_temporal(query: &Query) -> bool {
 
 fn value_type_is_temporal(value_type: &ValueType) -> bool {
     matches!(value_type, ValueType::DbDate | ValueType::DbDateTime)
-}
-
-fn temporal_module_path(module: &str) -> String {
-    let depth = module.split('/').count();
-    format!("{}temporal", "super::".repeat(depth))
 }
 
 fn validate_generated_names(queries: &[&Query]) -> Result<()> {
@@ -1285,118 +1218,6 @@ fn raw_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn set_old_mtime(path: &Path) -> SystemTime {
-        let old = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
-        old
-    }
-
-    #[test]
-    fn emit_preserves_final_formatted_files_in_both_output_trees() {
-        for tree in ["src/generated/sql", "agent_knowledge_db/generated/sql"] {
-            let fixture = tempfile::tempdir().unwrap();
-            let output = fixture.path().join(tree);
-            let mut config = Config {
-                database: fixture.path().join("app.sqlite3"),
-                source_root: fixture.path().join("src"),
-                output: output.clone(),
-                target: crate::config::Target::Rust,
-                check: false,
-                temporal: Default::default(),
-            };
-            let mut project = Project {
-                queries: vec![
-                    Query {
-                        source_path: PathBuf::from("src/users.sql"),
-                        module_name: "users".to_string(),
-                        name: "list_users".to_string(),
-                        return_type: ReturnType::Execute,
-                        connection_access: ConnectionAccess::Read,
-                        sql: "select id from users".to_string(),
-                        parameters: vec![],
-                        column_substitution: None,
-                        columns: vec![],
-                    },
-                    Query {
-                        source_path: PathBuf::from("src/events.sql"),
-                        module_name: "events".to_string(),
-                        name: "update_day".to_string(),
-                        return_type: ReturnType::Execute,
-                        connection_access: ConnectionAccess::Mutation,
-                        sql: "update events set day = @day".to_string(),
-                        parameters: vec![Parameter {
-                            name: "day".to_string(),
-                            sql_names: vec!["@day".to_string()],
-                            column_type: ValueType::DbDate,
-                            nullable: false,
-                        }],
-                        column_substitution: None,
-                        columns: vec![],
-                    },
-                ],
-            };
-            emit(&config, &project, &BTreeSet::new()).unwrap();
-            let paths = ["users.rs", "events.rs", "temporal.rs", "mod.rs"];
-            let before = paths.map(|name| {
-                (
-                    fs::read(output.join(name)).unwrap(),
-                    set_old_mtime(&output.join(name)),
-                )
-            });
-
-            emit(&config, &project, &BTreeSet::new()).unwrap();
-            for (index, name) in paths.iter().enumerate() {
-                assert_eq!(
-                    fs::read(output.join(name)).unwrap(),
-                    before[index].0,
-                    "{tree}/{name}"
-                );
-                assert_eq!(
-                    fs::metadata(output.join(name)).unwrap().modified().unwrap(),
-                    before[index].1,
-                    "{tree}/{name}"
-                );
-            }
-
-            project.queries[1].sql = "update events set day = @day where active = 1".to_string();
-            emit(&config, &project, &BTreeSet::new()).unwrap();
-            assert_ne!(fs::read(output.join("events.rs")).unwrap(), before[1].0);
-            for index in [0, 2, 3] {
-                assert_eq!(
-                    fs::metadata(output.join(paths[index]))
-                        .unwrap()
-                        .modified()
-                        .unwrap(),
-                    before[index].1
-                );
-            }
-
-            project.queries.pop();
-            config.check = true;
-            assert!(matches!(
-                emit(&config, &project, &BTreeSet::new()),
-                Err(Error::StaleGeneratedFile { .. })
-            ));
-            config.check = false;
-            emit(&config, &project, &BTreeSet::new()).unwrap();
-            assert!(!output.join("events.rs").exists());
-            assert!(!output.join("temporal.rs").exists());
-            assert_eq!(
-                fs::metadata(output.join("users.rs"))
-                    .unwrap()
-                    .modified()
-                    .unwrap(),
-                before[0].1
-            );
-        }
-    }
 
     #[test]
     fn serialize_opt_in_changes_generated_row_structs_only() {
@@ -1630,7 +1451,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users", vec![&query]).unwrap();
+        let output = render_module("users.sql", vec![&query], None).unwrap();
 
         assert!(output.contains("params![params.param, params.param_2]"));
     }
@@ -1662,7 +1483,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users", vec![&query]).unwrap();
+        let output = render_module("users.sql", vec![&query], None).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
         assert!(output.contains("params![params.param, params.id]"));
@@ -1695,7 +1516,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users", vec![&query]).unwrap();
+        let output = render_module("users.sql", vec![&query], None).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
         assert!(output.contains("params![params.param, params.param_2]"));
@@ -1982,113 +1803,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_module_names_allow_module_inception_at_the_generated_boundary() {
-        assert_eq!(
-            module_declaration(Path::new("generated/participants"), "participants"),
-            "#[allow(clippy::module_inception)]\npub mod participants;\n"
-        );
-        assert_eq!(
-            module_declaration(Path::new("generated/participants"), "waivers"),
-            "pub mod waivers;\n"
-        );
-    }
-
-    #[test]
-    fn emit_check_reports_missing_or_changed_files_as_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("src/generated");
-        let project = Project {
-            queries: vec![Query {
-                source_path: PathBuf::from("src/users/sql/list_users.sql"),
-                module_name: "users".to_string(),
-                name: "list_users".to_string(),
-                return_type: ReturnType::Rows,
-                connection_access: ConnectionAccess::Read,
-                sql: "select id, name from users".to_string(),
-                parameters: vec![],
-                column_substitution: None,
-                columns: vec![
-                    Column {
-                        name: "id".to_string(),
-                        field_name: "id".to_string(),
-                        column_type: ValueType::I64,
-                        nullable: false,
-                    },
-                    Column {
-                        name: "name".to_string(),
-                        field_name: "name".to_string(),
-                        column_type: ValueType::String,
-                        nullable: false,
-                    },
-                ],
-            }],
-        };
-        let check_config = Config {
-            database: dir.path().join("app.sqlite3"),
-            source_root: dir.path().join("src"),
-            output: output.clone(),
-            target: crate::config::Target::Rust,
-            check: true,
-            temporal: Default::default(),
-        };
-
-        assert!(matches!(
-            emit(&check_config, &project, &BTreeSet::new()),
-            Err(Error::StaleGeneratedFile { .. })
-        ));
-
-        let write_config = Config {
-            check: false,
-            temporal: Default::default(),
-            ..check_config.clone()
-        };
-        emit(&write_config, &project, &BTreeSet::new()).unwrap();
-        emit(&check_config, &project, &BTreeSet::new()).unwrap();
-
-        fs::write(output.join("users.rs"), "stale").unwrap();
-        assert!(matches!(
-            emit(&check_config, &project, &BTreeSet::new()),
-            Err(Error::StaleGeneratedFile { .. })
-        ));
-    }
-
-    #[test]
-    fn emit_rejects_root_temporal_module_when_temporal_types_are_generated() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = Project {
-            queries: vec![Query {
-                source_path: PathBuf::from("src/temporal.sql"),
-                module_name: "temporal".to_string(),
-                name: "create_event".to_string(),
-                return_type: ReturnType::Execute,
-                connection_access: ConnectionAccess::Mutation,
-                sql: "insert into events (starts_at) values (@starts_at)".to_string(),
-                parameters: vec![Parameter {
-                    name: "starts_at".to_string(),
-                    sql_names: vec!["@starts_at".to_string()],
-                    column_type: ValueType::DbDateTime,
-                    nullable: false,
-                }],
-                column_substitution: None,
-                columns: vec![],
-            }],
-        };
-        let config = Config {
-            database: dir.path().join("app.sqlite3"),
-            source_root: dir.path().join("src"),
-            output: dir.path().join("src/generated/sql"),
-            target: crate::config::Target::Rust,
-            check: false,
-            temporal: Default::default(),
-        };
-
-        assert!(matches!(
-            emit(&config, &project, &BTreeSet::new()),
-            Err(Error::GeneratedTemporalModuleCollision)
-        ));
-    }
-
-    #[test]
     fn render_module_rejects_duplicate_query_names() {
         let queries = [
             Query {
@@ -2127,7 +1841,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users", query_refs),
+            render_module("users.sql", query_refs, None),
             Err(Error::DuplicateQueryNames { names }) if names == ["find_user", "find_user_one"]
         ));
     }
@@ -2171,7 +1885,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users", query_refs),
+            render_module("users.sql", query_refs, None),
             Err(Error::DuplicateQueryNames { names }) if names == ["find_one"]
         ));
     }
@@ -2224,7 +1938,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users", query_refs),
+            render_module("users.sql", query_refs, None),
             Err(Error::DuplicateRowTypeNames { names }) if names == ["ListOrgsRow"]
         ));
     }
