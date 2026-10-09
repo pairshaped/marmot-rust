@@ -11,6 +11,34 @@ use crate::views::{self, ViewDefinition};
 
 pub use rust::output_paths;
 
+/// Every Rust file Marmot may delete: any adjacent binding under the source
+/// root and any Rust file in the shared output folder, such as a retired
+/// central tree.
+pub fn managed_files(config: &Config) -> Result<BTreeSet<PathBuf>> {
+    let mut managed = BTreeSet::new();
+    for (root, adjacent_only) in [(&config.source_root, true), (&config.output, false)] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.map_err(|source| Error::WalkDir {
+                path: root.to_path_buf(),
+                source,
+            })?;
+            let name = entry.file_name().to_string_lossy();
+            let owned = if adjacent_only {
+                name.ends_with(".generated.rs")
+            } else {
+                name.ends_with(".rs") || name.ends_with(".generated.rs")
+            };
+            if entry.file_type().is_file() && owned {
+                managed.insert(entry.path().to_path_buf());
+            }
+        }
+    }
+    Ok(managed)
+}
+
 pub fn emit_project(config: &Config, project: &Project) -> Result<()> {
     emit_project_with_serialize_modules(config, project, &BTreeSet::new())
 }
@@ -80,7 +108,7 @@ fn plan(
     let mut plan = match config.target {
         Target::Rust => Plan {
             desired: rust::render_project(config, project, serialize_modules)?,
-            managed: rust::managed_files(config)?,
+            managed: managed_files(config)?,
             prune_root: Some(config.output.clone()),
         },
     };

@@ -1,3 +1,5 @@
+mod generation_cache;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -33,7 +35,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Inspect(Args),
-    Generate(Args),
+    Generate(GenerateArgs),
     Migrate(MigrateArgs),
     Bootstrap(BootstrapArgs),
     Seed(SeedArgs),
@@ -63,6 +65,15 @@ struct Args {
 
     #[arg(long)]
     check: bool,
+}
+
+#[derive(Debug, Parser)]
+struct GenerateArgs {
+    #[command(flatten)]
+    args: Args,
+    /// Regenerate even when inputs and published outputs match the cache.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -251,7 +262,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Command::Generate(args) => {
+        Command::Generate(request) => {
+            let args = request.args;
+            let check = args.check;
+            let identity = if check {
+                None
+            } else {
+                generation_cache::executable_identity().ok()
+            };
+            let mut caches = Vec::new();
+            let mut outputs = Vec::new();
             let mut analyzed = Vec::new();
             let configs = configs(args, &file_config)?;
             for target in &configs {
@@ -261,15 +281,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             for target in configs {
+                let cache = generation_cache::Cache::new(&target);
+                let current = identity.as_ref().and_then(|identity| {
+                    cache
+                        .current(&target, &file_config, &cli.config, identity)
+                        .ok()
+                });
+                let input_fingerprint = current.as_ref().map(|state| state.inputs.clone());
+                if !request.force
+                    && let Some(state) = current
+                    && cache.matches(&state)
+                {
+                    outputs.push(state.outputs.keys().cloned().collect());
+                    println!(
+                        "Skipped {} (inputs and outputs unchanged)",
+                        target.config.source_root.display()
+                    );
+                    continue;
+                }
                 let project = analyze_project_with_sources(
                     &target.config,
                     target.init_sql.as_deref(),
                     &target.view_source_root,
                 )?;
-                analyzed.push(AnalyzedTarget { target, project });
+                outputs.push(marmot::emit::output_paths(&target.config, &project));
+                analyzed.push(AnalyzedTarget {
+                    target,
+                    project,
+                    input_fingerprint,
+                });
             }
-            ensure_generated_outputs_do_not_collide(&analyzed)?;
-            for AnalyzedTarget { target, project } in analyzed {
+            ensure_generated_outputs_do_not_collide(&outputs)?;
+            for AnalyzedTarget {
+                target,
+                project,
+                input_fingerprint,
+            } in analyzed
+            {
                 let config = &target.config;
                 let definitions = views::discover(&config.source_root)?;
                 emit_project_with_views(config, &project, &target.serialize_modules, &definitions)?;
@@ -282,6 +330,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     audit.deny_warnings(&target.view_source_root)?;
                 } else {
                     print_view_warnings(&audit, &target.view_source_root);
+                    caches.push((
+                        generation_cache::Cache::new(&target),
+                        target,
+                        input_fingerprint,
+                    ));
+                }
+            }
+            // Publish cache records only after every target has succeeded.
+            if let Some(identity) = &identity {
+                for (cache, target, input_fingerprint) in caches {
+                    if let Err(error) = cache
+                        .current(&target, &file_config, &cli.config, identity)
+                        .and_then(|state| {
+                            if input_fingerprint.as_ref() == Some(&state.inputs) {
+                                cache.save(&state)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    {
+                        eprintln!("generation cache unavailable: {error}");
+                    }
                 }
             }
         }
@@ -550,13 +620,16 @@ fn print_view_warnings(audit: &views::ViewAudit, source_root: &Path) {
     }
 }
 
-fn ensure_generated_outputs_do_not_collide(analyzed: &[AnalyzedTarget]) -> Result<(), MarmotError> {
+fn ensure_generated_outputs_do_not_collide(
+    outputs: &[BTreeSet<PathBuf>],
+) -> Result<(), MarmotError> {
     let mut by_path: BTreeMap<PathBuf, BTreeSet<usize>> = BTreeMap::new();
-    for (target_index, analyzed_target) in analyzed.iter().enumerate() {
-        for path in
-            marmot::emit::output_paths(&analyzed_target.target.config, &analyzed_target.project)
-        {
-            by_path.entry(path).or_default().insert(target_index);
+    for (target_index, paths) in outputs.iter().enumerate() {
+        for path in paths {
+            by_path
+                .entry(path.clone())
+                .or_default()
+                .insert(target_index);
         }
     }
 
@@ -576,6 +649,7 @@ fn ensure_generated_outputs_do_not_collide(analyzed: &[AnalyzedTarget]) -> Resul
 struct AnalyzedTarget {
     target: AnalysisTarget,
     project: Project,
+    input_fingerprint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -584,6 +658,7 @@ struct AnalysisTarget {
     init_sql: Option<PathBuf>,
     view_source_root: PathBuf,
     serialize_modules: BTreeSet<String>,
+    auxiliary_inputs: Vec<PathBuf>,
 }
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, ConfigError> {
@@ -616,6 +691,17 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                     .unwrap_or(config_source_root),
                 init_sql: database_target.init_sql,
                 serialize_modules: file_config.serialize_modules.clone(),
+                auxiliary_inputs: [
+                    Some(
+                        database_target
+                            .migrations_dir
+                            .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR)),
+                    ),
+                    database_target.bootstrap_dir,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
             }
         })
         .collect())

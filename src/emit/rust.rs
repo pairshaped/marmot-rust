@@ -64,34 +64,6 @@ pub(super) fn render_project(
     Ok(desired)
 }
 
-/// Every Rust file Marmot may delete: any adjacent binding under the source
-/// root and any Rust file in the shared output folder, such as a retired
-/// central tree.
-pub(super) fn managed_files(config: &Config) -> Result<BTreeSet<PathBuf>> {
-    let mut managed = BTreeSet::new();
-    for (root, adjacent_only) in [(&config.source_root, true), (&config.output, false)] {
-        if !root.exists() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(root) {
-            let entry = entry.map_err(|source| Error::WalkDir {
-                path: root.to_path_buf(),
-                source,
-            })?;
-            let name = entry.file_name().to_string_lossy();
-            let owned = if adjacent_only {
-                name.ends_with(ADJACENT_SUFFIX)
-            } else {
-                name.ends_with(".rs") || name.ends_with(ADJACENT_SUFFIX)
-            };
-            if entry.file_type().is_file() && owned {
-                managed.insert(entry.path().to_path_buf());
-            }
-        }
-    }
-    Ok(managed)
-}
-
 /// The paths a project writes, for collision checks between targets.
 pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
     let mut paths = project
@@ -108,8 +80,6 @@ pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
     }
     paths
 }
-
-const ADJACENT_SUFFIX: &str = ".generated.rs";
 
 pub(super) fn adjacent_binding_path(query: &Query) -> PathBuf {
     query.source_path.with_extension("generated.rs")

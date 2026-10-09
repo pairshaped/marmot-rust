@@ -575,3 +575,46 @@ isn't maintained separately.
 
 The `derive/` crate supplies Marmot's `FromSqlRow` procedural macro and is
 included with the generator so this repository can build independently.
+
+## Generation cache
+
+`marmot generate` skips an owner only when its inputs and published output
+bytes match the last successful run. `generate --force` always regenerates.
+`generate --check` always performs analysis and checks binding declarations;
+it neither reads nor writes the cache.
+
+The input fingerprint includes:
+
+- Effective target configuration after CLI and environment overrides, temporal
+  settings, serialization settings, and the selected config file's bytes.
+- Discovered companion SQL paths and bytes, and their adjacent Rust module
+  paths. Rust module contents are checked by `--check`; editing a function
+  body alone does not require SQL generation.
+- View SQL membership and bytes under both `source_root/db_views` and
+  `view_source_root/db_views`, including when those roots differ.
+- Migration and configured bootstrap SQL membership and bytes, and `init_sql`.
+- The running executable's SHA-256, covering generator and dependency changes
+  even without a version bump.
+- The database file's birth time and, on Unix, device and inode, plus ordered
+  SQLite schema definitions. A reset with identical schema still invalidates
+  the cache. Filesystems without birth-time support run generation in full.
+
+Receipts live in `.local/marmot/` beside each source root. Their filenames
+identify the existing source, database and output paths by digest. Keep this
+folder ignored and local to the checkout. From that source root's parent,
+clear the cache with `rm -rf .local/marmot`. For Curling's three owners, run
+these commands from the repository root:
+
+```sh
+rm -rf apps/curling/platform/.local/marmot
+rm -rf apps/curling/platform/crates/curling_admin_resources/.local/marmot
+```
+
+Receipts include hashes of adjacent bindings and managed shared output.
+Missing, modified or obsolete output triggers normal generation and repair.
+Marmot's own output never enters its input fingerprint. Missing or corrupt
+receipts cause a full run; cache I/O failure leaves generation usable.
+Receipts are published only after all selected targets succeed, and only
+when their non-schema inputs stayed unchanged through generation. Schema
+changes made by view reconciliation are recorded after the successful run.
+Schema dumps remain owned by database lifecycle commands.

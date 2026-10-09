@@ -10,6 +10,7 @@ heck = "0.5"
 rusqlite = { version = "0.37", features = ["bundled", "column_metadata", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
 walkdir = "2"
