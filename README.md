@@ -618,3 +618,10 @@ Receipts are published only after all selected targets succeed, and only
 when their non-schema inputs stayed unchanged through generation. Schema
 changes made by view reconciliation are recorded after the successful run.
 Schema dumps remain owned by database lifecycle commands.
+
+Receipt publication verifies the schema snapshot used for analysis as well as
+source inputs. Analysis reconciles views first, then reads schema and query facts
+inside one SQLite read transaction. If an in-place schema change occurs after
+analysis, that run publishes no receipt for its old bindings; the next run
+regenerates. `analyzer::analyze_project_snapshot` returns the analyzed project and
+its schema identity for callers that need this guarantee.

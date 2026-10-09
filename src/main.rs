@@ -299,7 +299,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     continue;
                 }
-                let project = analyze_project_with_sources(
+                let marmot::analyzer::AnalysisSnapshot {
+                    project,
+                    schema_fingerprint,
+                } = marmot::analyzer::analyze_project_snapshot(
                     &target.config,
                     target.init_sql.as_deref(),
                     &target.view_source_root,
@@ -309,6 +312,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     target,
                     project,
                     input_fingerprint,
+                    schema_fingerprint,
                 });
             }
             ensure_generated_outputs_do_not_collide(&outputs)?;
@@ -316,6 +320,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 target,
                 project,
                 input_fingerprint,
+                schema_fingerprint,
             } in analyzed
             {
                 let config = &target.config;
@@ -334,22 +339,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         generation_cache::Cache::new(&target),
                         target,
                         input_fingerprint,
+                        schema_fingerprint,
                     ));
                 }
             }
             // Publish cache records only after every target has succeeded.
             if let Some(identity) = &identity {
-                for (cache, target, input_fingerprint) in caches {
-                    if let Err(error) = cache
-                        .current(&target, &file_config, &cli.config, identity)
-                        .and_then(|state| {
-                            if input_fingerprint.as_ref() == Some(&state.inputs) {
-                                cache.save(&state)
-                            } else {
-                                Ok(())
-                            }
-                        })
-                    {
+                for (cache, target, input_fingerprint, schema_fingerprint) in caches {
+                    if let Err(error) = cache.publish_analyzed(
+                        &target,
+                        &file_config,
+                        &cli.config,
+                        identity,
+                        input_fingerprint.as_deref(),
+                        &schema_fingerprint,
+                    ) {
                         eprintln!("generation cache unavailable: {error}");
                     }
                 }
@@ -650,6 +654,7 @@ struct AnalyzedTarget {
     target: AnalysisTarget,
     project: Project,
     input_fingerprint: Option<String>,
+    schema_fingerprint: String,
 }
 
 #[derive(Debug)]

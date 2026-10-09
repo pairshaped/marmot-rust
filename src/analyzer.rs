@@ -21,11 +21,25 @@ pub fn analyze_project(config: &Config) -> Result<Project> {
     analyze_project_with_sources(config, None, &config.source_root)
 }
 
+/// Bindings and the database schema snapshot used to analyze them.
+pub struct AnalysisSnapshot {
+    pub project: Project,
+    pub schema_fingerprint: String,
+}
+
 pub fn analyze_project_with_sources(
     config: &Config,
     init_sql: Option<&Path>,
     view_source_root: &Path,
 ) -> Result<Project> {
+    Ok(analyze_project_snapshot(config, init_sql, view_source_root)?.project)
+}
+
+pub fn analyze_project_snapshot(
+    config: &Config,
+    init_sql: Option<&Path>,
+    view_source_root: &Path,
+) -> Result<AnalysisSnapshot> {
     if !view_source_root.is_dir() {
         return Err(views::ViewError::SourcePathIsNotDirectory {
             path: view_source_root.to_path_buf(),
@@ -49,7 +63,15 @@ pub fn analyze_project_with_sources(
             })?;
     }
     views::reconcile_connection(&mut conn, view_source_root)?;
-    let schema = load_schema(&conn, &config.temporal)?;
+    // Reconcile first, then pin every schema read and query analysis to one
+    // SQLite snapshot. The returned identity describes these exact bindings.
+    let transaction = conn
+        .transaction()
+        .map_err(|source| Error::InspectDatabase { source })?;
+    let conn = &transaction;
+    let schema_fingerprint =
+        crate::schema::fingerprint(conn).map_err(|source| Error::InspectDatabase { source })?;
+    let schema = load_schema(conn, &config.temporal)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
 
@@ -65,7 +87,7 @@ pub fn analyze_project_with_sources(
 
         for block in blocks {
             let variants = analyze_column_variants(
-                &conn,
+                conn,
                 &schema,
                 &config.temporal,
                 &file.path,
@@ -128,7 +150,10 @@ pub fn analyze_project_with_sources(
         }
     }
 
-    Ok(Project { queries })
+    Ok(AnalysisSnapshot {
+        project: Project { queries },
+        schema_fingerprint,
+    })
 }
 
 pub(crate) fn register_analysis_functions(conn: &Connection, path: &Path, sql: &str) -> Result<()> {

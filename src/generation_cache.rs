@@ -18,6 +18,7 @@ pub(super) struct State {
     version: u32,
     fingerprint: String,
     pub inputs: String,
+    schema: String,
     pub outputs: BTreeMap<PathBuf, String>,
 }
 
@@ -49,7 +50,7 @@ impl Cache {
         identity: &str,
     ) -> Result<State> {
         let mut input = Fingerprint::default();
-        input.add(b"marmot-generation-v1");
+        input.add(b"marmot-generation-v2");
         input.add(identity.as_bytes());
         input.add(format!("{target:?}{config:?}").as_bytes());
         input.optional_file(config_path)?;
@@ -85,18 +86,8 @@ impl Cache {
         }
         let inputs = format!("{:x}", input.0.clone().finalize());
         let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut statement = connection
-            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")?;
-        for row in statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })? {
-            input.add(serde_json::to_string(&row?)?.as_bytes());
-        }
+        let schema = marmot::schema::fingerprint(&connection)?;
+        input.add(schema.as_bytes());
         let mut outputs = emit::managed_files(&target.config)?;
         let views = target.config.output.join(views::GENERATED_FILE);
         if views.try_exists()? {
@@ -110,9 +101,10 @@ impl Cache {
             })
             .collect::<io::Result<_>>()?;
         Ok(State {
-            version: 1,
+            version: 2,
             fingerprint: input.finish(),
             inputs,
+            schema,
             outputs,
         })
     }
@@ -123,6 +115,22 @@ impl Cache {
             .and_then(|bytes| serde_json::from_slice::<State>(&bytes).ok())
             .as_ref()
             == Some(current)
+    }
+
+    pub fn publish_analyzed(
+        &self,
+        target: &AnalysisTarget,
+        config: &FileConfig,
+        config_path: &Path,
+        identity: &str,
+        initial_inputs: Option<&str>,
+        analyzed_schema: &str,
+    ) -> Result<()> {
+        let state = self.current(target, config, config_path, identity)?;
+        if initial_inputs == Some(state.inputs.as_str()) && state.schema == analyzed_schema {
+            self.save(&state)?;
+        }
+        Ok(())
     }
 
     pub fn save(&self, state: &State) -> Result<()> {
@@ -185,5 +193,109 @@ impl Fingerprint {
 
     fn finish(self) -> String {
         format!("{:x}", self.0.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot::{Config, Target};
+
+    #[test]
+    fn schema_change_after_analysis_cannot_authorize_old_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("items.rs"),
+            "#[path = \"items.generated.rs\"] mod sql;\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("items.sql"),
+            "-- func: list_items\nselect * from items",
+        )
+        .unwrap();
+        let database = root.path().join("app.sqlite");
+        let template = Connection::open_in_memory().unwrap();
+        template
+            .execute_batch(
+                "create table items (id integer primary key, name text not null) strict;",
+            )
+            .unwrap();
+        template
+            .execute("vacuum into ?1", [database.to_str().unwrap()])
+            .unwrap();
+        let target = AnalysisTarget {
+            config: Config {
+                database: database.clone(),
+                source_root: source.clone(),
+                output: source.join("generated/sql"),
+                target: Target::Rust,
+                check: false,
+                temporal: Default::default(),
+            },
+            init_sql: None,
+            view_source_root: source.clone(),
+            serialize_modules: Default::default(),
+            auxiliary_inputs: vec![],
+        };
+        let config = FileConfig::default();
+        let config_path = root.path().join("marmot.toml");
+        let cache = Cache::new(&target);
+        let initial = cache
+            .current(&target, &config, &config_path, "executable")
+            .unwrap();
+        let analyzed =
+            marmot::analyzer::analyze_project_snapshot(&target.config, None, &source).unwrap();
+        assert_eq!(analyzed.project.queries[0].columns.len(), 2);
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("alter table items add column extra text;")
+            .unwrap();
+        marmot::emit_project(&target.config, &analyzed.project).unwrap();
+        cache
+            .publish_analyzed(
+                &target,
+                &config,
+                &config_path,
+                "executable",
+                Some(&initial.inputs),
+                &analyzed.schema_fingerprint,
+            )
+            .unwrap();
+        assert!(
+            !cache.path.exists(),
+            "a receipt must not pair the new schema with old bindings"
+        );
+        assert!(
+            !cache.matches(
+                &cache
+                    .current(&target, &config, &config_path, "executable")
+                    .unwrap()
+            )
+        );
+
+        let fresh =
+            marmot::analyzer::analyze_project_snapshot(&target.config, None, &source).unwrap();
+        assert_eq!(fresh.project.queries[0].columns.len(), 3);
+        marmot::emit_project(&target.config, &fresh.project).unwrap();
+        cache
+            .publish_analyzed(
+                &target,
+                &config,
+                &config_path,
+                "executable",
+                Some(&initial.inputs),
+                &fresh.schema_fingerprint,
+            )
+            .unwrap();
+        assert!(
+            cache.matches(
+                &cache
+                    .current(&target, &config, &config_path, "executable")
+                    .unwrap()
+            )
+        );
     }
 }

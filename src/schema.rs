@@ -3,6 +3,37 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+/// Identity of the schema visible to this connection's current read snapshot.
+/// Row data and SQLite's schema-version counter do not affect this identity.
+pub fn fingerprint(conn: &Connection) -> rusqlite::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut statement =
+        conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, name, table, sql) = row?;
+        for value in [Some(kind), Some(name), Some(table), sql] {
+            match value {
+                Some(value) => {
+                    hash.update([1]);
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value.as_bytes());
+                }
+                None => hash.update([0]),
+            }
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DumpResult {
     Unchanged,
