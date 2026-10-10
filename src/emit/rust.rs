@@ -30,7 +30,7 @@ pub(super) fn render_project(
     for query in &project.queries {
         by_module.entry(&query.module_name).or_default().push(query);
     }
-    let uses_temporal = project_uses_temporal(project);
+    let uses_temporal = project_uses_temporal(project) || config.temporal.emit_without_queries;
     let temporal_module = config.temporal.module.as_deref();
     if let Some(module) = temporal_module {
         validate_temporal_module(module)?;
@@ -71,10 +71,10 @@ pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
         .iter()
         .map(adjacent_binding_path)
         .collect::<BTreeSet<_>>();
-    let uses_temporal = project_uses_temporal(project);
+    let uses_temporal = project_uses_temporal(project) || config.temporal.emit_without_queries;
     if let Ok(Some(temporal)) = temporal_output(config, uses_temporal) {
         paths.insert(temporal.declaration_file);
-        if project_uses_temporal(project) {
+        if uses_temporal {
             paths.insert(temporal.module_file);
         }
     }
@@ -357,7 +357,7 @@ impl std::error::Error for TemporalFieldError {
     }
 }
 
-pub(crate) fn with_field<T>(
+pub fn with_field<T>(
     result: rusqlite::Result<T>,
     field: &'static str,
     index: usize,
@@ -1758,6 +1758,7 @@ mod tests {
 
         assert!(output.contains("&& let Some(source) = source.downcast_ref"));
         assert!(output.contains("year.is_multiple_of(4)"));
+        assert!(output.contains("pub fn with_field<T>("));
         assert!(!output.contains("year % 4 == 0"));
     }
 

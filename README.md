@@ -164,6 +164,13 @@ types emits nothing temporal. When you omit `output`, your project supplies the 
 emits neither the temporal module nor the declaration, and bindings import
 `module` as written.
 
+Set `emit_without_queries = true` for a dedicated temporal owner, including one
+with no SQL files. This requires both `module` and `output`. The owner still
+needs its configured local database for analysis. It publishes the module and
+its declaration inside its own shared output folder, with the same stale-file
+cleanup, fingerprint cache and `--check` validation as query owners. Other
+owners import its module by setting `module` and omitting `output`.
+
 With `strict_suffixes = true`, columns ending in a configured datetime suffix
 must be declared as `TEXT` and generate `temporal::DbDateTime`. Columns ending
 in a configured date suffix must be declared as `TEXT` and generate

@@ -46,6 +46,8 @@ pub struct TemporalConfig {
     /// File Marmot writes the temporal module to, directly inside the shared
     /// output folder. When omitted, the project supplies the module.
     pub output: Option<PathBuf>,
+    /// Emit the configured module even when the owner has no temporal queries.
+    pub emit_without_queries: bool,
 }
 
 impl Default for TemporalConfig {
@@ -58,6 +60,7 @@ impl Default for TemporalConfig {
             date_storage: TemporalDateStorage::TextYmd,
             module: None,
             output: None,
+            emit_without_queries: false,
         }
     }
 }
@@ -126,6 +129,9 @@ pub enum ConfigError {
 
     #[error("unknown temporal date_storage {0}")]
     UnknownTemporalDateStorage(String),
+
+    #[error("invalid temporal config: {0}")]
+    InvalidTemporalConfig(String),
 
     #[error(
         "output {output} is the source root; it must be a folder below it, because Marmot removes stale generated Rust from the shared output folder"
@@ -210,6 +216,16 @@ fn toml_temporal_config(marmot: Option<&toml::Value>) -> Result<TemporalConfig, 
     let mut config = TemporalConfig::default();
     config.module = toml_string(Some(temporal), "module");
     config.output = toml_path(Some(temporal), "output");
+    if let Some(value) = temporal.get("emit_without_queries") {
+        config.emit_without_queries = value.as_bool().ok_or_else(|| {
+            ConfigError::InvalidTemporalConfig("emit_without_queries must be a boolean".into())
+        })?;
+    }
+    if config.emit_without_queries && (config.module.is_none() || config.output.is_none()) {
+        return Err(ConfigError::InvalidTemporalConfig(
+            "emit_without_queries requires module and output".into(),
+        ));
+    }
     config.strict_suffixes = temporal
         .get("strict_suffixes")
         .and_then(|value| value.as_bool())
