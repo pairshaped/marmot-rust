@@ -192,3 +192,25 @@ fn empty_owner_tracks_both_temporal_output_paths() {
             .collect()
     );
 }
+
+#[test]
+fn library_emission_also_rejects_an_owner_without_output() {
+    let owner = Owner::new();
+    let config = marmot::config::Config {
+        database: owner.file("db/local.sqlite"),
+        source_root: owner.file("crates/clock/src"),
+        output: owner.file("crates/clock/src/generated/sql"),
+        target: marmot::config::Target::Rust,
+        check: false,
+        temporal: marmot::config::TemporalConfig {
+            module: Some("crate::generated::sql::temporal".into()),
+            emit_without_queries: true,
+            ..Default::default()
+        },
+    };
+    assert!(matches!(
+        marmot::emit::emit_project(&config, &marmot::model::Project { queries: vec![] }),
+        Err(marmot::error::Error::InvalidTemporalConfig { .. })
+    ));
+    assert!(!config.output.join("temporal.rs").exists());
+}

@@ -111,6 +111,11 @@ fn validate_temporal_module(module: &str) -> Result<()> {
 /// temporal types and doesn't own the configured folder simply emits nothing.
 fn temporal_output(config: &Config, uses_temporal: bool) -> Result<Option<TemporalOutput>> {
     let Some(file) = &config.temporal.output else {
+        if config.temporal.emit_without_queries {
+            return Err(Error::InvalidTemporalConfig {
+                reason: "emit_without_queries requires output".to_string(),
+            });
+        }
         return Ok(None);
     };
     let Some(module) = config.temporal.module.as_deref() else {

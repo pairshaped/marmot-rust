@@ -213,9 +213,11 @@ fn toml_temporal_config(marmot: Option<&toml::Value>) -> Result<TemporalConfig, 
         return Ok(TemporalConfig::default());
     };
 
-    let mut config = TemporalConfig::default();
-    config.module = toml_string(Some(temporal), "module");
-    config.output = toml_path(Some(temporal), "output");
+    let mut config = TemporalConfig {
+        module: toml_string(Some(temporal), "module"),
+        output: toml_path(Some(temporal), "output"),
+        ..Default::default()
+    };
     if let Some(value) = temporal.get("emit_without_queries") {
         config.emit_without_queries = value.as_bool().ok_or_else(|| {
             ConfigError::InvalidTemporalConfig("emit_without_queries must be a boolean".into())
