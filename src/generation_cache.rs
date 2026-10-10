@@ -238,6 +238,7 @@ mod tests {
             init_sql: None,
             view_source_root: source.clone(),
             serialize_modules: Default::default(),
+            public_bindings: None,
             auxiliary_inputs: vec![],
         };
         let config = FileConfig::default();

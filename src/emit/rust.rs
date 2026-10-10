@@ -25,6 +25,7 @@ pub(super) fn render_project(
     config: &Config,
     project: &Project,
     serialize_modules: &BTreeSet<String>,
+    public_bindings: Option<&BTreeMap<String, BTreeSet<String>>>,
 ) -> Result<BTreeMap<PathBuf, String>> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
     for query in &project.queries {
@@ -41,11 +42,26 @@ pub(super) fn render_project(
     let temporal_output = temporal_output(config, uses_temporal)?;
 
     let mut desired = BTreeMap::new();
+    if let Some(bindings) = public_bindings {
+        for module in bindings.keys() {
+            if !by_module.contains_key(module.as_str()) {
+                return Err(Error::InvalidBindingVisibility {
+                    reason: format!("unknown SQL module {module}"),
+                });
+            }
+        }
+    }
     for (module, queries) in by_module {
         let path = adjacent_binding_path(queries[0]);
         let mut content = render_module(&sql_file_name(queries[0]), queries, temporal_module)?;
         if serialize_modules.contains(module) {
             content = add_serialize_to_row_structs(content);
+        }
+        if let Some(bindings) = public_bindings {
+            content = super::visibility::apply(
+                &content,
+                bindings.get(module).unwrap_or(&BTreeSet::new()),
+            )?;
         }
         desired.insert(path, content);
     }

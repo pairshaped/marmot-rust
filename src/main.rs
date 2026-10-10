@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use marmot::{
     Config, Error as MarmotError, FileConfig, Target, analyze_project_with_sources, builtin_themes,
     config::{ConfigError, DatabaseReference},
-    emit::emit_project_with_views,
+    emit::emit_project_with_binding_visibility,
     migrations,
     model::Project,
     reset, schema, seeds,
@@ -325,7 +325,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let config = &target.config;
                 let definitions = views::discover(&config.source_root)?;
-                emit_project_with_views(config, &project, &target.serialize_modules, &definitions)?;
+                emit_project_with_binding_visibility(
+                    config,
+                    &project,
+                    &target.serialize_modules,
+                    &definitions,
+                    target.public_bindings.as_ref(),
+                )?;
                 let audit = views::audit_database_with_init_sql(
                     &config.database,
                     &target.view_source_root,
@@ -663,6 +669,7 @@ struct AnalysisTarget {
     init_sql: Option<PathBuf>,
     view_source_root: PathBuf,
     serialize_modules: BTreeSet<String>,
+    public_bindings: Option<BTreeMap<String, BTreeSet<String>>>,
     auxiliary_inputs: Vec<PathBuf>,
 }
 
@@ -696,6 +703,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                     .unwrap_or(config_source_root),
                 init_sql: database_target.init_sql,
                 serialize_modules: file_config.serialize_modules.clone(),
+                public_bindings: file_config.public_bindings.clone(),
                 auxiliary_inputs: [
                     Some(
                         database_target

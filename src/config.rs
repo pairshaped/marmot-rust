@@ -31,6 +31,8 @@ pub struct FileConfig {
     pub schema_output: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
     pub serialize_modules: BTreeSet<String>,
+    /// When configured, generated bindings are crate-visible unless listed here.
+    pub public_bindings: Option<BTreeMap<String, BTreeSet<String>>>,
     pub temporal: TemporalConfig,
 }
 
@@ -133,6 +135,9 @@ pub enum ConfigError {
     #[error("invalid temporal config: {0}")]
     InvalidTemporalConfig(String),
 
+    #[error("invalid public_bindings config: {0}")]
+    InvalidPublicBindings(String),
+
     #[error(
         "output {output} is the source root; it must be a folder below it, because Marmot removes stale generated Rust from the shared output folder"
     )]
@@ -173,6 +178,7 @@ impl FileConfig {
                 .into_iter()
                 .collect(),
             temporal: toml_temporal_config(marmot)?,
+            public_bindings: public_bindings(marmot)?,
         })
     }
 
@@ -193,6 +199,41 @@ impl FileConfig {
             }),
         }
     }
+}
+
+fn public_bindings(
+    marmot: Option<&toml::Value>,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, ConfigError> {
+    let Some(value) = marmot.and_then(|table| table.get("public_bindings")) else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| ConfigError::InvalidPublicBindings("expected a module table".into()))?;
+    let mut bindings = BTreeMap::new();
+    for (module, value) in table {
+        let array = value.as_array().ok_or_else(|| {
+            ConfigError::InvalidPublicBindings(format!("{module}: expected an array"))
+        })?;
+        let mut names = BTreeSet::new();
+        for value in array {
+            let name = value
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    ConfigError::InvalidPublicBindings(format!(
+                        "{module}: expected a nonempty item name"
+                    ))
+                })?;
+            if !names.insert(name.to_owned()) {
+                return Err(ConfigError::InvalidPublicBindings(format!(
+                    "{module}: duplicate {name}"
+                )));
+            }
+        }
+        bindings.insert(module.clone(), names);
+    }
+    Ok(Some(bindings))
 }
 
 fn toml_path(table: Option<&toml::Value>, key: &str) -> Option<PathBuf> {
@@ -340,6 +381,40 @@ fn table_string(table: &toml::map::Map<String, toml::Value>, key: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_bindings_distinguishes_default_and_explicit_owner_visibility() {
+        assert!(
+            FileConfig::from_toml_str("")
+                .unwrap()
+                .public_bindings
+                .is_none()
+        );
+        let empty = FileConfig::from_toml_str("[tools.marmot.public_bindings]").unwrap();
+        assert_eq!(empty.public_bindings, Some(BTreeMap::new()));
+        let selected = FileConfig::from_toml_str(
+            "[tools.marmot.public_bindings]\norders = [\"read\", \"Row::id\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            selected.public_bindings.unwrap()["orders"],
+            BTreeSet::from(["read".into(), "Row::id".into()])
+        );
+    }
+
+    #[test]
+    fn public_bindings_refuses_malformed_or_duplicate_declarations() {
+        for source in [
+            "[tools.marmot]\npublic_bindings = 1",
+            "[tools.marmot.public_bindings]\norders = [1]",
+            "[tools.marmot.public_bindings]\norders = [\"read\", \"read\"]",
+        ] {
+            assert!(matches!(
+                FileConfig::from_toml_str(source),
+                Err(ConfigError::InvalidPublicBindings(_))
+            ));
+        }
+    }
 
     #[test]
     fn parses_empty_toml_as_empty_config() {

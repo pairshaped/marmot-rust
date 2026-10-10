@@ -7,7 +7,15 @@ use crate::model::SqlFile;
 pub fn discover_sql_files(source_root: &Path) -> Result<Vec<SqlFile>> {
     let mut files = Vec::new();
 
-    for entry in WalkDir::new(source_root).sort_by_file_name() {
+    for entry in WalkDir::new(source_root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !entry.path().join("marmot.toml").is_file()
+        })
+    {
         let entry = entry.map_err(|source| Error::WalkDir {
             path: source_root.to_path_buf(),
             source,
@@ -83,6 +91,34 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn nested_sql_owner_is_discovered_only_from_its_own_root() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("other_database");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.path().join("outer.rs"), "").unwrap();
+        fs::write(root.path().join("outer.sql"), "-- func: outer\nselect 1;").unwrap();
+        fs::write(nested.join("marmot.toml"), "[tools.marmot]").unwrap();
+        fs::write(nested.join("inner.rs"), "").unwrap();
+        fs::write(nested.join("inner.sql"), "-- func: inner\nselect 1;").unwrap();
+        assert_eq!(
+            discover_sql_files(root.path())
+                .unwrap()
+                .iter()
+                .map(|file| &file.module_name)
+                .collect::<Vec<_>>(),
+            vec!["outer"]
+        );
+        assert_eq!(
+            discover_sql_files(&nested)
+                .unwrap()
+                .iter()
+                .map(|file| &file.module_name)
+                .collect::<Vec<_>>(),
+            vec!["inner"]
+        );
+    }
 
     #[test]
     fn finds_colocated_sql_companion_files() {

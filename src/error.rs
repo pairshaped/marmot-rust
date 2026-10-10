@@ -135,6 +135,10 @@ pub enum Error {
         reason: String,
     },
 
+    InvalidBindingVisibility {
+        reason: String,
+    },
+
     MixedParameterStyles {
         path: PathBuf,
     },
@@ -164,6 +168,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidBindingVisibility { reason } => {
+                write!(f, "invalid binding visibility: {reason}")
+            }
             Self::ReadFile { path, source } => {
                 write!(f, "could not read {}: {source}", path.display())
             }

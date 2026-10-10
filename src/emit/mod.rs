@@ -1,4 +1,5 @@
 mod rust;
+mod visibility;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -20,7 +21,14 @@ pub fn managed_files(config: &Config) -> Result<BTreeSet<PathBuf>> {
         if !root.exists() {
             continue;
         }
-        for entry in walkdir::WalkDir::new(root) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !entry.file_type().is_dir()
+                    || !entry.path().join("marmot.toml").is_file()
+            })
+        {
             let entry = entry.map_err(|source| Error::WalkDir {
                 path: root.to_path_buf(),
                 source,
@@ -48,7 +56,7 @@ pub fn emit_project_with_serialize_modules(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
 ) -> Result<()> {
-    emit(config, project, serialize_modules, None)
+    emit(config, project, serialize_modules, None, None)
 }
 
 /// Publish one owner's bindings and view installation SQL as one complete
@@ -59,7 +67,29 @@ pub fn emit_project_with_views(
     serialize_modules: &BTreeSet<String>,
     definitions: &[ViewDefinition],
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    Ok(emit(config, project, serialize_modules, Some(definitions))?)
+    Ok(emit(
+        config,
+        project,
+        serialize_modules,
+        Some(definitions),
+        None,
+    )?)
+}
+
+pub fn emit_project_with_binding_visibility(
+    config: &Config,
+    project: &Project,
+    serialize_modules: &BTreeSet<String>,
+    definitions: &[ViewDefinition],
+    public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    Ok(emit(
+        config,
+        project,
+        serialize_modules,
+        Some(definitions),
+        public_bindings,
+    )?)
 }
 
 fn emit(
@@ -67,8 +97,15 @@ fn emit(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
     definitions: Option<&[ViewDefinition]>,
+    public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
 ) -> Result<()> {
-    let plan = plan(config, project, serialize_modules, definitions)?;
+    let plan = plan(
+        config,
+        project,
+        serialize_modules,
+        definitions,
+        public_bindings,
+    )?;
     if config.check {
         // Check mode only reads: it stages nothing and touches no path.
         let changes = plan.changes().map_err(|source| Error::ReadFile {
@@ -104,10 +141,11 @@ fn plan(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
     definitions: Option<&[ViewDefinition]>,
+    public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
 ) -> Result<Plan> {
     let mut plan = match config.target {
         Target::Rust => Plan {
-            desired: rust::render_project(config, project, serialize_modules)?,
+            desired: rust::render_project(config, project, serialize_modules, public_bindings)?,
             managed: managed_files(config)?,
             prune_root: Some(config.output.clone()),
         },
@@ -130,6 +168,32 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn nested_sql_owner_bindings_are_not_parent_prune_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("other_database");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.path().join("outer.generated.rs"), "").unwrap();
+        fs::write(nested.join("marmot.toml"), "[tools.marmot]").unwrap();
+        fs::write(nested.join("inner.generated.rs"), "retained child binding").unwrap();
+        let config = Config {
+            database: root.path().join("unused.db"),
+            source_root: root.path().to_owned(),
+            output: root.path().join("generated/sql"),
+            target: Target::Rust,
+            check: false,
+            temporal: TemporalConfig::default(),
+        };
+        assert_eq!(
+            managed_files(&config).unwrap(),
+            BTreeSet::from([root.path().join("outer.generated.rs")])
+        );
+        assert_eq!(
+            fs::read_to_string(nested.join("inner.generated.rs")).unwrap(),
+            "retained child binding"
+        );
+    }
 
     fn old_time() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_600_000_000)
