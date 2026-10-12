@@ -179,7 +179,7 @@ mod tests {
         .unwrap();
         fs::write(
             temp.path().join("002_rebuild_orgs.sql"),
-            "-- marmot: rebuild-table
+            "\u{feff}-- marmot: rebuild-table
 CREATE TABLE new_orgs (id INTEGER PRIMARY KEY);
              INSERT INTO new_orgs SELECT id FROM orgs; DROP TABLE orgs; ALTER TABLE new_orgs RENAME TO orgs;",
         ).unwrap();
