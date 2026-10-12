@@ -300,6 +300,29 @@ CREATE TABLE new_orgs (id INTEGER PRIMARY KEY);
     }
 
     #[test]
+    fn rebuild_migration_bom_header_cannot_bypass_transaction_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        fs::write(
+            temp.path().join("001_create_orgs.sql"),
+            "CREATE TABLE orgs (id INTEGER PRIMARY KEY, note TEXT);",
+        )
+        .unwrap();
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+        conn.execute("INSERT INTO orgs VALUES (7,'retained')", [])
+            .unwrap();
+        fs::write(temp.path().join("002_rebuild_orgs.sql"), "\u{feff}-- marmot: rebuild-table\nUPDATE orgs SET note='lost'; COMMIT; SELECT missing FROM missing_table;").unwrap();
+        assert!(migrate_connection(&conn, temp.path(), TRACKING_TABLE).is_err());
+        assert_eq!(
+            conn.query_row("SELECT note FROM orgs WHERE id=7", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+        assert_eq!(applied_versions(&conn), ["001_create_orgs"]);
+    }
+
+    #[test]
     fn applies_migrations_in_filename_order() {
         let temp = tempfile::tempdir().unwrap();
         let migrations_dir = temp.path().join("db/migrations");

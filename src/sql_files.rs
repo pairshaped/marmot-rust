@@ -290,7 +290,7 @@ fn apply_file(
 
 fn table_rebuild(sql: &str) -> bool {
     sql.lines()
-        .any(|line| line.trim() == "-- marmot: rebuild-table")
+        .any(|line| line.trim().trim_start_matches('\u{feff}').trim() == "-- marmot: rebuild-table")
 }
 
 fn controls_transaction(sql: &str) -> rusqlite::Result<bool> {
