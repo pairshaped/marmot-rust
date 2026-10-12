@@ -239,14 +239,15 @@ fn apply_file(
     file: &SqlFile,
 ) -> Result<(), SqlFilesError> {
     let sql = read_file(file)?;
-    let rebuild = sql
-        .lines()
-        .any(|line| line.trim() == "-- marmot: rebuild-table");
+    let rebuild = table_rebuild(&sql);
     let sql_error = |source| SqlFilesError::SqlError {
         path: file.path.clone(),
         source,
     };
     if !conn.is_autocommit() {
+        return Err(sql_error(rusqlite::Error::InvalidQuery));
+    }
+    if rebuild && controls_transaction(&sql).map_err(sql_error)? {
         return Err(sql_error(rusqlite::Error::InvalidQuery));
     }
     let foreign_keys: bool = conn
@@ -287,6 +288,39 @@ fn apply_file(
     result.and(rollback).and(restore)
 }
 
+fn table_rebuild(sql: &str) -> bool {
+    sql.lines()
+        .any(|line| line.trim() == "-- marmot: rebuild-table")
+}
+
+fn controls_transaction(sql: &str) -> rusqlite::Result<bool> {
+    use crate::sqlite::tokenize::{Token, tokenize_spans};
+    let tokens = tokenize_spans(sql);
+    let transaction_statement = |tokens: &[crate::sqlite::tokenize::SpannedToken]| {
+        matches!(tokens.iter().map(|span| &span.token).find(|token| !matches!(token, Token::Semicolon | Token::Unknown('\u{feff}')) && !matches!(token, Token::Word(word) if word.trim_start_matches('\u{feff}').is_empty())),
+            Some(Token::Word(word)) if ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"].iter().any(|keyword| word.trim_start_matches('\u{feff}').eq_ignore_ascii_case(keyword)))
+    };
+    let mut byte_start = 0;
+    let mut token_start = 0;
+    for (index, span) in tokens.iter().enumerate() {
+        if span.token != Token::Semicolon {
+            continue;
+        }
+        let candidate = std::ffi::CString::new(&sql[byte_start..span.end])
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        // SQLite identifies complete statements, including compound trigger bodies.
+        // SAFETY: candidate owns a valid NUL-terminated string for this call.
+        if unsafe { rusqlite::ffi::sqlite3_complete(candidate.as_ptr()) } != 0 {
+            if transaction_statement(&tokens[token_start..=index]) {
+                return Ok(true);
+            }
+            byte_start = span.end;
+            token_start = index + 1;
+        }
+    }
+    Ok(transaction_statement(&tokens[token_start..]))
+}
+
 fn read_file(file: &SqlFile) -> Result<String, SqlFilesError> {
     fs::read_to_string(&file.path).map_err(|source| SqlFilesError::FileReadError {
         path: file.path.clone(),
@@ -300,10 +334,7 @@ fn execute_file(
     file: &SqlFile,
 ) -> Result<(), SqlFilesError> {
     let sql = read_file(file)?;
-    if sql
-        .lines()
-        .any(|line| line.trim() == "-- marmot: rebuild-table")
-    {
+    if table_rebuild(&sql) {
         return Err(SqlFilesError::SqlError {
             path: file.path.clone(),
             source: rusqlite::Error::InvalidQuery,

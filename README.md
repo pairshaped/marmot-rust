@@ -63,7 +63,7 @@ untyped runtime fallback.
 
 Put `-- marmot: rebuild-table` on its own line in a numbered migration that replaces a referenced table. Marmot disables foreign-key enforcement before starting that migration's transaction, checks all foreign keys before commit, and restores the prior setting. The table copy, replacement and migration tracking record commit together. A SQL error or invalid relationship rolls them back.
 
-Keep table copies and explicit insert columns in the migration. Preserve unrelated columns, indexes, triggers and dependent rows. A rebuild cannot run inside an existing transaction or an atomic seed workflow. Ordinary migrations keep foreign-key enforcement enabled.
+Keep table copies and explicit insert columns in the migration. Preserve unrelated columns, indexes, triggers and dependent rows. A rebuild cannot run inside an existing transaction or an atomic seed workflow. Rebuild SQL must not contain transaction-control statements; Marmot owns the transaction boundary. Ordinary migrations keep foreign-key enforcement enabled.
 
 ## Implementation navigation
 

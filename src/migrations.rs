@@ -239,6 +239,67 @@ CREATE TABLE new_orgs (id INTEGER PRIMARY KEY);
     }
 
     #[test]
+    fn rebuild_migration_cannot_commit_changes_before_later_failure() {
+        for escape in [
+            "COMMIT;",
+            "/* comment */ CoMmIt;",
+            "\u{feff}COMMIT;",
+            "END TRANSACTION;",
+            "ROLLBACK; BEGIN;",
+            "SAVEPOINT escape; RELEASE escape; COMMIT;",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            fs::write(
+                temp.path().join("001_create_orgs.sql"),
+                "CREATE TABLE orgs (id INTEGER PRIMARY KEY, obsolete TEXT);",
+            )
+            .unwrap();
+            migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+            conn.execute("INSERT INTO orgs VALUES (7,'retained')", [])
+                .unwrap();
+            fs::write(temp.path().join("002_rebuild_orgs.sql"), format!("-- marmot: rebuild-table\nUPDATE orgs SET obsolete='lost'; {escape} SELECT missing FROM missing_table;")).unwrap();
+            assert!(migrate_connection(&conn, temp.path(), TRACKING_TABLE).is_err());
+            assert_eq!(
+                conn.query_row("SELECT obsolete FROM orgs WHERE id=7", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "retained",
+                "escape: {escape}"
+            );
+            assert_eq!(applied_versions(&conn), ["001_create_orgs"]);
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_migration_preserves_compound_triggers_and_transaction_words_in_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        fs::write(
+            temp.path().join("001_create_records.sql"),
+            "CREATE TABLE records (id INTEGER PRIMARY KEY, note TEXT);",
+        )
+        .unwrap();
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+        fs::write(temp.path().join("002_rebuild_records.sql"),
+            "-- marmot: rebuild-table\n-- COMMIT; in a comment is not a statement.\nCREATE TRIGGER record_note AFTER INSERT ON records BEGIN UPDATE records SET note=CASE WHEN new.id=1 THEN 'COMMIT; END TRANSACTION;' ELSE 'ROLLBACK;' END WHERE id=new.id; END; INSERT INTO records VALUES (1, 'BEGIN;');"
+        ).unwrap();
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT note FROM records WHERE id=1", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "COMMIT; END TRANSACTION;"
+        );
+    }
+
+    #[test]
     fn applies_migrations_in_filename_order() {
         let temp = tempfile::tempdir().unwrap();
         let migrations_dir = temp.path().join("db/migrations");
