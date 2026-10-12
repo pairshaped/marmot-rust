@@ -164,6 +164,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rebuild_migration_preserves_referencing_rows_and_restores_foreign_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        fs::write(
+            temp.path().join("001_create_orgs.sql"),
+            "CREATE TABLE orgs (id INTEGER PRIMARY KEY, obsolete TEXT);
+             CREATE TABLE members (id INTEGER PRIMARY KEY, org_id INTEGER REFERENCES orgs(id) ON DELETE CASCADE);",
+        ).unwrap();
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+        conn.execute_batch(
+            "INSERT INTO orgs VALUES (7, 'old'); INSERT INTO members VALUES (9, 7);",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("002_rebuild_orgs.sql"),
+            "-- marmot: rebuild-table
+CREATE TABLE new_orgs (id INTEGER PRIMARY KEY);
+             INSERT INTO new_orgs SELECT id FROM orgs; DROP TABLE orgs; ALTER TABLE new_orgs RENAME TO orgs;",
+        ).unwrap();
+
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT org_id FROM members WHERE id = 9", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rebuild_migration_rolls_back_invalid_rows_and_sql_and_restores_foreign_keys() {
+        for replacement in [
+            "INSERT INTO new_orgs VALUES (8); DROP TABLE orgs; ALTER TABLE new_orgs RENAME TO orgs;",
+            "INSERT INTO new_orgs SELECT id FROM orgs; DROP TABLE orgs; SELECT missing_column FROM missing_table;",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            fs::write(temp.path().join("001_create_orgs.sql"),
+                "CREATE TABLE orgs (id INTEGER PRIMARY KEY, obsolete TEXT); CREATE TABLE members (id INTEGER PRIMARY KEY, org_id INTEGER REFERENCES orgs(id) ON DELETE CASCADE);").unwrap();
+            migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+            conn.execute_batch(
+                "INSERT INTO orgs VALUES (7, 'old'); INSERT INTO members VALUES (9, 7);",
+            )
+            .unwrap();
+            fs::write(temp.path().join("002_rebuild_orgs.sql"), format!("-- marmot: rebuild-table\nCREATE TABLE new_orgs (id INTEGER PRIMARY KEY); {replacement}")).unwrap();
+            assert!(migrate_connection(&conn, temp.path(), TRACKING_TABLE).is_err());
+            assert_eq!(applied_versions(&conn), ["001_create_orgs"]);
+            assert_eq!(
+                conn.query_row("SELECT obsolete FROM orgs WHERE id=7", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "old"
+            );
+            assert_eq!(
+                conn.query_row("SELECT org_id FROM members WHERE id=9", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert!(conn.is_autocommit());
+        }
+    }
+
+    #[test]
     fn applies_migrations_in_filename_order() {
         let temp = tempfile::tempdir().unwrap();
         let migrations_dir = temp.path().join("db/migrations");

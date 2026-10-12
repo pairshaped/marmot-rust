@@ -238,22 +238,60 @@ fn apply_file(
     tracking_table: Option<&str>,
     file: &SqlFile,
 ) -> Result<(), SqlFilesError> {
-    conn.execute_batch("begin")
-        .map_err(|source| SqlFilesError::SqlError {
-            path: file.path.clone(),
-            source,
-        })?;
-
-    if let Err(error) = execute_file(conn, tracking_table, file) {
-        let _ = conn.execute_batch("rollback");
-        return Err(error);
+    let sql = read_file(file)?;
+    let rebuild = sql
+        .lines()
+        .any(|line| line.trim() == "-- marmot: rebuild-table");
+    let sql_error = |source| SqlFilesError::SqlError {
+        path: file.path.clone(),
+        source,
+    };
+    if !conn.is_autocommit() {
+        return Err(sql_error(rusqlite::Error::InvalidQuery));
     }
+    let foreign_keys: bool = conn
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .map_err(sql_error)?;
+    if rebuild {
+        conn.pragma_update(None, "foreign_keys", false)
+            .map_err(sql_error)?;
+    }
+    let result = (|| {
+        conn.execute_batch("begin").map_err(sql_error)?;
+        execute_sql(conn, tracking_table, file, &sql)?;
+        if rebuild
+            && conn
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(sql_error)?
+                .exists([])
+                .map_err(sql_error)?
+        {
+            return Err(sql_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some("table rebuild leaves invalid foreign keys".to_owned()),
+            )));
+        }
+        conn.execute_batch("commit").map_err(sql_error)
+    })();
+    let rollback = if result.is_err() && !conn.is_autocommit() {
+        conn.execute_batch("rollback").map_err(sql_error)
+    } else {
+        Ok(())
+    };
+    let restore = if rebuild {
+        conn.pragma_update(None, "foreign_keys", foreign_keys)
+            .map_err(sql_error)
+    } else {
+        Ok(())
+    };
+    result.and(rollback).and(restore)
+}
 
-    conn.execute_batch("commit")
-        .map_err(|source| SqlFilesError::SqlError {
-            path: file.path.clone(),
-            source,
-        })
+fn read_file(file: &SqlFile) -> Result<String, SqlFilesError> {
+    fs::read_to_string(&file.path).map_err(|source| SqlFilesError::FileReadError {
+        path: file.path.clone(),
+        source,
+    })
 }
 
 fn execute_file(
@@ -261,12 +299,26 @@ fn execute_file(
     tracking_table: Option<&str>,
     file: &SqlFile,
 ) -> Result<(), SqlFilesError> {
-    let sql = fs::read_to_string(&file.path).map_err(|source| SqlFilesError::FileReadError {
-        path: file.path.clone(),
-        source,
-    })?;
+    let sql = read_file(file)?;
+    if sql
+        .lines()
+        .any(|line| line.trim() == "-- marmot: rebuild-table")
+    {
+        return Err(SqlFilesError::SqlError {
+            path: file.path.clone(),
+            source: rusqlite::Error::InvalidQuery,
+        });
+    }
+    execute_sql(conn, tracking_table, file, &sql)
+}
 
-    conn.execute_batch(&sql)
+fn execute_sql(
+    conn: &Connection,
+    tracking_table: Option<&str>,
+    file: &SqlFile,
+    sql: &str,
+) -> Result<(), SqlFilesError> {
+    conn.execute_batch(sql)
         .map_err(|source| SqlFilesError::SqlError {
             path: file.path.clone(),
             source,

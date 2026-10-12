@@ -59,6 +59,12 @@ Marmot:
 Unsupported SQL shapes fail analysis rather than silently generating an
 untyped runtime fallback.
 
+## Table rebuild migrations
+
+Put `-- marmot: rebuild-table` on its own line in a numbered migration that replaces a referenced table. Marmot disables foreign-key enforcement before starting that migration's transaction, checks all foreign keys before commit, and restores the prior setting. The table copy, replacement and migration tracking record commit together. A SQL error or invalid relationship rolls them back.
+
+Keep table copies and explicit insert columns in the migration. Preserve unrelated columns, indexes, triggers and dependent rows. A rebuild cannot run inside an existing transaction or an atomic seed workflow. Ordinary migrations keep foreign-key enforcement enabled.
+
 ## Implementation navigation
 
 - `src/analyzer.rs`, `src/sqlite/`, and `src/model.rs` build the
