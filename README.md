@@ -48,7 +48,8 @@ Marmot:
 - extracts named parameters like `@org_id`
 - prepares each statement with SQLite and records result columns
 - infers common parameter and result types from schema metadata, expressions, casts, joins, returning clauses, and insert/update positions
-- emits typed direct `rusqlite` functions using `prepare_cached`
+- emits typed direct `rusqlite` functions using `prepare_cached` (see
+  [Statement cache size](#statement-cache-size))
 - requires immutable connections for reads and stronger mutation-capable connections for writes
 - lowers source-level SQL parameters to dense positional binds in generated Rust
 - runs forward-only SQL migrations, seed files, and database resets through `marmot::migrations`, `marmot::seeds`, and `marmot::reset`, with bounded planner-statistics optimization after schema-changing workflows
@@ -299,6 +300,35 @@ Existing callers must make standalone write connections mutable and pass
 `&mut conn`. Callers already inside a transaction should pass `&transaction`.
 Read calls stay unchanged. Marmot rejects multi-statement query blocks, so each
 generated function has one SQLite access classification.
+
+### Statement cache size
+
+Generated functions call `prepare_cached`, so they reuse compiled statements
+from rusqlite's per-connection cache. That cache holds 16 statements by default
+and evicts the least recently used one when it fills. Raise it on every
+connection you pass to generated code:
+
+```rust
+let conn = rusqlite::Connection::open("app.sqlite")?;
+conn.set_prepared_statement_cache_capacity(4096);
+```
+
+Size it above the number of distinct statements a connection runs, not the
+number one request runs. A pooled connection serves every route over time, so
+its working set is every hot statement in the app. Generated SQL is constant
+text, so the cache can never hold more than the number of generated functions;
+a capacity above that count means nothing is ever evicted.
+
+Leaving the default in place is worse than not caching. When a request cycles
+through more statements than the cache holds, LRU evicts each one just before
+it's needed again, so every lookup misses and still pays for eviction. The
+[SQLite request-shape benchmark](https://github.com/pairshaped/gleam_sqlite_benchmarks) shows the effect on a request that runs
+26 queries over 22 distinct statements.
+
+Memory is rarely the constraint. A compiled statement usually takes a few KB,
+and only statements that have actually run occupy the cache. Curling's roughly
+2,600 generated statements take about 20 MiB per connection when all are
+cached, so it sets 4096.
 
 ### Generated bindings
 
