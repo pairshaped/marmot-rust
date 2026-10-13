@@ -3919,7 +3919,9 @@ fn common_case_branch_type(branch_types: Vec<ValueType>) -> Option<CaseType> {
     }
 }
 
-fn strip_nullability_overrides(sql: &str) -> String {
+/// Removes the `!` and `?` nullability overrides Marmot reads from result
+/// aliases, leaving the SQL SQLite executes.
+pub fn strip_nullability_overrides(sql: &str) -> String {
     let tokens = tokenize_spans(sql);
     if !tokens.iter().any(is_nullability_override) {
         return sql.to_string();
