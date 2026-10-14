@@ -11,6 +11,18 @@ pub const TRACKING_TABLE: &str = "schema_migrations";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
+    #[error("could not read migration scalar declarations from {path}: {source}")]
+    InitSqlReadError {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("could not register migration scalar declarations from {path}: {source}")]
+    InitSqlDeclarationsError {
+        path: PathBuf,
+        source: Box<crate::Error>,
+    },
+
     #[error("could not open SQLite database {path}: {source}")]
     DatabaseOpenError {
         path: PathBuf,
@@ -73,13 +85,27 @@ pub fn migrate_from_with_tracking_table(
     migrations_dir: impl AsRef<Path>,
     tracking_table: &str,
 ) -> Result<Vec<String>, MigrationError> {
+    migrate_from_with_tracking_table_and_init_sql(
+        database_path,
+        migrations_dir,
+        tracking_table,
+        None,
+    )
+}
+
+pub fn migrate_from_with_tracking_table_and_init_sql(
+    database_path: impl AsRef<Path>,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+    init_sql: Option<&Path>,
+) -> Result<Vec<String>, MigrationError> {
     let conn = Connection::open(database_path.as_ref()).map_err(|source| {
         MigrationError::DatabaseOpenError {
             path: database_path.as_ref().to_path_buf(),
             source,
         }
     })?;
-    migrate_connection(&conn, migrations_dir, tracking_table)
+    migrate_connection_with_init_sql(&conn, migrations_dir, tracking_table, init_sql)
 }
 
 pub fn versions_from(migrations_dir: impl AsRef<Path>) -> Result<Vec<String>, MigrationError> {
@@ -113,6 +139,31 @@ pub fn migrate_connection(
         })?;
     }
     Ok(applied)
+}
+
+/// Register declared scalars for schema validation, without executing initialization SQL.
+/// These placeholders refuse evaluation; callers with real application functions should
+/// use `migrate_connection` instead.
+pub fn migrate_connection_with_init_sql(
+    conn: &Connection,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+    init_sql: Option<&Path>,
+) -> Result<Vec<String>, MigrationError> {
+    if let Some(path) = init_sql {
+        let sql =
+            std::fs::read_to_string(path).map_err(|source| MigrationError::InitSqlReadError {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        crate::analyzer::register_analysis_functions(conn, path, &sql).map_err(|source| {
+            MigrationError::InitSqlDeclarationsError {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?;
+    }
+    migrate_connection(conn, migrations_dir, tracking_table)
 }
 
 fn validate_tracking_table(name: &str) -> Result<(), MigrationError> {
@@ -162,6 +213,149 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[test]
+    fn forward_migration_validates_views_with_declared_application_scalars() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations = temp.path().join("migrations");
+        fs::create_dir(&migrations).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (email TEXT, obsolete TEXT);
+             INSERT INTO users VALUES ('member@example.com', 'old');
+             CREATE VIEW user_keys AS
+             WITH original AS (
+               SELECT email, CAST(email_identity_key(email) AS TEXT) AS canonical FROM users
+             ), keys AS (SELECT email FROM original UNION SELECT canonical FROM original)
+             SELECT email FROM keys;
+             CREATE VIEW eligible_users AS SELECT email FROM users
+             WHERE NOT EXISTS (
+               SELECT 1 FROM user_keys WHERE user_keys.email = email_identity_key(users.email)
+             );",
+        )
+        .unwrap();
+        fs::write(
+            migrations.join("001_remove_obsolete.sql"),
+            "ALTER TABLE users DROP COLUMN obsolete;",
+        )
+        .unwrap();
+        let init = temp.path().join("init.sql");
+        fs::write(
+            &init,
+            "-- marmot: scalar email_identity_key 1\nINVALID INITIALIZATION SQL;",
+        )
+        .unwrap();
+
+        let missing = migrate_connection(&conn, &migrations, TRACKING_TABLE).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("no such function: email_identity_key")
+        );
+        assert!(applied_versions(&conn).is_empty());
+        migrate_connection_with_init_sql(&conn, &migrations, TRACKING_TABLE, Some(&init)).unwrap();
+
+        assert_eq!(applied_versions(&conn), ["001_remove_obsolete"]);
+        assert_eq!(
+            conn.query_row("SELECT email FROM users", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "member@example.com"
+        );
+    }
+
+    #[test]
+    fn declared_scalar_evaluation_rolls_back_the_data_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations = temp.path().join("migrations");
+        fs::create_dir(&migrations).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (email TEXT);
+             INSERT INTO users VALUES ('member@example.com');",
+        )
+        .unwrap();
+        fs::write(
+            migrations.join("001_update_email.sql"),
+            "UPDATE users SET email = 'changed@example.com';
+             UPDATE users SET email = email_identity_key(email);",
+        )
+        .unwrap();
+        let init = temp.path().join("init.sql");
+        fs::write(&init, "-- marmot: scalar email_identity_key 1").unwrap();
+
+        let error =
+            migrate_connection_with_init_sql(&conn, &migrations, TRACKING_TABLE, Some(&init))
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("analysis-only scalar cannot execute")
+        );
+        assert!(applied_versions(&conn).is_empty());
+        assert_eq!(
+            conn.query_row("SELECT email FROM users", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "member@example.com"
+        );
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn invalid_scalar_declarations_fail_before_migrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations = temp.path().join("migrations");
+        fs::create_dir(&migrations).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        fs::write(
+            migrations.join("001_users.sql"),
+            "CREATE TABLE users (email TEXT);",
+        )
+        .unwrap();
+        let init = temp.path().join("init.sql");
+        fs::write(&init, "-- marmot: scalar email_identity_key invalid").unwrap();
+
+        assert!(matches!(
+            migrate_connection_with_init_sql(&conn, &migrations, TRACKING_TABLE, Some(&init)),
+            Err(MigrationError::InitSqlDeclarationsError { .. })
+        ));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn connection_migrations_preserve_real_application_functions() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.create_scalar_function(
+            "email_identity_key",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |context| Ok(context.get::<String>(0)?.to_lowercase()),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("001_users.sql"),
+            "CREATE TABLE users (email TEXT);
+             INSERT INTO users VALUES (email_identity_key('MEMBER@EXAMPLE.COM'));",
+        )
+        .unwrap();
+
+        migrate_connection(&conn, temp.path(), TRACKING_TABLE).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT email FROM users", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "member@example.com"
+        );
+    }
 
     #[test]
     fn rebuild_migration_preserves_referencing_rows_and_restores_foreign_keys() {

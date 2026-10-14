@@ -375,10 +375,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .or(target.migrations_dir.clone())
                     .unwrap_or_else(|| PathBuf::from(migrations::MIGRATION_DIR));
                 let migration_table = resolved_migration_table(&args.migration_table, &target);
-                let applied = migrations::migrate_from_with_tracking_table(
+                let applied = migrations::migrate_from_with_tracking_table_and_init_sql(
                     &target.database,
                     migrations_dir,
                     migration_table,
+                    target.init_sql.as_deref(),
                 )?;
                 print_applied("Applied", &applied);
                 let audit = views::reconcile_database_with_init_sql(
