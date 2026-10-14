@@ -202,6 +202,55 @@ mod tests {
     use marmot::{Config, Target};
 
     #[test]
+    fn toggling_statement_labels_changes_the_generation_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("items.rs"), "").unwrap();
+        fs::write(
+            source.join("items.sql"),
+            "-- func: list_items\nselect * from items",
+        )
+        .unwrap();
+        let database = root.path().join("app.sqlite");
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("create table items (id integer primary key) strict;")
+            .unwrap();
+        let target = |statement_labels| AnalysisTarget {
+            config: Config {
+                database: database.clone(),
+                source_root: source.clone(),
+                output: source.join("generated/sql"),
+                target: Target::Rust,
+                check: false,
+                temporal: Default::default(),
+            },
+            init_sql: None,
+            view_source_root: source.clone(),
+            serialize_modules: Default::default(),
+            public_bindings: None,
+            auxiliary_inputs: vec![],
+            statement_labels,
+        };
+        let config = FileConfig::default();
+        let config_path = root.path().join("marmot.toml");
+        let inputs = |statement_labels| {
+            let target = target(statement_labels);
+            Cache::new(&target)
+                .current(&target, &config, &config_path, "executable")
+                .unwrap()
+                .inputs
+        };
+        assert_eq!(inputs(false), inputs(false));
+        assert_ne!(
+            inputs(false),
+            inputs(true),
+            "a labelled run must never skip regeneration on unlabelled bindings"
+        );
+    }
+
+    #[test]
     fn schema_change_after_analysis_cannot_authorize_old_bindings() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("src");
