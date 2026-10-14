@@ -62,6 +62,8 @@ untyped runtime fallback.
 
 ## Table rebuild migrations
 
+Use a rebuild only when SQLite can't make the change in place. `DROP COLUMN` and `RENAME COLUMN` don't need one, and neither does a type or constraint change made by adding a new column, backfilling it and dropping the old one. A column's own named Boolean `CHECK` doesn't block dropping it.
+
 Put `-- marmot: rebuild-table` on its own line in a numbered migration that replaces a referenced table. Marmot disables foreign-key enforcement before starting that migration's transaction, checks all foreign keys before commit, and restores the prior setting. The table copy, replacement and migration tracking record commit together. A SQL error or invalid relationship rolls them back.
 
 Keep table copies and explicit insert columns in the migration. Preserve unrelated columns, indexes, triggers and dependent rows. A rebuild cannot run inside an existing transaction or an atomic seed workflow. Rebuild SQL must not contain transaction-control statements; Marmot owns the transaction boundary. Ordinary migrations keep foreign-key enforcement enabled.
