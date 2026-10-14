@@ -330,6 +330,17 @@ and only statements that have actually run occupy the cache. Curling's roughly
 2,600 generated statements take about 20 MiB per connection when all are
 cached, so it sets 4096.
 
+### Statement labels
+
+Pass `--statement-labels` to `generate` to start each generated SQL constant
+with a comment naming its source: `/* marmot:<path>#<function> */`. The path is
+the companion `.sql` file as the config sees it (the configured `source_root`
+joined with the module path), and the function is the `-- func:` name.
+SQLite returns that text from `sqlite3_sql`, so a trace or profile hook can
+attribute every statement without a runtime registry. The flag is off by
+default, and `generate --check` must be given the same flag to compare against
+labelled bindings.
+
 ### Generated bindings
 
 Marmot writes each companion file's bindings beside it, as `NAME.generated.rs`

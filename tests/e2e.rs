@@ -117,6 +117,49 @@ fn analyzes_and_emits_multiple_colocated_sql_modules() {
 }
 
 #[test]
+fn statement_labels_join_the_path_from_the_configured_source_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    let conn = Connection::open(&database).unwrap();
+    conn.execute_batch("create table users (id integer primary key, name text not null) strict;")
+        .unwrap();
+    drop(conn);
+
+    let source_root = dir.path().join("src");
+    write_sql_file(
+        &source_root.join("admin/users"),
+        "list_users.sql",
+        "select id, name from users order by id",
+    );
+    let config = Config {
+        database,
+        source_root: source_root.clone(),
+        output: dir.path().join("src/generated/sql"),
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+    let project = analyze_project(&config).unwrap();
+    let generated = source_root.join("admin/users.generated.rs");
+    let sql_path = source_root.join("admin/users.sql");
+    let label = format!("/* marmot:{}#list_users */", sql_path.display());
+
+    emit_project(&config, &project).unwrap();
+    assert!(!fs::read_to_string(&generated).unwrap().contains("marmot:"));
+
+    marmot::emit::emit_project_with_binding_visibility(
+        &config,
+        &project,
+        &Default::default(),
+        &[],
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&generated).unwrap().contains(&label));
+}
+
+#[test]
 fn named_boolean_constraints_emit_bool_types_for_strict_tables() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("app.sqlite3");

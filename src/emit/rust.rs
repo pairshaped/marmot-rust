@@ -26,6 +26,7 @@ pub(super) fn render_project(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
     public_bindings: Option<&BTreeMap<String, BTreeSet<String>>>,
+    statement_labels: bool,
 ) -> Result<BTreeMap<PathBuf, String>> {
     let mut by_module: BTreeMap<&str, Vec<&Query>> = BTreeMap::new();
     for query in &project.queries {
@@ -53,7 +54,12 @@ pub(super) fn render_project(
     }
     for (module, queries) in by_module {
         let path = adjacent_binding_path(queries[0]);
-        let mut content = render_module(&sql_file_name(queries[0]), queries, temporal_module)?;
+        let mut content = render_module(
+            &sql_file_name(queries[0]),
+            queries,
+            temporal_module,
+            statement_labels,
+        )?;
         if serialize_modules.contains(module) {
             content = add_serialize_to_row_structs(content);
         }
@@ -487,6 +493,7 @@ fn render_module(
     sql_file: &str,
     queries: Vec<&Query>,
     temporal_module: Option<&str>,
+    statement_labels: bool,
 ) -> Result<String> {
     validate_generated_names(&queries)?;
     let import_macros = render_import_macros(&queries);
@@ -512,7 +519,7 @@ fn render_module(
          {mutation_connection}",
     );
     for query in queries {
-        output.push_str(&render_query(query));
+        output.push_str(&render_query(query, statement_labels));
         output.push('\n');
     }
 
@@ -700,14 +707,14 @@ fn render_import_macros(queries: &[&Query]) -> String {
     }
 }
 
-fn render_query(query: &Query) -> String {
+fn render_query(query: &Query, statement_labels: bool) -> String {
     let const_name = format!("{}_SQL", query.name.to_uppercase());
     let lowered = lower_sql_parameters(query);
 
     let mut output = render_column_substitution(query);
     output.push_str(&render_parameter_struct(query));
     let (sql_declarations, sql_selection, sql_expression) =
-        render_query_sql(query, &const_name, &lowered);
+        render_query_sql(query, &const_name, &lowered, statement_labels);
     output.push_str(&sql_declarations);
     match &query.return_type {
         ReturnType::Execute => output.push_str(&render_execute(
@@ -736,12 +743,14 @@ fn render_query_sql(
     query: &Query,
     const_name: &str,
     lowered: &LoweredSqlParameters<'_>,
+    statement_labels: bool,
 ) -> (String, String, String) {
+    let label = statement_label(query, statement_labels);
     let Some(substitution) = &query.column_substitution else {
         return (
             format!(
                 "const {const_name}: &str = {};\n\n",
-                raw_string(&lowered.sql)
+                raw_string(&format!("{label}{}", lowered.sql))
             ),
             String::new(),
             const_name.to_string(),
@@ -760,7 +769,7 @@ fn render_query_sql(
         let lowered_choice = lower_sql_parameters_for(query, &choice.sql);
         declarations.push_str(&format!(
             "const {choice_const}: &str = {};\n",
-            raw_string(&lowered_choice.sql)
+            raw_string(&format!("{label}{}", lowered_choice.sql))
         ));
         arms.push_str(&format!(
             "                 {enum_name}::{} => {choice_const},\n",
@@ -771,6 +780,17 @@ fn render_query_sql(
     let selection =
         format!("let sql = match params.column {{\n{arms}             }};\n             ");
     (declarations, selection, "sql".to_string())
+}
+
+/// The comment SQLite returns from `sqlite3_sql`, so a statement names its own
+/// companion file and function. The path is the SQL file's path as the Marmot
+/// config sees it, and the function is the `-- func:` name.
+fn statement_label(query: &Query, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let path = query.source_path.to_string_lossy().replace('\\', "/");
+    format!("/* marmot:{path}#{} */\n", query.name)
 }
 
 fn render_column_substitution(query: &Query) -> String {
@@ -1268,7 +1288,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("user_id = ?1"));
         assert!(output.contains("created_at >= ?2"));
@@ -1320,7 +1340,7 @@ mod tests {
             }),
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("pub enum UpdateUserFieldColumn"));
         assert!(output.contains("Name,"));
@@ -1331,6 +1351,29 @@ mod tests {
         assert!(output.contains("const UPDATE_USER_FIELD_ACTIVE_SQL"));
         assert!(output.contains("UpdateUserFieldColumn::Name => UPDATE_USER_FIELD_NAME_SQL"));
         assert!(output.contains("conn.execute(sql, params![params.value, params.id])"));
+    }
+
+    #[test]
+    fn statement_labels_name_the_companion_file_and_function() {
+        let query = Query {
+            source_path: PathBuf::from("crates/app/src/users/find.sql"),
+            module_name: "users".to_string(),
+            name: "find_user".to_string(),
+            return_type: ReturnType::Execute,
+            connection_access: ConnectionAccess::Mutation,
+            sql: "update users set name = ?".to_string(),
+            parameters: vec![],
+            column_substitution: None,
+            columns: vec![],
+        };
+
+        let labelled = render_query(&query, true);
+        assert!(labelled.contains(
+            "const FIND_USER_SQL: &str = r\"/* marmot:crates/app/src/users/find.sql#find_user */\nupdate users set name = ?\";"
+        ));
+        let plain = render_query(&query, false);
+        assert!(!plain.contains("marmot:"));
+        assert!(plain.contains("const FIND_USER_SQL: &str = r\"update users set name = ?\";"));
     }
 
     #[test]
@@ -1360,7 +1403,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("params![params.param, params.param_2]"));
     }
@@ -1392,7 +1435,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("update users set name = ?1 where id = ?2 or parent_id = ?2"));
         assert!(output.contains("params![params.param_2, params.param]"));
@@ -1417,7 +1460,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("update users set name = ?1"));
         assert!(output.contains("params![params.param_2]"));
@@ -1450,7 +1493,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users.sql", vec![&query], None).unwrap();
+        let output = render_module("users.sql", vec![&query], None, false).unwrap();
 
         assert!(output.contains("params![params.param, params.param_2]"));
     }
@@ -1482,7 +1525,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users.sql", vec![&query], None).unwrap();
+        let output = render_module("users.sql", vec![&query], None, false).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
         assert!(output.contains("params![params.param, params.id]"));
@@ -1515,7 +1558,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_module("users.sql", vec![&query], None).unwrap();
+        let output = render_module("users.sql", vec![&query], None, false).unwrap();
 
         assert!(output.contains("update users set name = ?1 where id = ?2"));
         assert!(output.contains("params![params.param, params.param_2]"));
@@ -1562,7 +1605,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("pub bio: Option<&'a str>"));
         assert!(output.contains("pub id: i64"));
@@ -1596,7 +1639,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains(
             "pub fn insert_user_batch(conn: impl MutationConnection, params: &[InsertUserParams<'_>])"
@@ -1688,8 +1731,8 @@ mod tests {
             columns: vec![],
         };
 
-        let row_output = render_query(&row_query);
-        let execute_output = render_query(&execute_query);
+        let row_output = render_query(&row_query, false);
+        let execute_output = render_query(&execute_query, false);
 
         assert!(row_output.contains("pub active: bool"));
         assert!(row_output.contains("pub price: f64"));
@@ -1729,7 +1772,7 @@ mod tests {
             }],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("|row| row.get(0)"), "{output}");
         assert!(!output.contains("Ok(row.get(0)?)"));
@@ -1757,7 +1800,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("pub struct UpdateUserParams {"), "{output}");
         assert!(output.contains("pub param_7: i64"), "{output}");
@@ -1797,7 +1840,7 @@ mod tests {
             columns: vec![],
         };
 
-        let output = render_query(&query);
+        let output = render_query(&query, false);
 
         assert!(output.contains("r##\"select 'it''s fine', \"quoted\", r#\"raw\"#\"##"));
     }
@@ -1841,7 +1884,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users.sql", query_refs, None),
+            render_module("users.sql", query_refs, None, false),
             Err(Error::DuplicateQueryNames { names }) if names == ["find_user", "find_user_one"]
         ));
     }
@@ -1885,7 +1928,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users.sql", query_refs, None),
+            render_module("users.sql", query_refs, None, false),
             Err(Error::DuplicateQueryNames { names }) if names == ["find_one"]
         ));
     }
@@ -1938,7 +1981,7 @@ mod tests {
         let query_refs = queries.iter().collect::<Vec<_>>();
 
         assert!(matches!(
-            render_module("users.sql", query_refs, None),
+            render_module("users.sql", query_refs, None, false),
             Err(Error::DuplicateRowTypeNames { names }) if names == ["ListOrgsRow"]
         ));
     }

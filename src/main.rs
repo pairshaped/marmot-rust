@@ -65,6 +65,11 @@ struct Args {
 
     #[arg(long)]
     check: bool,
+
+    /// Start each generated SQL constant with a `/* marmot:<path>#<function> */`
+    /// comment naming its companion file and function.
+    #[arg(long)]
+    statement_labels: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -331,6 +336,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &target.serialize_modules,
                     &definitions,
                     target.public_bindings.as_ref(),
+                    target.statement_labels,
                 )?;
                 let audit = views::audit_database_with_init_sql(
                     &config.database,
@@ -672,6 +678,7 @@ struct AnalysisTarget {
     serialize_modules: BTreeSet<String>,
     public_bindings: Option<BTreeMap<String, BTreeSet<String>>>,
     auxiliary_inputs: Vec<PathBuf>,
+    statement_labels: bool,
 }
 
 fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, ConfigError> {
@@ -680,6 +687,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
     let output = args.output;
     let target = args.target;
     let check = args.check;
+    let statement_labels = args.statement_labels;
 
     Ok(targets
         .into_iter()
@@ -716,6 +724,7 @@ fn configs(args: Args, file_config: &FileConfig) -> Result<Vec<AnalysisTarget>, 
                 .into_iter()
                 .flatten()
                 .collect(),
+                statement_labels,
             }
         })
         .collect())

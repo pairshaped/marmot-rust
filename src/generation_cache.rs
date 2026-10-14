@@ -240,6 +240,7 @@ mod tests {
             serialize_modules: Default::default(),
             public_bindings: None,
             auxiliary_inputs: vec![],
+            statement_labels: false,
         };
         let config = FileConfig::default();
         let config_path = root.path().join("marmot.toml");

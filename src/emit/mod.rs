@@ -56,7 +56,7 @@ pub fn emit_project_with_serialize_modules(
     project: &Project,
     serialize_modules: &BTreeSet<String>,
 ) -> Result<()> {
-    emit(config, project, serialize_modules, None, None)
+    emit(config, project, serialize_modules, None, None, false)
 }
 
 /// Publish one owner's bindings and view installation SQL as one complete
@@ -73,6 +73,7 @@ pub fn emit_project_with_views(
         serialize_modules,
         Some(definitions),
         None,
+        false,
     )?)
 }
 
@@ -82,6 +83,7 @@ pub fn emit_project_with_binding_visibility(
     serialize_modules: &BTreeSet<String>,
     definitions: &[ViewDefinition],
     public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
+    statement_labels: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(emit(
         config,
@@ -89,6 +91,7 @@ pub fn emit_project_with_binding_visibility(
         serialize_modules,
         Some(definitions),
         public_bindings,
+        statement_labels,
     )?)
 }
 
@@ -98,6 +101,7 @@ fn emit(
     serialize_modules: &BTreeSet<String>,
     definitions: Option<&[ViewDefinition]>,
     public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
+    statement_labels: bool,
 ) -> Result<()> {
     let plan = plan(
         config,
@@ -105,6 +109,7 @@ fn emit(
         serialize_modules,
         definitions,
         public_bindings,
+        statement_labels,
     )?;
     if config.check {
         // Check mode only reads: it stages nothing and touches no path.
@@ -142,10 +147,17 @@ fn plan(
     serialize_modules: &BTreeSet<String>,
     definitions: Option<&[ViewDefinition]>,
     public_bindings: Option<&std::collections::BTreeMap<String, BTreeSet<String>>>,
+    statement_labels: bool,
 ) -> Result<Plan> {
     let mut plan = match config.target {
         Target::Rust => Plan {
-            desired: rust::render_project(config, project, serialize_modules, public_bindings)?,
+            desired: rust::render_project(
+                config,
+                project,
+                serialize_modules,
+                public_bindings,
+                statement_labels,
+            )?,
             managed: managed_files(config)?,
             prune_root: Some(config.output.clone()),
         },
