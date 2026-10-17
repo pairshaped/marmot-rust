@@ -1113,7 +1113,11 @@ fn generated_rust_functions_round_trip_against_sqlite() {
         "select id, name, active, avatar, score, nickname \
          from users where active = @active order by id",
     );
-    write_sql_file(&module_dir, "count_users.sql", "select count(*) from users");
+    write_sql_file(
+        &module_dir,
+        "count_users.sql",
+        "-- cardinality: one\nselect count(*) from users",
+    );
     write_sql_file(
         &module_dir,
         "rename_user.sql",
@@ -1139,27 +1143,27 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     write_sql_file(
         &module_dir,
         "find_name_numbered.sql",
-        "select name from users where id = ?1 and active = ?2",
+        "-- cardinality: both\nselect name from users where id = ?1 and active = ?2",
     );
     write_sql_file(
         &module_dir,
         "find_name_numbered_leading_zero.sql",
-        "select name from users where id = ?01 and active = ?02",
+        "-- cardinality: one\nselect name from users where id = ?01 and active = ?02",
     );
     write_sql_file(
         &module_dir,
         "find_active_sparse_numbered.sql",
-        "select name from users where active = ?2 order by id",
+        "-- cardinality: one\nselect name from users where active = ?2 order by id",
     );
     write_sql_file(
         &module_dir,
         "find_name_mixed_positional.sql",
-        "select name from users where id = ?1 and active = ?",
+        "-- cardinality: one\nselect name from users where id = ?1 and active = ?",
     );
     write_sql_file(
         &module_dir,
         "find_name_named_numbered_same_slot.sql",
-        "select name from users where id = @id and id = ?1",
+        "-- cardinality: one\nselect name from users where id = @id and id = ?1",
     );
     write_sql_file(
         &module_dir,
@@ -1181,7 +1185,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     write_sql_file(
         &module_dir,
         "find_keyword_table_row.sql",
-        "select name from \"returning\" where id = @id",
+        "-- cardinality: one\nselect name from \"returning\" where id = @id",
     );
     write_sql_file(
         &module_dir,
@@ -1740,6 +1744,10 @@ mod tests {
             app::list_active_users(&conn, app::ListActiveUsersParams { active: true }).unwrap();
         assert_eq!(active[0].score, 2.5);
 
+        assert_eq!(
+            app::find_name_numbered(&conn, app::FindNameNumberedParams { param: 1, param_2: true }).unwrap(),
+            vec!["bob".to_string()]
+        );
         assert_eq!(
             app::find_name_numbered_one(
                 &conn,

@@ -41,6 +41,7 @@ pub struct Query {
     pub name: String,
     pub return_type: ReturnType,
     pub emit_batch: bool,
+    pub scalar_cardinality: ScalarCardinality,
     pub connection_access: ConnectionAccess,
     pub sql: String,
     pub parameters: Vec<Parameter>,
@@ -63,6 +64,14 @@ pub struct Project {
 pub enum ReturnType {
     Execute,
     Rows,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScalarCardinality {
+    #[default]
+    Many,
+    One,
+    Both,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

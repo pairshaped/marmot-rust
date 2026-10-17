@@ -1,10 +1,11 @@
-use crate::model::sanitize_identifier;
+use crate::model::{ScalarCardinality, sanitize_identifier};
 use crate::sql_text::strip_comments;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlBlock {
     pub function_name: String,
     pub emit_batch: bool,
+    pub scalar_cardinality: Option<ScalarCardinality>,
     pub sql: String,
     pub column_substitution: Option<ColumnSubstitution>,
 }
@@ -24,12 +25,16 @@ pub enum SqlBlockError {
     DuplicateFunc { name: String },
     ColumnBeforeFunc,
     InvalidBatch { reason: String },
+    InvalidCardinality { reason: String },
     InvalidColumn { reason: String },
 }
 
 impl std::fmt::Display for SqlBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidCardinality { reason } => {
+                write!(f, "invalid `-- cardinality:` directive: {reason}")
+            }
             Self::InvalidBatch { reason } => write!(f, "invalid `-- batch` directive: {reason}"),
             Self::MissingFunc => f.write_str("SQL file must contain at least one `-- func:` block"),
             Self::SqlBeforeFirstFunc => {
@@ -57,6 +62,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
     let mut current_sql = String::new();
     let mut current_column = None;
     let mut current_batch = false;
+    let mut current_cardinality = None;
 
     for line in sql.lines() {
         if let Some(name) = func_name_from_line(line)? {
@@ -66,6 +72,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
                 &mut current_sql,
                 current_column.take(),
                 std::mem::take(&mut current_batch),
+                current_cardinality.take(),
             )?;
             current_name = Some(name);
             continue;
@@ -91,6 +98,38 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
         }) {
             return Err(SqlBlockError::InvalidBatch {
                 reason: "use `-- batch` without a value".into(),
+            });
+        }
+
+        if let Some(value) = comment.and_then(|body| body.strip_prefix("cardinality:")) {
+            if current_name.is_none() || current_cardinality.is_some() {
+                return Err(SqlBlockError::InvalidCardinality {
+                    reason: "must appear once inside a `-- func:` block".into(),
+                });
+            }
+            current_cardinality = Some(match value.trim() {
+                "many" => ScalarCardinality::Many,
+                "one" => ScalarCardinality::One,
+                "both" => ScalarCardinality::Both,
+                _ => {
+                    return Err(SqlBlockError::InvalidCardinality {
+                        reason: "expected many, one or both".into(),
+                    });
+                }
+            });
+            continue;
+        }
+        if comment.is_some_and(|body| {
+            body.strip_prefix("cardinality").is_some_and(|value| {
+                value.is_empty()
+                    || value
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_whitespace() || ch == '=')
+            })
+        }) {
+            return Err(SqlBlockError::InvalidCardinality {
+                reason: "use `-- cardinality: many`, `one` or `both`".into(),
             });
         }
 
@@ -123,6 +162,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
         &mut current_sql,
         current_column,
         current_batch,
+        current_cardinality,
     )?;
 
     if blocks.is_empty() {
@@ -203,6 +243,7 @@ fn finish_block(
     sql: &mut String,
     column_substitution: Option<ColumnSubstitution>,
     emit_batch: bool,
+    scalar_cardinality: Option<ScalarCardinality>,
 ) -> std::result::Result<(), SqlBlockError> {
     let Some(name) = name else {
         return Ok(());
@@ -243,6 +284,7 @@ fn finish_block(
     blocks.push(SqlBlock {
         function_name: name,
         emit_batch,
+        scalar_cardinality,
         sql: trimmed.to_string(),
         column_substitution,
     });
@@ -253,6 +295,38 @@ fn finish_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_cardinality_is_scoped_and_rejects_malformed_values() {
+        for (value, expected) in [
+            ("many", ScalarCardinality::Many),
+            ("one", ScalarCardinality::One),
+            ("both", ScalarCardinality::Both),
+        ] {
+            let source = format!(
+                "-- func: find\n-- cardinality: {value}\nselect 1;\n-- func: other\nselect 2"
+            );
+            let blocks = parse_sql_blocks(&source).unwrap();
+            assert_eq!(blocks[0].scalar_cardinality, Some(expected));
+            assert_eq!(blocks[1].scalar_cardinality, None);
+            assert!(!blocks[0].sql.contains("cardinality"));
+        }
+        for source in [
+            "-- cardinality: one\n-- func: find\nselect 1",
+            "-- func: find\n-- cardinality: one\n-- cardinality: both\nselect 1",
+            "-- func: find\n-- cardinality: single\nselect 1",
+            "-- func: find\n-- cardinality one\nselect 1",
+            "-- func: find\n-- cardinality=one\nselect 1",
+        ] {
+            assert!(
+                matches!(
+                    parse_sql_blocks(source),
+                    Err(SqlBlockError::InvalidCardinality { .. })
+                ),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn batch_opt_in_is_scoped_and_validated() {
@@ -308,12 +382,14 @@ select 1",
                 SqlBlock {
                     function_name: "list_users".to_string(),
                     emit_batch: false,
+                    scalar_cardinality: None,
                     sql: "select id, name from users;".to_string(),
                     column_substitution: None,
                 },
                 SqlBlock {
                     function_name: "delete_user".to_string(),
                     emit_batch: false,
+                    scalar_cardinality: None,
                     sql: "delete from users where id = @id;".to_string(),
                     column_substitution: None,
                 },
@@ -337,6 +413,7 @@ select 1",
             vec![SqlBlock {
                 function_name: "update_user_field".to_string(),
                 emit_batch: false,
+                scalar_cardinality: None,
                 sql: "update users set {{column}} = @value where id = @id;".to_string(),
                 column_substitution: Some(ColumnSubstitution {
                     choices: vec!["name".to_string(), "nickname".to_string()],

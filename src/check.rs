@@ -407,6 +407,7 @@ mod tests {
             name: "run".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Read,
             sql: "select 1".to_string(),
             parameters: vec![],

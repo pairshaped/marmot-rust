@@ -303,6 +303,27 @@ Existing callers must make standalone write connections mutable and pass
 Read calls stay unchanged. Marmot rejects multi-statement query blocks, so each
 generated function has one SQLite access classification.
 
+Mutation bindings import the shared trait, so add `marmot` as an application
+dependency alongside `rusqlite`.
+
+### Scalar cardinality
+
+A single-column query emits a list function by default. Add `-- cardinality: one`
+to emit only its `_one` function, or `-- cardinality: both` when callers need both
+forms:
+
+```sql
+-- func: item_count
+-- cardinality: one
+select count(*) from items;
+```
+
+`-- cardinality: many` explicitly selects the default list form. These annotations
+require exactly one result column. They also work on single-column mutations with
+`RETURNING`; those functions retain the mutation-connection requirement. The
+annotation selects generated functions without changing SQL or result handling.
+`_one` still uses `query_row`, including its error when no row is returned.
+
 ### Prepared mutation batches
 
 Add `-- batch` inside a parameterized mutation block to emit its `_batch`

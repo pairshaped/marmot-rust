@@ -51,13 +51,12 @@ mod tests {
     #[test]
     fn mutable_connections_and_transactions_keep_the_same_database_and_rollback() {
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
-        (&mut connection)
-            .as_connection()
+        let mutation = &mut connection;
+        MutationConnection::as_connection(&mutation)
             .execute("create table items (id integer)", [])
             .unwrap();
         let transaction = connection.transaction().unwrap();
-        (&transaction)
-            .as_connection()
+        MutationConnection::as_connection(&&transaction)
             .execute("insert into items values (1)", [])
             .unwrap();
         transaction.rollback().unwrap();

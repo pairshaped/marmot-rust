@@ -7,7 +7,9 @@ use heck::ToPascalCase;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{ConnectionAccess, Parameter, Project, Query, ReturnType, ValueType};
+use crate::model::{
+    ConnectionAccess, Parameter, Project, Query, ReturnType, ScalarCardinality, ValueType,
+};
 use crate::sqlite::tokenize::{Token, tokenize_spans};
 
 /// The shared temporal module file and the declaration file beside it.
@@ -667,8 +669,12 @@ impl ParameterSlots {
 }
 
 fn generated_function_names_for(query: &Query) -> Vec<String> {
-    let mut names = vec![query.name.clone()];
-    if matches!(query.return_type, ReturnType::Rows) && query.columns.len() == 1 {
+    let scalar = matches!(query.return_type, ReturnType::Rows) && query.columns.len() == 1;
+    let mut names = Vec::new();
+    if !scalar || query.scalar_cardinality != ScalarCardinality::One {
+        names.push(query.name.clone());
+    }
+    if scalar && query.scalar_cardinality != ScalarCardinality::Many {
         names.push(format!("{}_one", query.name));
     }
     if supports_batch_helper(query) {
@@ -860,24 +866,33 @@ fn render_scalar_select(
     let row_get = render_row_get_result(&query.columns[0], 0);
     let params = render_params(query);
     let bindings = render_bindings(query, lowered);
-    format!(
-        "pub fn {name}({connection_param}{params}) -> Result<Vec<{rust_type}>> {{\n\
+    let connection_param = render_connection_param(query);
+    let connection_binding = render_connection_binding(query);
+    let mut output = String::new();
+    if query.scalar_cardinality != ScalarCardinality::One {
+        output.push_str(&format!(
+            "pub fn {name}({connection_param}{params}) -> Result<Vec<{rust_type}>> {{\n\
              {connection_binding}\
              {sql_selection}\
              let mut stmt = conn.prepare_cached({sql_expression})?;\n\
              let rows = stmt.query_map({bindings}, |row| {row_get})?;\n\
              rows.collect()\n\
-         }}\n\n\
-         pub fn {name}_one({connection_param}{params}) -> Result<{rust_type}> {{\n\
+         }}\n\n",
+            name = query.name,
+        ));
+    }
+    if query.scalar_cardinality != ScalarCardinality::Many {
+        output.push_str(&format!(
+            "pub fn {name}_one({connection_param}{params}) -> Result<{rust_type}> {{\n\
              {connection_binding}\
              {sql_selection}\
              let mut stmt = conn.prepare_cached({sql_expression})?;\n\
              stmt.query_row({bindings}, |row| {row_get})\n\
          }}\n",
-        name = query.name,
-        connection_param = render_connection_param(query),
-        connection_binding = render_connection_binding(query),
-    )
+            name = query.name,
+        ));
+    }
+    output
 }
 
 fn render_execute(
@@ -1249,6 +1264,7 @@ mod tests {
             name: "search".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update posts set viewed = 1 where user_id = @user_id and created_at >= :since and title like $pattern or owner_id = :user_id".to_string(),
             parameters: vec![
@@ -1296,6 +1312,7 @@ mod tests {
             name: "update_user_field".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set \"name\" = @value where id = @id".to_string(),
             parameters: vec![
@@ -1349,6 +1366,7 @@ mod tests {
             name: "find_user".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ?".to_string(),
             parameters: vec![],
@@ -1373,6 +1391,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ? where id = ?".to_string(),
             parameters: vec![
@@ -1406,6 +1425,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ?2 where id = ?1 or parent_id = ?1".to_string(),
             parameters: vec![
@@ -1440,6 +1460,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ?2".to_string(),
             parameters: vec![Parameter {
@@ -1466,6 +1487,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "delete from users where id = ?1 and name = ?".to_string(),
             parameters: vec![
@@ -1499,6 +1521,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ? where id = @id".to_string(),
             parameters: vec![
@@ -1533,6 +1556,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set name = ? where id = ?2".to_string(),
             parameters: vec![
@@ -1581,6 +1605,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set bio = @bio where id = @id".to_string(),
             parameters: vec![
@@ -1616,6 +1641,7 @@ mod tests {
             name: "insert_user".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: true,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "insert into users (id, name) values (@id, @name)".to_string(),
             parameters: vec![
@@ -1662,6 +1688,7 @@ mod tests {
             name: "list".to_string(),
             return_type: ReturnType::Rows,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Read,
             sql: "select active, price, avatar, metadata, deleted from files".to_string(),
             parameters: vec![],
@@ -1705,6 +1732,7 @@ mod tests {
             name: "update".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update files set active = ?, price = ?, avatar = ?, maybe_avatar = ?".to_string(),
             parameters: vec![
@@ -1767,6 +1795,7 @@ mod tests {
             name: "count_users".to_string(),
             return_type: ReturnType::Rows,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Read,
             sql: "select count(*) from users".to_string(),
             parameters: vec![],
@@ -1793,6 +1822,7 @@ mod tests {
             name: "update_user".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: "update users set a = ?, b = ?, c = ?, d = ?, e = ?, f = ? where id = ?"
                 .to_string(),
@@ -1842,6 +1872,7 @@ mod tests {
             name: "find".to_string(),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Read,
             sql: "select 'it''s fine', \"quoted\", r#\"raw\"#".to_string(),
             parameters: vec![],
@@ -1863,6 +1894,7 @@ mod tests {
                 name: "find_user".to_string(),
                 return_type: ReturnType::Rows,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Both,
                 connection_access: ConnectionAccess::Read,
                 sql: "select 1 as value".to_string(),
                 parameters: vec![],
@@ -1880,6 +1912,7 @@ mod tests {
                 name: "find_user".to_string(),
                 return_type: ReturnType::Rows,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Both,
                 connection_access: ConnectionAccess::Read,
                 sql: "select 2 as value".to_string(),
                 parameters: vec![],
@@ -1901,14 +1934,52 @@ mod tests {
     }
 
     #[test]
+    fn scalar_cardinality_emits_only_the_requested_functions() {
+        let mut query = Query {
+            source_path: PathBuf::from("src/items.sql"),
+            module_name: "items".into(),
+            name: "find".into(),
+            return_type: ReturnType::Rows,
+            emit_batch: false,
+            scalar_cardinality: ScalarCardinality::Many,
+            connection_access: ConnectionAccess::Read,
+            sql: "select 1".into(),
+            parameters: vec![],
+            column_substitution: None,
+            columns: vec![Column {
+                name: "value".into(),
+                field_name: "value".into(),
+                column_type: ValueType::I64,
+                nullable: false,
+            }],
+        };
+        for (mode, many, one) in [
+            (ScalarCardinality::Many, true, false),
+            (ScalarCardinality::One, false, true),
+            (ScalarCardinality::Both, true, true),
+        ] {
+            query.scalar_cardinality = mode;
+            let output = render_query(&query, false);
+            assert_eq!(output.contains("pub fn find("), many);
+            assert_eq!(output.contains("pub fn find_one("), one);
+            let expected = [(many, "find"), (one, "find_one")]
+                .into_iter()
+                .filter_map(|(include, name)| include.then_some(name))
+                .collect::<Vec<_>>();
+            assert_eq!(generated_function_names_for(&query), expected);
+        }
+    }
+
+    #[test]
     fn render_module_rejects_scalar_helper_name_collisions() {
-        let queries = [
+        let mut queries = [
             Query {
                 source_path: PathBuf::from("src/users/sql/find.sql"),
                 module_name: "users".to_string(),
                 name: "find".to_string(),
                 return_type: ReturnType::Rows,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Both,
                 connection_access: ConnectionAccess::Read,
                 sql: "select 1 as value".to_string(),
                 parameters: vec![],
@@ -1926,6 +1997,7 @@ mod tests {
                 name: "find_one".to_string(),
                 return_type: ReturnType::Execute,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Many,
                 connection_access: ConnectionAccess::Mutation,
                 sql: "delete from users where id = ?".to_string(),
                 parameters: vec![Parameter {
@@ -1944,6 +2016,8 @@ mod tests {
             render_module("users.sql", query_refs, None, false),
             Err(Error::DuplicateQueryNames { names }) if names == ["find_one"]
         ));
+        queries[0].scalar_cardinality = ScalarCardinality::Many;
+        assert!(render_module("users.sql", queries.iter().collect(), None, false).is_ok());
     }
 
     #[test]
@@ -1969,6 +2043,7 @@ mod tests {
                 name: "list_orgs".to_string(),
                 return_type: ReturnType::Rows,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Many,
                 connection_access: ConnectionAccess::Read,
                 sql: "select id, name from orgs".to_string(),
                 parameters: vec![],
@@ -1981,6 +2056,7 @@ mod tests {
                 name: "list__orgs".to_string(),
                 return_type: ReturnType::Rows,
                 emit_batch: false,
+                scalar_cardinality: crate::model::ScalarCardinality::Many,
                 connection_access: ConnectionAccess::Read,
                 sql: "select id, name from orgs where id = ?".to_string(),
                 parameters: vec![Parameter {

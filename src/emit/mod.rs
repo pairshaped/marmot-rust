@@ -229,6 +229,7 @@ mod tests {
             name: format!("run_{}", module.replace('/', "_")),
             return_type: ReturnType::Execute,
             emit_batch: false,
+            scalar_cardinality: crate::model::ScalarCardinality::Many,
             connection_access: ConnectionAccess::Mutation,
             sql: sql.to_string(),
             parameters: if temporal {

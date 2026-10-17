@@ -153,12 +153,24 @@ pub fn analyze_project_snapshot(
                 });
             }
 
+            if block.scalar_cardinality.is_some()
+                && (!matches!(first.return_type, ReturnType::Rows) || first.columns.len() != 1)
+            {
+                return Err(Error::InvalidSqlBlock {
+                    path: file.path.clone(),
+                    reason: crate::sqlite::blocks::SqlBlockError::InvalidCardinality {
+                        reason: format!("{} must return exactly one column", block.function_name),
+                    },
+                });
+            }
+
             queries.push(Query {
                 source_path: file.path.clone(),
                 module_name: file.module_name.clone(),
                 name: block.function_name,
                 return_type: first.return_type.clone(),
                 emit_batch: block.emit_batch,
+                scalar_cardinality: block.scalar_cardinality.unwrap_or_default(),
                 connection_access: first.connection_access.clone(),
                 sql: first.sql.clone(),
                 parameters,
@@ -4095,6 +4107,66 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn scalar_cardinality_defaults_to_many_and_requires_one_result_column() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("cardinality.sqlite3");
+        Connection::open(&database)
+            .unwrap()
+            .execute("create table items (id integer, label text)", [])
+            .unwrap();
+        let source_root = dir.path().join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("items.rs"), "").unwrap();
+        let config = Config {
+            database,
+            source_root: source_root.clone(),
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        };
+        use crate::model::ScalarCardinality;
+        for (sql, expected) in [
+            ("select id from items", Some(ScalarCardinality::Many)),
+            (
+                "-- cardinality: one\nselect id from items",
+                Some(ScalarCardinality::One),
+            ),
+            (
+                "-- cardinality: both\nselect id from items",
+                Some(ScalarCardinality::Both),
+            ),
+            (
+                "-- cardinality: one\ninsert into items (id) values (@id) returning id",
+                Some(ScalarCardinality::One),
+            ),
+            ("-- cardinality: one\nselect id, label from items", None),
+            ("-- cardinality: one\nupdate items set label = @label", None),
+        ] {
+            fs::write(
+                source_root.join("items.sql"),
+                format!("-- func: query\n{sql}"),
+            )
+            .unwrap();
+            let result = analyze_project(&config);
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap().queries[0].scalar_cardinality, expected);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::InvalidSqlBlock {
+                            reason: crate::sqlite::blocks::SqlBlockError::InvalidCardinality { .. },
+                            ..
+                        })
+                    ),
+                    "{sql}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
