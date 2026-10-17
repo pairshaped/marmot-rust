@@ -81,7 +81,14 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
             current_batch = true;
             continue;
         }
-        if comment.is_some_and(|body| body.starts_with("batch:")) {
+        if comment.is_some_and(|body| {
+            body.strip_prefix("batch").is_some_and(|value| {
+                value
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_whitespace() || matches!(ch, ':' | '='))
+            })
+        }) {
             return Err(SqlBlockError::InvalidBatch {
                 reason: "use `-- batch` without a value".into(),
             });
@@ -271,6 +278,8 @@ select 1",
             "-- func: insert
 -- batch: true
 select 1",
+            "-- func: insert\n-- batch true\nselect 1",
+            "-- func: insert\n-- batch=true\nselect 1",
         ] {
             assert!(matches!(
                 parse_sql_blocks(source),
