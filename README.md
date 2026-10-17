@@ -285,7 +285,7 @@ generate functions that accept `&Connection`. Anything SQLite reports as a
 write, including `INSERT`, `UPDATE`, `DELETE`, write statements with `RETURNING`,
 and DDL, generates a function that accepts `impl MutationConnection`.
 
-`MutationConnection` is a sealed generated trait implemented for
+`marmot::MutationConnection` is one shared sealed trait implemented for
 `&mut Connection` and `&Transaction`. This means an immutable `&Connection`
 cannot call generated mutation SQL:
 
@@ -302,6 +302,24 @@ Existing callers must make standalone write connections mutable and pass
 `&mut conn`. Callers already inside a transaction should pass `&transaction`.
 Read calls stay unchanged. Marmot rejects multi-statement query blocks, so each
 generated function has one SQLite access classification.
+
+### Prepared mutation batches
+
+Add `-- batch` inside a parameterized mutation block to emit its `_batch`
+helper:
+
+```sql
+-- func: insert_item
+-- batch
+insert into items (name) values (@name);
+```
+
+The ordinary function remains available. The batch helper prepares the statement
+once and executes it for each parameter struct in the supplied slice, using the
+caller's connection or transaction. It does not create or commit a transaction.
+Unannotated blocks emit only the ordinary function. Batch annotations are rejected
+on reads, statements without parameters, column substitutions and statements with
+`RETURNING`.
 
 ### Statement cache size
 

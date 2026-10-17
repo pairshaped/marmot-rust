@@ -228,6 +228,7 @@ mod tests {
             module_name: module.to_string(),
             name: format!("run_{}", module.replace('/', "_")),
             return_type: ReturnType::Execute,
+            emit_batch: false,
             connection_access: ConnectionAccess::Mutation,
             sql: sql.to_string(),
             parameters: if temporal {

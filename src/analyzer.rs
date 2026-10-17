@@ -136,11 +136,29 @@ pub fn analyze_project_snapshot(
                             .collect(),
                     });
 
+            if block.emit_batch
+                && (!matches!(first.return_type, ReturnType::Execute)
+                    || !matches!(first.connection_access, ConnectionAccess::Mutation)
+                    || parameters.is_empty()
+                    || column_substitution.is_some())
+            {
+                return Err(Error::InvalidSqlBlock {
+                    path: file.path.clone(),
+                    reason: crate::sqlite::blocks::SqlBlockError::InvalidBatch {
+                        reason: format!(
+                            "{} requires a parameterized mutation without column substitution or RETURNING",
+                            block.function_name
+                        ),
+                    },
+                });
+            }
+
             queries.push(Query {
                 source_path: file.path.clone(),
                 module_name: file.module_name.clone(),
                 name: block.function_name,
                 return_type: first.return_type.clone(),
+                emit_batch: block.emit_batch,
                 connection_access: first.connection_access.clone(),
                 sql: first.sql.clone(),
                 parameters,
@@ -4077,6 +4095,54 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn prepared_batches_require_a_parameterized_plain_mutation() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("batch.sqlite3");
+        Connection::open(&database)
+            .unwrap()
+            .execute("create table items (id integer)", [])
+            .unwrap();
+        let source_root = dir.path().join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("items.rs"), "").unwrap();
+        let config = Config {
+            database,
+            source_root: source_root.clone(),
+            output: dir.path().join("generated"),
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        };
+        for (sql, valid) in [
+            ("insert into items values (@id)", true),
+            ("select @id", false),
+            ("insert into items values (1)", false),
+            ("insert into items values (@id) returning id", false),
+        ] {
+            fs::write(
+                source_root.join("items.sql"),
+                format!("-- func: insert_item\n-- batch\n{sql}"),
+            )
+            .unwrap();
+            let result = analyze_project(&config);
+            if valid {
+                assert!(result.unwrap().queries[0].emit_batch);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::InvalidSqlBlock {
+                            reason: crate::sqlite::blocks::SqlBlockError::InvalidBatch { .. },
+                            ..
+                        })
+                    ),
+                    "{sql}: {result:?}"
+                );
+            }
+        }
     }
 
     fn analyze_single_query(schema_sql: &str, query_sql: &str) -> Vec<Parameter> {

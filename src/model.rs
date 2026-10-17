@@ -40,6 +40,7 @@ pub struct Query {
     pub module_name: String,
     pub name: String,
     pub return_type: ReturnType,
+    pub emit_batch: bool,
     pub connection_access: ConnectionAccess,
     pub sql: String,
     pub parameters: Vec<Parameter>,

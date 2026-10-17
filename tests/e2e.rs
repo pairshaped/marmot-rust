@@ -406,9 +406,7 @@ fn strict_temporal_suffixes_generate_checked_boundary_types() {
 
     write_temporal_runtime_crate(dir.path());
 
-    let output = isolated_cargo()
-        .arg("test")
-        .current_dir(dir.path().join("runtime"))
+    let output = isolated_cargo(&dir.path().join("runtime"), &["test"])
         .output()
         .unwrap();
 
@@ -465,9 +463,7 @@ fn project_supplied_temporal_module_compiles_without_a_generated_declaration() {
     )
     .unwrap();
 
-    let output = isolated_cargo()
-        .arg("test")
-        .current_dir(dir.path().join("runtime"))
+    let output = isolated_cargo(&dir.path().join("runtime"), &["test"])
         .output()
         .unwrap();
     assert!(
@@ -1108,7 +1104,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
     write_sql_file(
         &module_dir,
         "insert_user.sql",
-        "insert into users (name, active, avatar, score, nickname) \
+        "-- batch\ninsert into users (name, active, avatar, score, nickname) \
          values (@name, @active, @avatar, @score, @nickname)",
     );
     write_sql_file(
@@ -1257,9 +1253,7 @@ fn generated_rust_functions_round_trip_against_sqlite() {
 
     write_runtime_crate(dir.path());
 
-    let output = isolated_cargo()
-        .arg("test")
-        .current_dir(dir.path().join("runtime"))
+    let output = isolated_cargo(&dir.path().join("runtime"), &["test"])
         .output()
         .unwrap();
 
@@ -1285,11 +1279,12 @@ fn main() {
 "#,
     )
     .unwrap();
-    let output = isolated_cargo()
-        .args(["check", "--bin", "immutable_mutation"])
-        .current_dir(dir.path().join("runtime"))
-        .output()
-        .unwrap();
+    let output = isolated_cargo(
+        &dir.path().join("runtime"),
+        &["check", "--bin", "immutable_mutation"],
+    )
+    .output()
+    .unwrap();
     assert!(
         !output.status.success(),
         "immutable mutation unexpectedly compiled"
@@ -1298,8 +1293,34 @@ fn main() {
     assert!(stderr.contains("MutationConnection"), "{stderr}");
 }
 
-fn isolated_cargo() -> Command {
-    let mut command = Command::new(env!("CARGO"));
+fn isolated_cargo(runtime: &Path, arguments: &[&str]) -> Command {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|path| path.join("bin/cargo").is_file());
+    let mut command = if let Some(root) = root {
+        fs::create_dir_all(root.join("target")).unwrap();
+        let mut command = Command::new("flock");
+        // The parent test holds this checkout's wrapper lock and reservation.
+        // Serialize nested fixtures through wrapper cleanup as well as Cargo.
+        command
+            .args(["--close"])
+            .arg(root.join("target/marmot-fixtures.lock"))
+            .arg(root.join("bin/cargo"))
+            .current_dir(root)
+            .args([
+                "__sports_cargo_repository_lock_held",
+                "__sports_cargo_checkout_lock_held",
+            ])
+            .args(arguments)
+            .arg("--manifest-path")
+            .arg(runtime.join("Cargo.toml"));
+        command
+    } else {
+        // The exported public library has no monorepo wrapper.
+        let mut command = Command::new(env!("CARGO"));
+        command.current_dir(runtime).args(arguments);
+        command
+    };
     for variable in [
         "CARGO_BUILD_BUILD_DIR",
         "CARGO_TARGET_DIR",
@@ -1309,6 +1330,9 @@ fn isolated_cargo() -> Command {
         "SPORTS_WORKTREE_TARGET_DIR",
     ] {
         command.env_remove(variable);
+    }
+    if let Some(root) = root {
+        command.env("CARGO_TARGET_DIR", root.join("target/marmot-fixtures"));
     }
     command
 }
@@ -1358,7 +1382,9 @@ publish = false
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
-"#,
+"#
+        .to_owned()
+            + &format!("marmot = {{ path = {:?} }}\n", env!("CARGO_MANIFEST_DIR")),
     )
     .unwrap();
     fs::write(runtime.join("src/generated/mod.rs"), "pub mod sql;\n").unwrap();
@@ -1485,7 +1511,9 @@ publish = false
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled", "column_metadata"] }
-"#,
+"#
+        .to_owned()
+            + &format!("marmot = {{ path = {:?} }}\n", env!("CARGO_MANIFEST_DIR")),
     )
     .unwrap();
     fs::write(

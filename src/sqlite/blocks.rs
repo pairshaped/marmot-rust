@@ -4,6 +4,7 @@ use crate::sql_text::strip_comments;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlBlock {
     pub function_name: String,
+    pub emit_batch: bool,
     pub sql: String,
     pub column_substitution: Option<ColumnSubstitution>,
 }
@@ -22,12 +23,14 @@ pub enum SqlBlockError {
     EmptyBlock { name: String },
     DuplicateFunc { name: String },
     ColumnBeforeFunc,
+    InvalidBatch { reason: String },
     InvalidColumn { reason: String },
 }
 
 impl std::fmt::Display for SqlBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidBatch { reason } => write!(f, "invalid `-- batch` directive: {reason}"),
             Self::MissingFunc => f.write_str("SQL file must contain at least one `-- func:` block"),
             Self::SqlBeforeFirstFunc => {
                 f.write_str("SQL appears before the first `-- func:` block")
@@ -53,6 +56,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
     let mut current_name: Option<String> = None;
     let mut current_sql = String::new();
     let mut current_column = None;
+    let mut current_batch = false;
 
     for line in sql.lines() {
         if let Some(name) = func_name_from_line(line)? {
@@ -61,9 +65,26 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
                 current_name.take(),
                 &mut current_sql,
                 current_column.take(),
+                std::mem::take(&mut current_batch),
             )?;
             current_name = Some(name);
             continue;
+        }
+
+        let comment = line.trim().strip_prefix("--").map(str::trim);
+        if comment == Some("batch") {
+            if current_name.is_none() || current_batch {
+                return Err(SqlBlockError::InvalidBatch {
+                    reason: "must appear once inside a `-- func:` block".into(),
+                });
+            }
+            current_batch = true;
+            continue;
+        }
+        if comment.is_some_and(|body| body.starts_with("batch:")) {
+            return Err(SqlBlockError::InvalidBatch {
+                reason: "use `-- batch` without a value".into(),
+            });
         }
 
         if let Some(column) = column_from_line(line)? {
@@ -89,7 +110,13 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
         current_sql.push('\n');
     }
 
-    finish_block(&mut blocks, current_name, &mut current_sql, current_column)?;
+    finish_block(
+        &mut blocks,
+        current_name,
+        &mut current_sql,
+        current_column,
+        current_batch,
+    )?;
 
     if blocks.is_empty() {
         return Err(SqlBlockError::MissingFunc);
@@ -168,6 +195,7 @@ fn finish_block(
     name: Option<String>,
     sql: &mut String,
     column_substitution: Option<ColumnSubstitution>,
+    emit_batch: bool,
 ) -> std::result::Result<(), SqlBlockError> {
     let Some(name) = name else {
         return Ok(());
@@ -207,6 +235,7 @@ fn finish_block(
     }
     blocks.push(SqlBlock {
         function_name: name,
+        emit_batch,
         sql: trimmed.to_string(),
         column_substitution,
     });
@@ -217,6 +246,38 @@ fn finish_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_opt_in_is_scoped_and_validated() {
+        let blocks = parse_sql_blocks(
+            "-- func: insert
+-- batch
+insert into items values (@id);
+-- func: remove
+delete from items where id = @id;",
+        )
+        .unwrap();
+        assert!(blocks[0].emit_batch);
+        assert!(!blocks[1].emit_batch);
+        assert!(!blocks[0].sql.contains("-- batch"));
+        for source in [
+            "-- batch
+-- func: insert
+select 1",
+            "-- func: insert
+-- batch
+-- batch
+select 1",
+            "-- func: insert
+-- batch: true
+select 1",
+        ] {
+            assert!(matches!(
+                parse_sql_blocks(source),
+                Err(SqlBlockError::InvalidBatch { .. })
+            ));
+        }
+    }
 
     #[test]
     fn parses_named_sql_blocks() {
@@ -237,11 +298,13 @@ mod tests {
             vec![
                 SqlBlock {
                     function_name: "list_users".to_string(),
+                    emit_batch: false,
                     sql: "select id, name from users;".to_string(),
                     column_substitution: None,
                 },
                 SqlBlock {
                     function_name: "delete_user".to_string(),
+                    emit_batch: false,
                     sql: "delete from users where id = @id;".to_string(),
                     column_substitution: None,
                 },
@@ -264,6 +327,7 @@ mod tests {
             blocks,
             vec![SqlBlock {
                 function_name: "update_user_field".to_string(),
+                emit_batch: false,
                 sql: "update users set {{column}} = @value where id = @id;".to_string(),
                 column_substitution: Some(ColumnSubstitution {
                     choices: vec!["name".to_string(), "nickname".to_string()],
