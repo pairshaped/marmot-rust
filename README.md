@@ -755,8 +755,23 @@ literals and conflicting parameter types. Expressions that transform a declared
 value without preserving its identity fail generation; return the column and
 transform it in Rust. INSERT SELECT into a declared column, typed compound
 queries, and scalar-subquery results in typed contexts are currently rejected.
-Declarations apply only to their configured owner. Other owners and raw SQL
-writers remain responsible for their own inputs.
+Other owners adopt the same columns by importing the home registry from their
+own `source_root/value_sets.toml`:
+
+```toml
+imports = ["../../curling_core/src/value_sets.toml"]
+```
+
+Paths are relative to the importing source root. A shared home uses its
+crate-named module path, such as `curling_core::value_sets`, and exposes that
+module publicly. Importers use its enums without generating copies. They may
+also declare their own sets; only local sets generate a module. Imports name
+home registries directly: imported registries must declare sets and cannot
+import others. Missing homes, duplicate set names or duplicate column bindings
+fail generation. Imported registries participate in generation freshness checks.
+Root uses `src/value_sets.toml` with the import
+`"../crates/curling_core/src/value_sets.toml"`. Owners without imports or
+declarations and raw SQL writers remain responsible for their own inputs.
 
 Before adopting an existing column, trace its writers and stored vocabulary.
 Replace the superseded handwritten enum and string comparisons in the same

@@ -51,7 +51,7 @@ pub(super) fn render_project(
             render_scoped_ids(project, statement_labels),
         );
     }
-    let value_sets = crate::value_sets::load(&config.source_root)?;
+    let value_sets = crate::value_sets::load(&config.source_root)?.owned;
     if !value_sets.is_empty() {
         desired.insert(
             config.output.join("value_sets.rs"),

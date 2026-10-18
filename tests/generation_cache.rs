@@ -442,3 +442,26 @@ fn imported_scope_home_is_a_generation_input() {
     fs::write(home, format!("{source}\n")).unwrap();
     assert!(!fixture.run(&[]).contains("Skipped"));
 }
+
+#[test]
+fn imported_value_set_changes_invalidate_warm_generation() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.file("home")).unwrap();
+    let home = fixture.file("home/value_sets.toml");
+    fs::write(&home, "module = \"home_owner::value_sets\"\n[sets.ItemName]\nvalues = [\"first\", \"second\"]\ncolumns = [\"items.name\"]\n").unwrap();
+    fs::write(
+        fixture.file("src/value_sets.toml"),
+        "imports = [\"../home/value_sets.toml\"]\n",
+    )
+    .unwrap();
+    fixture.run(&[]);
+    assert!(fixture.run(&[]).contains("Skipped"));
+    let source = fs::read_to_string(&home).unwrap();
+    fs::write(&home, source.replace("second", "changed")).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    assert!(fixture.run(&[]).contains("Skipped"));
+    fs::remove_file(home).unwrap();
+    let result = fixture.generate(&[]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("value_sets.toml"));
+}

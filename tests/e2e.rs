@@ -2613,3 +2613,111 @@ fn scoped_directives_fail_closed_when_the_registry_or_binding_is_invalid() {
             .contains("unknown scoped type")
     );
 }
+
+fn imported_value_set_fixture(sql: &str) -> (tempfile::TempDir, Config) {
+    let (dir, config) = value_set_fixture(sql);
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let registry = config.source_root.join("value_sets.toml");
+    let source = fs::read_to_string(&registry)
+        .unwrap()
+        .replace("crate::value_sets", "home_owner::value_sets");
+    fs::write(home.join("value_sets.toml"), source).unwrap();
+    fs::write(registry, "imports = [\"../home/value_sets.toml\"]\n").unwrap();
+    (dir, config)
+}
+
+#[test]
+fn imported_value_sets_share_home_types_without_emitting_copies() {
+    let (_dir, config) = imported_value_set_fixture(
+        "select status, previous from notices where status = @status and previous is @previous",
+    );
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let output = fs::read_to_string(config.source_root.join("notices.generated.rs")).unwrap();
+    assert!(
+        output.contains("pub status: home_owner::value_sets::NoticeStatus"),
+        "{output}"
+    );
+    assert!(output.contains("pub previous: Option<home_owner::value_sets::NoticeStatus>"));
+    assert!(!config.output.join("value_sets.rs").exists());
+}
+
+#[test]
+fn imported_value_sets_validate_literals_through_column_identity() {
+    for sql in [
+        "select n.status from notices n where n.status = 'draft'",
+        "select n.status from notices n join other o on n.id = o.id where n.status = 'draft'",
+        "select status from notices where status = @status and @status = 'draft'",
+        "select status from notices where status in ('draft', 'published')",
+        "select case status when 'draft' then 1 else 0 end as result from notices",
+        "update notices set status = case when id = @id then 'draft' else 'published' end",
+    ] {
+        let (_dir, config) = imported_value_set_fixture(sql);
+        analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let (_dir, config) = imported_value_set_fixture(&sql.replace("draft", "drfat"));
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("drfat"), "{error}");
+    }
+}
+
+#[test]
+fn imported_value_sets_reject_invalid_registries_with_file_diagnostics() {
+    for (home, expected) in [
+        (None, "home/value_sets.toml"),
+        (Some("imports = [\"../src/value_sets.toml\"]"), "transitive"),
+        (Some("module = \"home_owner::value_sets\"\n"), "sets"),
+        (
+            Some(
+                "module = \"crate::value_sets\"\n[sets.NoticeStatus]\nvalues = [\"draft\"]\ncolumns = [\"notices.status\"]",
+            ),
+            "crate",
+        ),
+    ] {
+        let (dir, config) = imported_value_set_fixture("select status from notices");
+        let path = dir.path().join("home/value_sets.toml");
+        match home {
+            Some(source) => fs::write(&path, source).unwrap(),
+            None => fs::remove_file(&path).unwrap(),
+        }
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(
+            error.contains(expected) && error.contains("value_sets.toml"),
+            "{error}"
+        );
+    }
+    for declaration in [
+        "[sets.NoticeStatus]\nvalues = [\"ready\"]\ncolumns = [\"other.status\"]\n",
+        "[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"notices.status\"]\n",
+        "[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"notices.missing\"]\n",
+    ] {
+        let (_dir, config) = imported_value_set_fixture("select status from notices");
+        let registry = config.source_root.join("value_sets.toml");
+        fs::write(registry, format!("imports = [\"../home/value_sets.toml\"]\nmodule = \"crate::value_sets\"\n{declaration}")).unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{error}");
+    }
+}
+
+#[test]
+fn imported_value_sets_can_coexist_with_local_sets_and_remove_stale_output() {
+    let (_dir, config) = value_set_fixture("select status from notices");
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let home = config.source_root.parent().unwrap().join("home");
+    fs::create_dir(&home).unwrap();
+    let registry = config.source_root.join("value_sets.toml");
+    fs::write(
+        home.join("value_sets.toml"),
+        fs::read_to_string(&registry)
+            .unwrap()
+            .replace("crate::value_sets", "home_owner::value_sets"),
+    )
+    .unwrap();
+    fs::write(&registry, "imports = [\"../home/value_sets.toml\"]\n").unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    assert!(!config.output.join("value_sets.rs").exists());
+    fs::write(&registry, "imports = [\"../home/value_sets.toml\"]\nmodule = \"crate::value_sets\"\n[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"other.status\"]\n").unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let output = fs::read_to_string(config.output.join("value_sets.rs")).unwrap();
+    assert!(output.contains("enum OtherStatus"));
+    assert!(!output.contains("enum NoticeStatus"));
+}

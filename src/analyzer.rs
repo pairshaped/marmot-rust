@@ -73,14 +73,18 @@ pub fn analyze_project_snapshot(
     let schema_fingerprint =
         crate::schema::fingerprint(conn).map_err(|source| Error::InspectDatabase { source })?;
     let mut schema = load_schema(conn, &config.temporal)?;
-    for set in crate::value_sets::load(&config.source_root)? {
+    for set in crate::value_sets::load(&config.source_root)?.sets {
         for (table, column) in &set.columns {
             let target = schema
                 .tables
                 .get_mut(table)
                 .and_then(|columns| columns.get_mut(column))
                 .ok_or_else(|| {
-                    crate::value_sets::invalid(format!("unknown column {table}.{column}"))
+                    crate::value_sets::invalid(format!(
+                        "{}: set {} references unknown column {table}.{column}",
+                        config.source_root.join("value_sets.toml").display(),
+                        set.rust_path
+                    ))
                 })?;
             if target.column_type != ValueType::String {
                 return Err(crate::value_sets::invalid(format!(

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use heck::ToPascalCase;
 use serde::Deserialize;
@@ -18,7 +18,10 @@ pub struct ValueSet {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Declaration {
-    module: String,
+    module: Option<String>,
+    #[serde(default)]
+    imports: Vec<String>,
+    #[serde(default)]
     sets: BTreeMap<String, Set>,
 }
 
@@ -35,16 +38,94 @@ pub(crate) fn invalid(reason: impl Into<String>) -> Error {
     }
 }
 
-pub(crate) fn load(source_root: &Path) -> Result<Vec<ValueSet>> {
+#[derive(Default)]
+pub(crate) struct Registry {
+    pub sets: Vec<ValueSet>,
+    pub owned: Vec<ValueSet>,
+    pub inputs: BTreeSet<PathBuf>,
+}
+
+fn read(path: &Path) -> Result<Declaration> {
+    let source = fs::read_to_string(path).map_err(|source| Error::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&source).map_err(|error| invalid(format!("{}: {error}", path.display())))
+}
+
+pub fn input_paths(source_root: &Path) -> Result<BTreeSet<PathBuf>> {
+    Ok(load(source_root)?.inputs)
+}
+
+pub(crate) fn load(source_root: &Path) -> Result<Registry> {
     let path = source_root.join("value_sets.toml");
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(source) => return Err(Error::ReadFile { path, source }),
-    };
-    let declaration: Declaration =
-        toml::from_str(&source).map_err(|error| invalid(format!("{}: {error}", path.display())))?;
-    let module = syn::parse_str::<syn::Path>(&declaration.module)
+    let mut registry = Registry::default();
+    registry.inputs.insert(path.clone());
+    if !path.try_exists().map_err(|source| Error::ReadFile {
+        path: path.clone(),
+        source,
+    })? {
+        return Ok(registry);
+    }
+    let declaration = read(&path)?;
+    let mut names = BTreeSet::new();
+    let mut columns = BTreeSet::new();
+    let mut homes = Vec::new();
+    for import in &declaration.imports {
+        let home_path = source_root.join(import);
+        let home = read(&home_path)?;
+        if !home.imports.is_empty() {
+            return Err(invalid(format!(
+                "{}: import home registries directly; transitive imports are not supported",
+                home_path.display()
+            )));
+        }
+        homes.push((home_path, home, false));
+    }
+    homes.push((path, declaration, true));
+    for (home_path, home, owned) in homes {
+        registry.inputs.insert(home_path.clone());
+        let sets = home_sets(&home, !owned)
+            .map_err(|error| invalid(format!("{}: {error}", home_path.display())))?;
+        for set in sets {
+            if !names.insert(set.name.clone()) {
+                return Err(invalid(format!(
+                    "{}: duplicate set name {}",
+                    home_path.display(),
+                    set.name
+                )));
+            }
+            for column in &set.columns {
+                if !columns.insert(column.clone()) {
+                    return Err(invalid(format!(
+                        "{}: duplicate binding for {}.{}",
+                        home_path.display(),
+                        column.0,
+                        column.1
+                    )));
+                }
+            }
+            if owned {
+                registry.owned.push(set.clone());
+            }
+            registry.sets.push(set);
+        }
+    }
+    Ok(registry)
+}
+
+fn home_sets(declaration: &Declaration, imported: bool) -> Result<Vec<ValueSet>> {
+    if declaration.sets.is_empty() {
+        if imported || declaration.module.is_some() {
+            return Err(invalid("a home registry requires nonempty sets"));
+        }
+        return Ok(vec![]);
+    }
+    let module_path = declaration
+        .module
+        .as_ref()
+        .ok_or_else(|| invalid("sets require a module"))?;
+    let module = syn::parse_str::<syn::Path>(module_path)
         .map_err(|error| invalid(format!("invalid module path: {error}")))?;
     if module.leading_colon.is_some()
         || module
@@ -52,20 +133,19 @@ pub(crate) fn load(source_root: &Path) -> Result<Vec<ValueSet>> {
             .iter()
             .any(|part| !matches!(part.arguments, syn::PathArguments::None))
         || module.segments.len() < 2
-        || !matches!(
+        || matches!(
             module.segments.first().unwrap().ident.to_string().as_str(),
-            "crate"
+            "self" | "super"
         )
+        || (imported && module.segments.first().unwrap().ident == "crate")
     {
-        return Err(invalid("module must be an absolute crate:: path"));
+        return Err(invalid(
+            "module must use an absolute crate path; imported homes cannot use crate::",
+        ));
     }
-    if declaration.sets.is_empty() {
-        return Err(invalid("sets must not be empty"));
-    }
-    let mut bound = BTreeSet::new();
     let mut sets = Vec::new();
-    for (name, set) in declaration.sets {
-        syn::parse_str::<syn::Ident>(&name)
+    for (name, set) in &declaration.sets {
+        syn::parse_str::<syn::Ident>(name)
             .map_err(|_| invalid(format!("invalid Rust enum name {name}")))?;
         if set.values.is_empty() || set.columns.is_empty() {
             return Err(invalid(format!(
@@ -84,21 +164,18 @@ pub(crate) fn load(source_root: &Path) -> Result<Vec<ValueSet>> {
             }
         }
         let mut columns = Vec::new();
-        for column in set.columns {
+        for column in &set.columns {
             let parts = column.split('.').collect::<Vec<_>>();
             if parts.len() != 2 || parts.iter().any(|part| part.is_empty()) {
                 return Err(invalid(format!("expected table.column, got {column:?}")));
             }
             let pair = (parts[0].to_ascii_lowercase(), parts[1].to_ascii_lowercase());
-            if !bound.insert(pair.clone()) {
-                return Err(invalid(format!("duplicate binding for {column}")));
-            }
             columns.push(pair);
         }
         sets.push(ValueSet {
-            rust_path: format!("{}::{name}", declaration.module),
-            name,
-            values: set.values,
+            rust_path: format!("{module_path}::{name}"),
+            name: name.clone(),
+            values: set.values.clone(),
             columns,
         });
     }

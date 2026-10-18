@@ -54,7 +54,9 @@ impl Cache {
         input.add(identity.as_bytes());
         input.add(format!("{target:?}{config:?}").as_bytes());
         input.optional_file(config_path)?;
-        input.optional_file(&target.config.source_root.join("value_sets.toml"))?;
+        for path in marmot::value_sets::input_paths(&target.config.source_root)? {
+            input.optional_file(&path)?;
+        }
         for path in marmot::scoped_ids::input_paths(&target.config.source_root)? {
             input.optional_file(&path)?;
         }
