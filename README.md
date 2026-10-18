@@ -773,6 +773,14 @@ Root uses `src/value_sets.toml` with the import
 `"../crates/curling_core/src/value_sets.toml"`. Owners without imports or
 declarations and raw SQL writers remain responsible for their own inputs.
 
+A set may add `rust_attributes = ['#[derive(serde::Serialize)]',
+'#[serde(rename_all = "snake_case")]']` to place those attributes on its generated
+enum. Each string must contain exactly one valid outer Rust attribute. The owner
+supplies the dependencies and checks attribute meaning and feature selection by
+compiling its crate. Defaults add no dependencies or output. This lets an island
+contract re-export the home enum while keeping its serialization, TypeScript and
+schema traits. Verify the wire contract when adding attributes.
+
 Before adopting an existing column, trace its writers and stored vocabulary.
 Replace the superseded handwritten enum and string comparisons in the same
 change. [ADR 0009](docs/adr/0009-declared-column-value-sets.md) defines ownership,

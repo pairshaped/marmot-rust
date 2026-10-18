@@ -2721,3 +2721,124 @@ fn imported_value_sets_can_coexist_with_local_sets_and_remove_stale_output() {
     assert!(output.contains("enum OtherStatus"));
     assert!(!output.contains("enum NoticeStatus"));
 }
+
+#[test]
+fn value_set_rust_attributes_require_one_outer_attribute() {
+    for attribute in [
+        "#[derive(",
+        "#![allow(dead_code)]",
+        "#[derive(Debug)] trailing",
+        "#[allow(dead_code)] #[allow(unused)]",
+        "",
+    ] {
+        let (_dir, config) = value_set_fixture("select status from notices");
+        let path = config.source_root.join("value_sets.toml");
+        let mut registry: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        registry["sets"]["NoticeStatus"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "rust_attributes".into(),
+                toml::Value::Array(vec![toml::Value::String(attribute.into())]),
+            );
+        fs::write(&path, toml::to_string(&registry).unwrap()).unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("value_sets.toml") && error.contains("attribute"),
+            "{attribute}: {error}"
+        );
+    }
+}
+
+#[test]
+fn value_set_attributes_preserve_serde_typescript_and_schema_contracts() {
+    let (_dir, config) = value_set_fixture("select status from notices");
+    let path = config.source_root.join("value_sets.toml");
+    let mut registry: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    registry["sets"]["NoticeStatus"]
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "rust_attributes".into(),
+            toml::Value::Array(
+                [
+                    "#[derive(serde::Serialize, serde::Deserialize, ts_rs::TS)]",
+                    "#[serde(rename_all = \"snake_case\")]",
+                    "#[cfg_attr(feature = \"schema\", derive(schemars::JsonSchema))]",
+                ]
+                .into_iter()
+                .map(|value| toml::Value::String(value.into()))
+                .collect(),
+            ),
+        );
+    fs::write(path, toml::to_string(&registry).unwrap()).unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let runtime = config.source_root.parent().unwrap();
+    fs::write(
+        runtime.join("Cargo.toml"),
+        r#"
+[package]
+name = "marmot-value-set-attributes"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[features]
+schema = ["dep:schemars"]
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ts-rs = "12.0.1"
+schemars = { version = "1.1", optional = true }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        config.source_root.join("lib.rs"),
+        r#"
+#[path = "generated/sql/value_sets.rs"]
+pub mod value_sets;
+mod original {
+    #[derive(serde::Serialize, serde::Deserialize, ts_rs::TS)]
+    #[serde(rename_all = "snake_case")]
+    #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+    pub enum NoticeStatus { Draft, Published }
+}
+#[cfg(test)]
+mod tests {
+    use super::{original, value_sets};
+    use ts_rs::TS;
+    #[test]
+    fn wire_contract_matches_the_original_enum() {
+        let cfg = ts_rs::Config::default();
+        assert_eq!(value_sets::NoticeStatus::decl(&cfg), original::NoticeStatus::decl(&cfg));
+        for (generated, original) in [
+            (value_sets::NoticeStatus::Draft, original::NoticeStatus::Draft),
+            (value_sets::NoticeStatus::Published, original::NoticeStatus::Published),
+        ] {
+            let json = serde_json::to_string(&original).unwrap();
+            assert_eq!(serde_json::to_string(&generated).unwrap(), json);
+            assert_eq!(serde_json::from_str::<value_sets::NoticeStatus>(&json).unwrap(), generated);
+        }
+        assert!(serde_json::from_str::<value_sets::NoticeStatus>("\"unknown\"").is_err());
+    }
+    #[test]
+    #[cfg(feature = "schema")]
+    fn schema_contract_matches_the_original_enum() {
+        assert_eq!(serde_json::to_value(schemars::schema_for!(value_sets::NoticeStatus)).unwrap(),
+                   serde_json::to_value(schemars::schema_for!(original::NoticeStatus)).unwrap());
+    }
+}
+"#,
+    )
+    .unwrap();
+    for arguments in [vec!["test"], vec!["test", "--features", "schema"]] {
+        let result = isolated_cargo(runtime, &arguments).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
