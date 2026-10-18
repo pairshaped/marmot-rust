@@ -65,9 +65,10 @@ no per-query output override.
 Query names come from `-- func:` blocks, not filenames.
 
 Generated bindings sit beside the SQL that owns them, so a feature owns its SQL
-and its bindings in one place. The only shared generated files are the
-configured temporal module (with a fixed `mod.rs` declaring it) and the
-aggregate `views.sql`, under the configured shared output folder, for example:
+and its bindings in one place. Shared generated files are the configured temporal module (with a fixed
+`mod.rs` declaring it), the value-set module defined by
+[ADR 0009](0009-declared-column-value-sets.md), and the aggregate `views.sql`,
+under the configured shared output folder, for example:
 
 ```text
 src/generated/sql/

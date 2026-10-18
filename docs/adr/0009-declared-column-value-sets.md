@@ -12,18 +12,17 @@ module = "crate::value_sets"
 [sets.NoticeStatus]
 values = ["draft", "published"]
 columns = ["notices.status"]
-unknown_read = "reject"
 ```
 
 The file is schema metadata scoped to that generator owner. It is separate from companion query SQL because several companions can use the same column. Keeping it outside create migrations avoids turning a vocabulary change into a schema migration. A missing file means no declarations and byte-identical existing output.
 
-Marmot emits `value_sets.generated.rs` beside the declaration. The owner declares that module at the configured absolute Rust path. The set name is the Rust enum name; values become PascalCase variants. Invalid Rust names, duplicate values, variant collisions, duplicate column bindings, unknown columns, and non-TEXT columns fail generation. Multiple columns share a type only by appearing in the same set's `columns` list. Columns with the same name or vocabulary don't implicitly share a type. Declaration and SQL identifiers follow SQLite's case-insensitive identity rules.
+Marmot emits `value_sets.rs` under the configured shared output folder. The owner declares that module at the configured absolute Rust path. It is a shared generated artifact alongside temporal types and view installation SQL. Normal managed-output reconciliation removes it when the declaration disappears; the owner removes its module declaration in the same change. The set name is the Rust enum name; values become PascalCase variants. Invalid Rust names, duplicate values, variant collisions, duplicate column bindings, unknown columns, and non-TEXT columns fail generation. Multiple columns share a type only by appearing in the same set's `columns` list. Columns with the same name or vocabulary don't implicitly share a type. Declaration and SQL identifiers follow SQLite's case-insensitive identity rules.
 
 One declaration owns each generated enum and its database mappings. The initial boundary is one generator owner; it doesn't claim that another independently configured owner adopts the same column. Cross-owner adoption needs an explicit shared type owner and import contract before use. Declarations never inspect stored rows to guess a vocabulary.
 
 ## Parameters, results and reads
 
-Known variants implement `rusqlite::ToSql` and `FromSql`, with an `as_str` method for existing text boundaries. Nullable params and results use `Option<Enum>`. There is no string constructor that accepts arbitrary values. `FromSql` rejects unknown stored text with an error that retains the value and type name. The only supported policy is the explicit `unknown_read = "reject"`; unsupported or omitted policies fail generation. Supporting lossless historical reads later requires separate read and write types so an unknown read cannot become an accepted write by accident.
+Known variants implement `rusqlite::ToSql` and `FromSql`, with an `as_str` method for existing text boundaries. Nullable params and results use `Option<Enum>`. There is no string constructor that accepts arbitrary values. `FromSql` rejects unknown stored text with an error that retains the value and type name. Strict rejection is the fixed read policy for every declared column. Supporting lossless historical reads later requires separate read and write types so an unknown read cannot become an accepted write by accident.
 
 Adding a declared value adds a Rust variant. Exhaustive matches must then be updated by the caller; existing raw string comparisons outside generated bindings aren't compiler checked. Adoption replaces those comparisons and any handwritten enum and `as_str` mapping in the same change. There must be one canonical vocabulary and mapping for adopted callers.
 
