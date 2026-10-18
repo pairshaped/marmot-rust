@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidScope {
+        reason: String,
+    },
     InvalidValueSet {
         reason: String,
     },
@@ -171,6 +174,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidScope { reason } => write!(f, "invalid scoped ID: {reason}"),
             Self::InvalidBindingVisibility { reason } => {
                 write!(f, "invalid binding visibility: {reason}")
             }

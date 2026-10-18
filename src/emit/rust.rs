@@ -45,6 +45,12 @@ pub(super) fn render_project(
     let temporal_output = temporal_output(config, uses_temporal)?;
 
     let mut desired = BTreeMap::new();
+    if !project.scoped_ids.is_empty() {
+        desired.insert(
+            config.output.join("scoped_ids.rs"),
+            render_scoped_ids(project, statement_labels),
+        );
+    }
     let value_sets = crate::value_sets::load(&config.source_root)?;
     if !value_sets.is_empty() {
         desired.insert(
@@ -104,6 +110,9 @@ pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
         .collect::<BTreeSet<_>>();
     if config.source_root.join("value_sets.toml").is_file() {
         paths.insert(config.output.join("value_sets.rs"));
+    }
+    if !project.scoped_ids.is_empty() {
+        paths.insert(config.output.join("scoped_ids.rs"));
     }
     let uses_temporal = project_uses_temporal(project) || config.temporal.emit_without_queries;
     if let Ok(Some(temporal)) = temporal_output(config, uses_temporal) {
@@ -715,6 +724,10 @@ fn render_query(query: &Query, statement_labels: bool) -> String {
 
     let mut output = render_column_substitution(query);
     output.push_str(&render_parameter_struct(query));
+    if let Some(id) = produced_scope(query) {
+        output.push_str(&render_scoped_gate(query, &lowered, id));
+        return output;
+    }
     let (sql_declarations, sql_selection, sql_expression) =
         render_query_sql(query, &const_name, &lowered, statement_labels);
     output.push_str(&sql_declarations);
@@ -949,11 +962,21 @@ fn render_connection_param(query: &Query) -> &'static str {
     }
 }
 
-fn render_connection_binding(query: &Query) -> &'static str {
-    match query.connection_access {
+fn render_connection_binding(query: &Query) -> String {
+    let mut binding = match query.connection_access {
         ConnectionAccess::Read => "",
         ConnectionAccess::Mutation => "let conn = conn.as_connection();\n             ",
     }
+    .to_string();
+    for parameter in &query.parameters {
+        if matches!(parameter.column_type, ValueType::ScopedId(_)) {
+            binding.push_str(&format!(
+                "params.{}.check_connection(conn)?;\n             ",
+                parameter.name
+            ));
+        }
+    }
+    binding
 }
 
 fn render_row_get(column: &crate::model::Column, index: usize) -> String {
@@ -1065,7 +1088,11 @@ fn parameter_struct_field_type(param: &Parameter) -> String {
 fn parameter_type_is_borrowed(value_type: &ValueType) -> bool {
     matches!(
         value_type,
-        ValueType::String | ValueType::DbDate | ValueType::DbDateTime | ValueType::Bytes
+        ValueType::String
+            | ValueType::DbDate
+            | ValueType::DbDateTime
+            | ValueType::Bytes
+            | ValueType::ScopedId(_)
     )
 }
 
@@ -2086,4 +2113,97 @@ mod tests {
             Err(Error::DuplicateRowTypeNames { names }) if names == ["ListOrgsRow"]
         ));
     }
+}
+
+fn produced_scope(query: &Query) -> Option<&crate::model::ScopedIdType> {
+    query.columns.iter().find_map(|column| {
+        if let ValueType::ScopedId(id) = &column.column_type {
+            Some(id)
+        } else {
+            None
+        }
+    })
+}
+
+fn render_scoped_gate(
+    query: &Query,
+    lowered: &LoweredSqlParameters<'_>,
+    id: &crate::model::ScopedIdType,
+) -> String {
+    let row_name = format!("{}Row", query.name.to_pascal_case());
+    let (declaration, result, mapped) = if query.columns.len() == 1 {
+        (String::new(), id.rust_type.clone(), "scoped_id".to_string())
+    } else {
+        let fields = query
+            .columns
+            .iter()
+            .map(|column| format!("pub {}: {},\n", column.field_name, column.rust_type()))
+            .collect::<String>();
+        let mapping = query
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let get = if matches!(column.column_type, ValueType::ScopedId(_)) {
+                    "scoped_id".to_string()
+                } else {
+                    render_row_get(column, index)
+                };
+                format!("{}: {get},\n", column.field_name)
+            })
+            .collect::<String>();
+        (
+            format!(
+                "#[derive(Debug, Clone, PartialEq)]\npub struct {row_name}<'a> {{ {fields} }}\n"
+            ),
+            format!("{row_name}<'a>"),
+            format!("{row_name} {{ {mapping} }}"),
+        )
+    };
+    let params = render_params(query);
+    let binding = render_connection_binding(query);
+    let arguments = if lowered.bindings.is_empty() {
+        "&[]".to_string()
+    } else {
+        render_bindings(query, lowered)
+    };
+    let row_binding = if query.columns.len() == 1 {
+        "_row"
+    } else {
+        "row"
+    };
+    format!(
+        "{declaration}pub fn {name}<'a>(conn: &'a Connection{params}) -> Result<Vec<{result}>> {{\n{binding}{path}::{name}(conn, {arguments}, |{row_binding}, scoped_id| Ok({mapped}))\n}}\n",
+        name = query.name,
+        path = id.rust_path
+    )
+}
+
+fn render_scoped_ids(project: &Project, statement_labels: bool) -> String {
+    let mut output="// @generated by Marmot from scoped_ids.toml and registered gate SQL. Do not edit by hand.\n".to_string();
+    for definition in &project.scoped_ids {
+        let name = &definition.id_type.name;
+        output.push_str(&format!(r#"
+#[derive(Clone, Copy)]
+pub struct {name}<'a> {{ value: i64, connection: &'a rusqlite::Connection }}
+impl std::fmt::Debug for {name}<'_> {{ fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{ formatter.debug_tuple({name:?}).field(&self.value).finish() }} }}
+impl PartialEq for {name}<'_> {{ fn eq(&self, other: &Self) -> bool {{ self.value == other.value && std::ptr::eq(self.connection, other.connection) }} }}
+impl Eq for {name}<'_> {{}}
+impl rusqlite::types::ToSql for {name}<'_> {{ fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {{ Ok(rusqlite::types::ToSqlOutput::Owned(rusqlite::types::Value::Integer(self.value))) }} }}
+impl<'a> {name}<'a> {{
+    pub fn get(self) -> i64 {{ self.value }}
+    pub fn check_connection(&self, conn: &rusqlite::Connection) -> rusqlite::Result<()> {{ if std::ptr::eq(self.connection,conn) {{ Ok(()) }} else {{ Err(rusqlite::Error::InvalidQuery) }} }}
+"#));
+        for gate in &definition.gates {
+            let lowered = lower_sql_parameters(&gate.query);
+            let sql = raw_string(&format!(
+                "{}{}",
+                statement_label(&gate.query, statement_labels),
+                lowered.sql
+            ));
+            output.push_str(&format!("pub fn {function}<T>(conn: &'a rusqlite::Connection, parameters: &[&dyn rusqlite::ToSql], mut map: impl FnMut(&rusqlite::Row<'_>, Self) -> rusqlite::Result<T>) -> rusqlite::Result<Vec<T>> {{\nlet mut statement=conn.prepare_cached({sql})?;\nlet rows=statement.query_map(parameters,|row|map(row,Self{{value:row.get({index})?,connection:conn}}))?;\nrows.collect()\n}}\n",function=gate.query.name,index=gate.id_index));
+        }
+        output.push_str("}\n");
+    }
+    output
 }

@@ -12,6 +12,7 @@ mod mutation_connection;
 mod publication;
 pub mod reset;
 pub mod schema;
+pub mod scoped_ids;
 pub mod seeds;
 mod sql_files;
 pub mod sql_text;

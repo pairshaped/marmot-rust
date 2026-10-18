@@ -91,6 +91,7 @@ pub fn analyze_project_snapshot(
         }
     }
     value_sets::annotate_views(conn, &mut schema, &config.database)?;
+    let scoped_registry = crate::scoped_ids::load(&config.source_root)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
 
@@ -183,10 +184,10 @@ pub fn analyze_project_snapshot(
                 });
             }
 
-            queries.push(Query {
+            let mut query = Query {
                 source_path: file.path.clone(),
                 module_name: file.module_name.clone(),
-                name: block.function_name,
+                name: block.function_name.clone(),
                 return_type: first.return_type.clone(),
                 emit_batch: block.emit_batch,
                 scalar_cardinality: block.scalar_cardinality.unwrap_or_default(),
@@ -195,12 +196,79 @@ pub fn analyze_project_snapshot(
                 parameters,
                 columns: first.columns.clone(),
                 column_substitution,
-            });
+            };
+            scoped_registry.apply(&block, &mut query)?;
+            queries.push(query);
         }
     }
 
+    let mut scoped_ids = Vec::new();
+    for path in &scoped_registry.owned {
+        let definition = &scoped_registry.ids[path];
+        let mut gates = Vec::new();
+        for gate in &definition.gates {
+            let source = fs::read_to_string(&gate.path).map_err(|source| Error::ReadFile {
+                path: gate.path.clone(),
+                source,
+            })?;
+            let blocks = parse_sql_blocks(&source).map_err(|reason| Error::InvalidSqlBlock {
+                path: gate.path.clone(),
+                reason,
+            })?;
+            let block = blocks
+                .iter()
+                .find(|block| block.function_name == gate.function)
+                .ok_or_else(|| {
+                    crate::scoped_ids::invalid(format!(
+                        "missing gate {} in {}",
+                        gate.function,
+                        gate.path.display()
+                    ))
+                })?;
+            let variants = analyze_column_variants(
+                conn,
+                &schema,
+                &config.temporal,
+                &gate.path,
+                &block.function_name,
+                &block.sql,
+                block.column_substitution.as_ref(),
+            )?;
+            let first = &variants[0];
+            let mut query = Query {
+                source_path: gate.path.clone(),
+                module_name: String::new(),
+                name: block.function_name.clone(),
+                return_type: first.return_type.clone(),
+                emit_batch: block.emit_batch,
+                scalar_cardinality: block.scalar_cardinality.unwrap_or_default(),
+                connection_access: first.connection_access.clone(),
+                sql: first.sql.clone(),
+                parameters: first.parameters.clone(),
+                columns: first.columns.clone(),
+                column_substitution: None,
+            };
+            let id_index = scoped_registry.apply(block, &mut query)?.ok_or_else(|| {
+                crate::scoped_ids::invalid("registered gate has no produces directive")
+            })?;
+            if !matches!(&query.columns[id_index].column_type,ValueType::ScopedId(id) if id.rust_path==definition.id_type.rust_path)
+            {
+                return Err(crate::scoped_ids::invalid(
+                    "registered gate produces a different scoped type",
+                ));
+            }
+            gates.push(crate::model::ScopedGate { query, id_index });
+        }
+        scoped_ids.push(crate::model::ScopedIdDefinition {
+            id_type: definition.id_type.clone(),
+            gates,
+        });
+    }
     Ok(AnalysisSnapshot {
-        project: Project { queries },
+        project: Project {
+            queries,
+            scoped_ids,
+        },
         schema_fingerprint,
     })
 }
@@ -1123,7 +1191,7 @@ fn first_select_list(tokens: &[Token]) -> Option<&[Token]> {
 
 fn declared_type_for_value_type(value_type: &ValueType) -> &'static str {
     match value_type {
-        ValueType::I64 => "integer",
+        ValueType::I64 | ValueType::ScopedId(_) => "integer",
         ValueType::F64 => "real",
         ValueType::Bool => "boolean",
         ValueType::String | ValueType::ValueSet(_) => "text",

@@ -287,6 +287,7 @@ mod tests {
 
     fn project(fixture: &Fixture, sql: &str) -> Project {
         Project {
+            scoped_ids: vec![],
             queries: vec![
                 query(&fixture.root, "users", "update users set a = 1", false),
                 query(&fixture.root, "events/days", sql, true),
@@ -382,6 +383,7 @@ mod tests {
         let mut fixture = fixture(false);
         fixture.config.output = fixture.root.join("other/generated");
         let project = Project {
+            scoped_ids: vec![],
             queries: vec![query(
                 &fixture.root,
                 "users",

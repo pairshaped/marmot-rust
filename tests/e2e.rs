@@ -2330,3 +2330,286 @@ fn value_sets_preserve_derived_table_projection_identity() {
         }
     }
 }
+
+fn scoped_fixture() -> (tempfile::TempDir, Vec<Config>) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("fixture.db");
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/scoped_ids/schema.sql"))
+        .unwrap();
+    let mut configs = Vec::new();
+    for (owner, declaration, sql) in [
+        (
+            "home",
+            include_str!("fixtures/scoped_ids/home/scoped_ids.toml"),
+            include_str!("fixtures/scoped_ids/home/queries.sql"),
+        ),
+        (
+            "gate_a",
+            include_str!("fixtures/scoped_ids/gate_a/scoped_ids.toml"),
+            include_str!("fixtures/scoped_ids/gate_a/queries.sql"),
+        ),
+        (
+            "gate_b",
+            include_str!("fixtures/scoped_ids/gate_b/scoped_ids.toml"),
+            include_str!("fixtures/scoped_ids/gate_b/queries.sql"),
+        ),
+    ] {
+        let source_root = dir.path().join(owner).join("src");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("queries.rs"),
+            "#[path = \"queries.generated.rs\"]\npub mod sql;\n",
+        )
+        .unwrap();
+        fs::write(source_root.join("queries.sql"), sql).unwrap();
+        fs::write(source_root.join("scoped_ids.toml"), declaration).unwrap();
+        configs.push(Config {
+            database: database.clone(),
+            output: source_root.join("generated/sql"),
+            source_root,
+            target: Target::Rust,
+            check: false,
+            temporal: Default::default(),
+        });
+    }
+    (dir, configs)
+}
+
+#[test]
+fn scoped_ids_require_one_shared_type_across_two_gate_owners() {
+    let (_dir, configs) = scoped_fixture();
+    for config in &configs {
+        emit_project(config, &analyze_project(config).unwrap()).unwrap();
+    }
+    let home = fs::read_to_string(configs[0].source_root.join("queries.generated.rs")).unwrap();
+    assert!(
+        home.contains("pub order_id: scope_home::scoped_ids::ScopedOrderId<'a>"),
+        "{home}"
+    );
+    assert!(configs[0].output.join("scoped_ids.rs").exists());
+    for config in &configs[1..] {
+        let output = fs::read_to_string(config.source_root.join("queries.generated.rs")).unwrap();
+        assert!(
+            output.contains("pub id: scope_home::scoped_ids::ScopedOrderId<'a>"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn unscoped_directives_require_a_nonempty_reason() {
+    for directive in ["-- unscoped:", "-- unscoped:   ", "-- unscoped"] {
+        let (_dir, config) = value_set_fixture(&format!("{directive}\nselect id from notices"));
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("unscoped"), "{error}");
+    }
+    let (_dir, config) = value_set_fixture(
+        "-- unscoped: cross-tenant maintenance inventory\nselect id from notices",
+    );
+    analyze_project(&config).unwrap();
+}
+
+#[test]
+fn scoped_id_cross_owner_runtime_and_compile_boundaries() {
+    let (dir, configs) = scoped_fixture();
+    for config in &configs {
+        emit_project(config, &analyze_project(config).unwrap()).unwrap();
+    }
+    for (owner, package) in [
+        ("home", "scope_home"),
+        ("gate_a", "scope_gate_a"),
+        ("gate_b", "scope_gate_b"),
+    ] {
+        let dependency = if owner == "home" {
+            ""
+        } else {
+            "scope_home = { path = \"../home\" }\n"
+        };
+        fs::write(dir.path().join(owner).join("Cargo.toml"),format!("[package]\nname = {package:?}\nversion = \"0.0.0\"\nedition = \"2024\"\n[dependencies]\nrusqlite = {{ version = \"0.37\", features = [\"bundled\"] }}\n{dependency}")).unwrap();
+        let declaration = if owner == "home" {
+            "extern crate self as scope_home;\n#[path = \"generated/sql/scoped_ids.rs\"] pub mod scoped_ids;\n"
+        } else {
+            ""
+        };
+        fs::write(
+            configs[if owner == "home" {
+                0
+            } else if owner == "gate_a" {
+                1
+            } else {
+                2
+            }]
+            .source_root
+            .join("lib.rs"),
+            format!("{declaration}pub mod queries;\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        r#"
+[package]
+name = "scope_runtime"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+members = ["home", "gate_a", "gate_b"]
+[dependencies]
+scope_home = { path = "home" }
+scope_gate_a = { path = "gate_a" }
+scope_gate_b = { path = "gate_b" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/schema.sql"),
+        include_str!("fixtures/scoped_ids/schema.sql"),
+    )
+    .unwrap();
+    fs::write(dir.path().join("src/lib.rs"),r#"
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use scope_gate_a::queries::sql::{gate_a, GateAParams};
+    use scope_gate_b::queries::sql::{gate_b, GateBParams};
+    use scope_home::queries::sql::{list_children, ListChildrenParams};
+    fn database(name: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("schema.sql")).unwrap();
+        conn.execute_batch("insert into orders values(12,1,2,'paid'),(13,2,2,'paid');").unwrap();
+        conn.execute("insert into children values(1,12,2,?1)",[name]).unwrap();
+        conn
+    }
+    #[test]
+    fn both_gates_produce_the_same_proof_and_children_keep_their_other_params() {
+        let conn=database("authorized child");
+        let a=gate_a(&conn,GateAParams{org_id:1,user_id:2,order_id:12}).unwrap().remove(0);
+        let b=gate_b(&conn,GateBParams{org_id:1,user_id:2,order_id:12}).unwrap().remove(0);
+        assert_eq!(a.id,b.id);
+        assert_eq!(a.id.get(),12);
+        let children=list_children(&conn,ListChildrenParams{order_id:a.id,user_id:2}).unwrap();
+        assert_eq!(children[0].name,"authorized child");
+        assert!(list_children(&conn,ListChildrenParams{order_id:b.id,user_id:3}).unwrap().is_empty());
+        assert!(gate_a(&conn,GateAParams{org_id:1,user_id:3,order_id:12}).unwrap().is_empty());
+        assert!(gate_b(&conn,GateBParams{org_id:2,user_id:2,order_id:12}).unwrap().is_empty());
+        let other=database("other database secret");
+        let error=list_children(&other,ListChildrenParams{order_id:a.id,user_id:2}).unwrap_err();
+        assert!(matches!(error,rusqlite::Error::InvalidQuery),"{error}");
+    }
+}
+"#).unwrap();
+    let result = isolated_cargo(dir.path(), &["test"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let binaries = dir.path().join("src/bin");
+    fs::create_dir_all(&binaries).unwrap();
+    let scalar_source = configs[2].source_root.join("queries.sql");
+    let sql = fs::read_to_string(&scalar_source).unwrap();
+    fs::write(scalar_source, sql.replace("SELECT id, status", "SELECT id")).unwrap();
+    for config in [&configs[0], &configs[2]] {
+        emit_project(config, &analyze_project(config).unwrap()).unwrap();
+    }
+    fs::write(binaries.join("scalar.rs"),r#"fn main(){let conn=rusqlite::Connection::open_in_memory().unwrap();let id=scope_gate_b::queries::sql::gate_b(&conn,scope_gate_b::queries::sql::GateBParams{org_id:1,user_id:2,order_id:12}).unwrap().remove(0);let _=id.get();}"#).unwrap();
+    let result = isolated_cargo(dir.path(), &["check", "--bin", "scalar"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    for (name, source, diagnostic) in [
+        (
+            "raw",
+            r#"fn main(){let conn=rusqlite::Connection::open_in_memory().unwrap(); let _=scope_home::queries::sql::list_children(&conn,scope_home::queries::sql::ListChildrenParams{order_id:12,user_id:2});}"#,
+            "ScopedOrderId",
+        ),
+        (
+            "forge",
+            r#"fn main(){let conn=rusqlite::Connection::open_in_memory().unwrap(); let _=scope_home::scoped_ids::ScopedOrderId{value:12,connection:&conn};}"#,
+            "private",
+        ),
+        (
+            "from_row",
+            r#"fn main(){let conn=rusqlite::Connection::open_in_memory().unwrap(); let _:scope_home::scoped_ids::ScopedOrderId<'_>=conn.query_row("select 12",[],|row|row.get(0)).unwrap();}"#,
+            "FromSql",
+        ),
+        (
+            "escape",
+            r#"fn main(){let proof={let conn=rusqlite::Connection::open_in_memory().unwrap();scope_gate_a::queries::sql::gate_a(&conn,scope_gate_a::queries::sql::GateAParams{org_id:1,user_id:2,order_id:12}).unwrap().remove(0).id};println!("{proof:?}");}"#,
+            "does not live long enough",
+        ),
+        (
+            "send",
+            r#"fn assert_send<T:Send>(){} fn main(){assert_send::<scope_home::scoped_ids::ScopedOrderId<'static>>();}"#,
+            "cannot be shared between threads safely",
+        ),
+    ] {
+        fs::write(binaries.join(format!("{name}.rs")), source).unwrap();
+        let result = isolated_cargo(dir.path(), &["check", "--bin", name])
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{name} unexpectedly compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(diagnostic), "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn scoped_directives_fail_closed_when_the_registry_or_binding_is_invalid() {
+    for (old, new) in [
+        (
+            "-- produces: id = scope_home::scoped_ids::ScopedOrderId",
+            "-- produces: status = scope_home::scoped_ids::ScopedOrderId",
+        ),
+        (
+            "-- produces: id = scope_home::scoped_ids::ScopedOrderId",
+            "-- produces: missing = scope_home::scoped_ids::ScopedOrderId",
+        ),
+        (
+            "-- produces: id = scope_home::scoped_ids::ScopedOrderId",
+            "-- produces: id = scope_home::scoped_ids::UnknownId",
+        ),
+        (
+            "-- produces: id = scope_home::scoped_ids::ScopedOrderId",
+            "-- produces: id = scope_home::scoped_ids::ScopedOrderId\n-- consumes: order_id = scope_home::scoped_ids::ScopedOrderId",
+        ),
+    ] {
+        let (_dir, configs) = scoped_fixture();
+        let path = configs[1].source_root.join("queries.sql");
+        let sql = fs::read_to_string(&path).unwrap();
+        fs::write(path, sql.replace(old, new)).unwrap();
+        assert!(
+            analyze_project(&configs[1])
+                .unwrap_err()
+                .to_string()
+                .contains("scoped")
+        );
+    }
+    let (_dir, configs) = scoped_fixture();
+    let path = configs[0].source_root.join("queries.sql");
+    let sql = fs::read_to_string(&path).unwrap();
+    fs::write(path, sql.replace("consumes: order_id", "consumes: missing")).unwrap();
+    assert!(
+        analyze_project(&configs[0])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown scoped parameter")
+    );
+    let (_dir, configs) = scoped_fixture();
+    fs::remove_file(configs[1].source_root.join("scoped_ids.toml")).unwrap();
+    assert!(
+        analyze_project(&configs[1])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown scoped type")
+    );
+}

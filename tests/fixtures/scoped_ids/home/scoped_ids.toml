@@ -1,0 +1,4 @@
+module = "scope_home::scoped_ids"
+
+[ids.ScopedOrderId]
+gates = ["../../gate_a/src/queries.sql#gate_a", "../../gate_b/src/queries.sql#gate_b"]

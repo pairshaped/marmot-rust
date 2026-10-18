@@ -186,7 +186,13 @@ fn empty_owner_tracks_both_temporal_output_paths() {
         },
     };
     assert_eq!(
-        marmot::emit::output_paths(&config, &marmot::model::Project { queries: vec![] }),
+        marmot::emit::output_paths(
+            &config,
+            &marmot::model::Project {
+                queries: vec![],
+                scoped_ids: vec![]
+            }
+        ),
         [output.join("mod.rs"), output.join("temporal.rs")]
             .into_iter()
             .collect()
@@ -209,7 +215,13 @@ fn library_emission_also_rejects_an_owner_without_output() {
         },
     };
     assert!(matches!(
-        marmot::emit::emit_project(&config, &marmot::model::Project { queries: vec![] }),
+        marmot::emit::emit_project(
+            &config,
+            &marmot::model::Project {
+                queries: vec![],
+                scoped_ids: vec![]
+            }
+        ),
         Err(marmot::error::Error::InvalidTemporalConfig { .. })
     ));
     assert!(!config.output.join("temporal.rs").exists());

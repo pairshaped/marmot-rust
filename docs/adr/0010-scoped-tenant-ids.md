@@ -21,7 +21,7 @@ A child names the parameter that requires the proof:
 SELECT product_id FROM line_items WHERE order_id = @order_id;
 ```
 
-Other parameters keep their ordinary types. A child may consume several scoped parameters by repeating `-- consumes:`. Duplicate parameter declarations, missing parameters, incompatible underlying types and malformed paths fail generation. A query produces at most one nonnullable INTEGER ID. Production requires a read-only gate; mutation, batch and unsupported cardinality combinations fail explicitly.
+Other parameters keep their ordinary types. A child may consume several scoped parameters by repeating `-- consumes:`. Duplicate parameter declarations, missing parameters, incompatible underlying types and malformed paths fail generation. A query produces at most one nonnullable INTEGER ID. Production requires a read-only gate that establishes its own authorization; mutation, batch, consuming scoped IDs in a producer, and unsupported cardinality combinations fail explicitly.
 
 A deliberate cross-tenant query can record `-- unscoped: <reason>`. A missing or whitespace-only reason fails generation, and the directive cannot coexist with scope production or consumption. It does not exempt a query from server authorization or change SQL. Undeclared queries retain their existing raw types and byte-identical generated output. There is no tenant-query ratchet.
 

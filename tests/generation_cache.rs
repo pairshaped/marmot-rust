@@ -395,3 +395,50 @@ fn value_set_changes_invalidate_warm_generation() {
     assert!(!fixture.run(&[]).contains("Skipped"));
     assert!(!output.exists());
 }
+
+#[test]
+fn scoped_registry_and_external_gate_sources_invalidate_generation() {
+    let fixture = Fixture::new();
+    fixture.run(&[]);
+    fs::create_dir_all(fixture.file("outside")).unwrap();
+    fs::write(fixture.file("outside/gate.rs"), "").unwrap();
+    let gate = fixture.file("outside/gate.sql");
+    fs::write(&gate,"-- func: gate\n-- produces: id = scope_fixture::scoped_ids::ScopedItemId\nselect id,name from items where id=@id").unwrap();
+    let registry = fixture.file("src/scoped_ids.toml");
+    fs::write(&registry,"module = \"scope_fixture::scoped_ids\"\n[ids.ScopedItemId]\ngates = [\"../outside/gate.sql#gate\"]\n").unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    let generated = fixture.file("src/generated/sql/scoped_ids.rs");
+    assert!(generated.exists());
+    assert!(fixture.run(&[]).contains("Skipped"));
+    let sql = fs::read_to_string(&gate).unwrap();
+    fs::write(&gate, format!("{sql} and name != 'excluded'")).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    assert!(fs::read_to_string(&generated).unwrap().contains("excluded"));
+    fs::remove_file(registry).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    assert!(!generated.exists());
+}
+
+#[test]
+fn imported_scope_home_is_a_generation_input() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.file("contracts")).unwrap();
+    fs::write(fixture.file("contracts/gate.rs"), "").unwrap();
+    let home = fixture.file("contracts/scoped_ids.toml");
+    fs::write(
+        &home,
+        "module = \"scope_fixture::scoped_ids\"\n[ids.ScopedItemId]\ngates = [\"gate.sql#gate\"]\n",
+    )
+    .unwrap();
+    fs::write(fixture.file("contracts/gate.sql"),"-- func: gate\n-- produces: id = scope_fixture::scoped_ids::ScopedItemId\nselect id,name from items where id=@id").unwrap();
+    fs::write(
+        fixture.file("src/scoped_ids.toml"),
+        "imports = [\"../contracts/scoped_ids.toml\"]\n",
+    )
+    .unwrap();
+    fixture.run(&[]);
+    assert!(fixture.run(&[]).contains("Skipped"));
+    let source = fs::read_to_string(&home).unwrap();
+    fs::write(home, format!("{source}\n")).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+}

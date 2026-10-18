@@ -55,6 +55,9 @@ impl Cache {
         input.add(format!("{target:?}{config:?}").as_bytes());
         input.optional_file(config_path)?;
         input.optional_file(&target.config.source_root.join("value_sets.toml"))?;
+        for path in marmot::scoped_ids::input_paths(&target.config.source_root)? {
+            input.optional_file(&path)?;
+        }
         for file in discovery::discover_sql_files(&target.config.source_root)? {
             input.file(&file.path)?;
             input.add(

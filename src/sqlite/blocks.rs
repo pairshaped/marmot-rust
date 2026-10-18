@@ -8,6 +8,20 @@ pub struct SqlBlock {
     pub scalar_cardinality: Option<ScalarCardinality>,
     pub sql: String,
     pub column_substitution: Option<ColumnSubstitution>,
+    pub scope: ScopeDirectives,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeDirectives {
+    pub produces: Option<ScopeBinding>,
+    pub consumes: Vec<ScopeBinding>,
+    pub unscoped: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeBinding {
+    pub name: String,
+    pub rust_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +31,7 @@ pub struct ColumnSubstitution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlBlockError {
+    InvalidScope { reason: String },
     MissingFunc,
     SqlBeforeFirstFunc,
     EmptyFuncName,
@@ -32,6 +47,7 @@ pub enum SqlBlockError {
 impl std::fmt::Display for SqlBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidScope { reason } => write!(f, "invalid scoped-id directive: {reason}"),
             Self::InvalidCardinality { reason } => {
                 write!(f, "invalid `-- cardinality:` directive: {reason}")
             }
@@ -63,6 +79,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
     let mut current_column = None;
     let mut current_batch = false;
     let mut current_cardinality = None;
+    let mut current_scope = ScopeDirectives::default();
 
     for line in sql.lines() {
         if let Some(name) = func_name_from_line(line)? {
@@ -73,12 +90,18 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
                 current_column.take(),
                 std::mem::take(&mut current_batch),
                 current_cardinality.take(),
+                std::mem::take(&mut current_scope),
             )?;
             current_name = Some(name);
             continue;
         }
 
         let comment = line.trim().strip_prefix("--").map(str::trim);
+        if let Some(body) = comment
+            && parse_scope_directive(body, current_name.is_some(), &mut current_scope)?
+        {
+            continue;
+        }
         if comment == Some("batch") {
             if current_name.is_none() || current_batch {
                 return Err(SqlBlockError::InvalidBatch {
@@ -163,6 +186,7 @@ pub fn parse_sql_blocks(sql: &str) -> std::result::Result<Vec<SqlBlock>, SqlBloc
         current_column,
         current_batch,
         current_cardinality,
+        current_scope,
     )?;
 
     if blocks.is_empty() {
@@ -244,6 +268,7 @@ fn finish_block(
     column_substitution: Option<ColumnSubstitution>,
     emit_batch: bool,
     scalar_cardinality: Option<ScalarCardinality>,
+    scope: ScopeDirectives,
 ) -> std::result::Result<(), SqlBlockError> {
     let Some(name) = name else {
         return Ok(());
@@ -287,6 +312,7 @@ fn finish_block(
         scalar_cardinality,
         sql: trimmed.to_string(),
         column_substitution,
+        scope,
     });
     sql.clear();
     Ok(())
@@ -385,6 +411,7 @@ select 1",
                     scalar_cardinality: None,
                     sql: "select id, name from users;".to_string(),
                     column_substitution: None,
+                    scope: ScopeDirectives::default(),
                 },
                 SqlBlock {
                     function_name: "delete_user".to_string(),
@@ -392,6 +419,7 @@ select 1",
                     scalar_cardinality: None,
                     sql: "delete from users where id = @id;".to_string(),
                     column_substitution: None,
+                    scope: ScopeDirectives::default(),
                 },
             ]
         );
@@ -418,6 +446,7 @@ select 1",
                 column_substitution: Some(ColumnSubstitution {
                     choices: vec!["name".to_string(), "nickname".to_string()],
                 }),
+                scope: ScopeDirectives::default(),
             }]
         );
     }
@@ -504,4 +533,92 @@ select 1",
             }
         );
     }
+}
+
+fn parse_scope_directive(
+    body: &str,
+    inside: bool,
+    scope: &mut ScopeDirectives,
+) -> std::result::Result<bool, SqlBlockError> {
+    let Some(keyword) = ["produces", "consumes", "unscoped"]
+        .into_iter()
+        .find(|keyword| {
+            body.strip_prefix(keyword).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.starts_with(':')
+                    || rest.starts_with('=')
+                    || rest.starts_with(char::is_whitespace)
+            })
+        })
+    else {
+        return Ok(false);
+    };
+    let invalid = |reason: &str| SqlBlockError::InvalidScope {
+        reason: format!("{keyword}: {reason}"),
+    };
+    if !inside {
+        return Err(invalid("must appear inside a -- func: block"));
+    }
+    let value = body
+        .strip_prefix(keyword)
+        .unwrap()
+        .strip_prefix(':')
+        .ok_or_else(|| invalid("requires a colon"))?
+        .trim();
+    if keyword == "unscoped" {
+        if value.is_empty()
+            || scope.unscoped.is_some()
+            || scope.produces.is_some()
+            || !scope.consumes.is_empty()
+        {
+            return Err(invalid(
+                "requires a nonempty reason and cannot coexist with another scope directive",
+            ));
+        }
+        scope.unscoped = Some(value.to_string());
+        return Ok(true);
+    }
+    if scope.unscoped.is_some() {
+        return Err(invalid("cannot coexist with unscoped"));
+    }
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("expected name = absolute::Type"))?;
+    let name = name.trim();
+    let path = path.trim();
+    syn::parse_str::<syn::Ident>(name).map_err(|_| invalid("invalid column or parameter name"))?;
+    let parsed =
+        syn::parse_str::<syn::Path>(path).map_err(|_| invalid("invalid Rust type path"))?;
+    if parsed.segments.len() < 2
+        || parsed.leading_colon.is_some()
+        || parsed
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+        || matches!(
+            parsed.segments.first().unwrap().ident.to_string().as_str(),
+            "self" | "super" | "crate"
+        )
+    {
+        return Err(invalid("use the home registry's absolute crate path"));
+    }
+    let binding = ScopeBinding {
+        name: name.to_string(),
+        rust_path: path.to_string(),
+    };
+    if keyword == "produces" {
+        if scope.produces.replace(binding).is_some() {
+            return Err(invalid("only one produced ID is supported"));
+        }
+    } else {
+        if scope
+            .consumes
+            .iter()
+            .any(|prior| prior.name.eq_ignore_ascii_case(name))
+        {
+            return Err(invalid("duplicate consumed parameter"));
+        }
+        scope.consumes.push(binding);
+    }
+    Ok(true)
 }

@@ -58,6 +58,26 @@ pub enum ConnectionAccess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub queries: Vec<Query>,
+    pub scoped_ids: Vec<ScopedIdDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedIdType {
+    pub rust_path: String,
+    pub rust_type: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedIdDefinition {
+    pub id_type: ScopedIdType,
+    pub gates: Vec<ScopedGate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedGate {
+    pub query: Query,
+    pub id_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +105,7 @@ pub enum ValueType {
     Bytes,
     Value,
     ValueSet(crate::value_sets::ValueSet),
+    ScopedId(ScopedIdType),
 }
 
 impl ValueType {
@@ -132,6 +153,7 @@ impl ValueType {
             Self::Bytes => "Vec<u8>",
             Self::Value => "rusqlite::types::Value",
             Self::ValueSet(set) => &set.rust_path,
+            Self::ScopedId(id) => &id.rust_type,
         }
     }
 }

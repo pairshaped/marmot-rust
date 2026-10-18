@@ -108,7 +108,7 @@ Project defaults can live in `marmot.toml`:
 [tools.marmot]
 database = "path/to/app.db"
 source_root = "path/to/src"
-output = "path/to/src/generated/sql"   # shared output: views.sql and the temporal module
+output = "path/to/src/generated/sql"   # shared generated artifacts
 init_sql = "db/marmot_init.sql"
 migrations_dir = "db/migrations"
 bootstrap_dir = "db/bootstrap"
@@ -123,7 +123,8 @@ Use another config path with `--config path/to/marmot.toml`. CLI flags override 
 writes each query file's bindings beside the SQL (see
 [Generated bindings](#generated-bindings)). The shared folder holds disposable
 `views.sql`, the temporal module and its fixed declaration when configured, and
-`value_sets.rs` when the owner declares column value sets.
+`value_sets.rs` when the owner declares column value sets, and `scoped_ids.rs`
+when the owner defines scoped IDs.
 
 Multi-database projects can use named references:
 
@@ -440,7 +441,7 @@ bin/cargo run -p marmot -- generate \
   --check
 ```
 
-`--check` compares the bindings, the temporal module and `views.sql` against
+`--check` compares the bindings and configured shared artifacts against
 what generation would write and touches no generated or source file: no bytes,
 no modification times, no staging folder. It still opens the analysis database
 and, like `generate`, applies `init_sql` and reconciles views there, so point it
@@ -762,3 +763,73 @@ Replace the superseded handwritten enum and string comparisons in the same
 change. [ADR 0009](docs/adr/0009-declared-column-value-sets.md) defines ownership,
 read failures and import constraints. No SQLite constraint or table rebuild is
 needed.
+
+## Scoped IDs
+
+A gate can produce an ID that child queries require. Declare its type in the
+consuming domain owner's `source_root/scoped_ids.toml`:
+
+```toml
+module = "domain_core::scoped_ids"
+
+[ids.ScopedOrderId]
+gates = ["../../checkout/src/orders.sql#get_order"]
+```
+
+The gate's companion SQL names the produced result column:
+
+```sql
+-- func: get_order
+-- produces: id = domain_core::scoped_ids::ScopedOrderId
+SELECT id, status FROM orders
+WHERE org_id = @org_id AND user_id = @user_id AND id = @order_id;
+```
+
+A child query names the parameter that requires that proof:
+
+```sql
+-- func: list_items
+-- consumes: order_id = domain_core::scoped_ids::ScopedOrderId
+SELECT id, name FROM line_items WHERE order_id = @order_id;
+```
+
+Other owners import the home registry with their own source-root
+`scoped_ids.toml`, using paths relative to that source root:
+
+```toml
+imports = ["../../domain_core/src/scoped_ids.toml"]
+```
+
+The home owner declares the generated module at its configured Rust path:
+
+```rust
+extern crate self as domain_core;
+#[path = "generated/sql/scoped_ids.rs"]
+pub mod scoped_ids;
+```
+
+Marmot generates one type and the registered gates' execution helpers in the
+home owner's shared output. Gate-owner bindings delegate to those helpers and
+map the returned rows. Multiple gates can produce the same type. A helper
+always runs its registered SQL; no public raw constructor or `FromSql`
+implementation exists. Each registered SQL file must have its Rust companion.
+
+Pass the returned ID to child params. Other params keep their ordinary types.
+A raw `i64` doesn't compile. The token borrows the connection, and child bindings
+reject a token from another connection. Keep gates and children in the same
+synchronous database operation; the token cannot escape to an async task or
+outlive that connection. Use `.get()` when an existing separately scoped read
+or response field needs the raw value.
+
+Production requires a nonnullable INTEGER result from an ordinary read-only
+gate. A producing gate establishes its own authorization and cannot consume a
+scoped ID. Home registries are imported directly; transitive imports are not
+supported. An unknown type, missing registered producer, mismatched directive
+or invalid parameter fails generation. The registry, imported homes and gate
+SQL participate in generation freshness checks.
+
+For deliberate cross-tenant SQL, `-- unscoped: <reason>` records a nonempty
+reason and cannot coexist with scope directives. It doesn't change SQL or waive
+authorization. Queries without directives retain their existing types and
+output. [ADR 0010](docs/adr/0010-scoped-tenant-ids.md) defines the visibility and
+lifetime boundary.

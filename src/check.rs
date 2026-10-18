@@ -426,6 +426,7 @@ mod tests {
             dir,
             config,
             project: Project {
+                scoped_ids: vec![],
                 queries: queries.to_vec(),
             },
         };
