@@ -67,7 +67,8 @@ Query names come from `-- func:` blocks, not filenames.
 Generated bindings sit beside the SQL that owns them, so a feature owns its SQL
 and its bindings in one place. Shared generated files are the configured temporal module (with a fixed
 `mod.rs` declaring it), the value-set module defined by
-[ADR 0009](0009-declared-column-value-sets.md), and the aggregate `views.sql`,
+[ADR 0009](0009-declared-column-value-sets.md), the scoped-ID module defined by
+[ADR 0010](0010-scoped-tenant-ids.md), and the aggregate `views.sql`,
 under the configured shared output folder, for example:
 
 ```text

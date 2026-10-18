@@ -14,5 +14,7 @@ defines the public boundary and implementation entry points.
 
 - [0009: Declare column value sets](0009-declared-column-value-sets.md)
 
+- [0010: Produce scoped IDs through generated gate execution](0010-scoped-tenant-ids.md)
+
 Numbering is unique and append-only. Update the owning decision when the design
 changes. Beans own delivery status and do not belong in ADR status sections.
