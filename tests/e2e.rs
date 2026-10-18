@@ -2842,3 +2842,25 @@ mod tests {
         );
     }
 }
+
+#[test]
+fn imported_schema_errors_name_the_home_registry() {
+    for column in ["notices.missing", "notices.id"] {
+        let (dir, config) = imported_value_set_fixture("select status from notices");
+        let home = dir.path().join("home/value_sets.toml");
+        let source = fs::read_to_string(&home).unwrap();
+        fs::write(&home, source.replace("notices.status", column)).unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                config
+                    .source_root
+                    .join("../home/value_sets.toml")
+                    .to_str()
+                    .unwrap()
+            ),
+            "{error}"
+        );
+        assert!(error.contains(column), "{error}");
+    }
+}

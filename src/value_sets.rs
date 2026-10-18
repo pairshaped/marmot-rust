@@ -15,6 +15,7 @@ pub struct ValueSet {
     pub values: Vec<String>,
     pub columns: Vec<(String, String)>,
     pub rust_attributes: Vec<String>,
+    pub declaration_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -89,7 +90,7 @@ pub(crate) fn load(source_root: &Path) -> Result<Registry> {
     homes.push((path, declaration, true));
     for (home_path, home, owned) in homes {
         registry.inputs.insert(home_path.clone());
-        let sets = home_sets(&home, !owned)
+        let sets = home_sets(&home, &home_path, !owned)
             .map_err(|error| invalid(format!("{}: {error}", home_path.display())))?;
         for set in sets {
             if !names.insert(set.name.clone()) {
@@ -118,7 +119,11 @@ pub(crate) fn load(source_root: &Path) -> Result<Registry> {
     Ok(registry)
 }
 
-fn home_sets(declaration: &Declaration, imported: bool) -> Result<Vec<ValueSet>> {
+fn home_sets(
+    declaration: &Declaration,
+    declaration_path: &Path,
+    imported: bool,
+) -> Result<Vec<ValueSet>> {
     if declaration.sets.is_empty() {
         if imported || declaration.module.is_some() {
             return Err(invalid("a home registry requires nonempty sets"));
@@ -196,6 +201,7 @@ fn home_sets(declaration: &Declaration, imported: bool) -> Result<Vec<ValueSet>>
             values: set.values.clone(),
             columns,
             rust_attributes: set.rust_attributes.clone(),
+            declaration_path: declaration_path.to_path_buf(),
         });
     }
     Ok(sets)

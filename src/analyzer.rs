@@ -82,13 +82,14 @@ pub fn analyze_project_snapshot(
                 .ok_or_else(|| {
                     crate::value_sets::invalid(format!(
                         "{}: set {} references unknown column {table}.{column}",
-                        config.source_root.join("value_sets.toml").display(),
+                        set.declaration_path.display(),
                         set.rust_path
                     ))
                 })?;
             if target.column_type != ValueType::String {
                 return Err(crate::value_sets::invalid(format!(
-                    "{table}.{column} must be TEXT"
+                    "{}: {table}.{column} must be TEXT",
+                    set.declaration_path.display()
                 )));
             }
             target.column_type = ValueType::ValueSet(set.clone());
