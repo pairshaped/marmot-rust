@@ -1923,3 +1923,320 @@ mod tests {
     )
     .unwrap();
 }
+
+fn value_set_fixture(sql: &str) -> (tempfile::TempDir, Config) {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("app.sqlite3");
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "create table notices (id integer primary key, status text not null, previous text);
+         create table other (id integer primary key, status text not null);",
+        )
+        .unwrap();
+    let source_root = dir.path().join("src");
+    write_sql_file(&source_root.join("notices"), "query.sql", sql);
+    fs::write(
+        source_root.join("value_sets.toml"),
+        r#"
+module = "crate::value_sets"
+[sets.NoticeStatus]
+values = ["draft", "published"]
+columns = ["notices.status", "notices.previous"]
+"#,
+    )
+    .unwrap();
+    let config = Config {
+        database,
+        output: source_root.join("generated/sql"),
+        source_root,
+        target: Target::Rust,
+        check: false,
+        temporal: Default::default(),
+    };
+    (dir, config)
+}
+
+#[test]
+fn value_sets_validate_literals_by_column_identity() {
+    for (valid, invalid) in [
+        (
+            "select status from notices where status = 'draft'",
+            "select status from notices where status = 'drfat'",
+        ),
+        (
+            "select n.status from notices n where n.status = 'draft'",
+            "select n.status from notices n where n.status = 'drfat'",
+        ),
+        (
+            "select n.status from notices n join other o on n.id = o.id where n.status = 'draft' and o.status = 'unrelated'",
+            "select n.status from notices n join other o on n.id = o.id where n.status = 'drfat'",
+        ),
+        (
+            "select status from notices where status = @status and @status = 'draft'",
+            "select status from notices where status = @status and @status = 'drfat'",
+        ),
+        (
+            "select status from notices where status in ('draft', 'published')",
+            "select status from notices where status in ('draft', 'drfat')",
+        ),
+        (
+            "select case status when 'draft' then 1 else 0 end as result from notices",
+            "select case status when 'drfat' then 1 else 0 end as result from notices",
+        ),
+        (
+            "update notices set status = case when id = @id then 'draft' else 'published' end",
+            "update notices set status = case when id = @id then 'drfat' else 'published' end",
+        ),
+        (
+            "insert into notices (status) values ('draft')",
+            "insert into notices (status) values ('drfat')",
+        ),
+        (
+            "select case when id = 1 then status else 'draft' end as result from notices",
+            "select case when id = 1 then status else 'drfat' end as result from notices",
+        ),
+    ] {
+        let (_dir, config) = value_set_fixture(valid);
+        analyze_project(&config).unwrap_or_else(|e| panic!("{valid}: {e}"));
+        let (_dir, config) = value_set_fixture(invalid);
+        let error = analyze_project(&config).expect_err(invalid).to_string();
+        assert!(
+            error.contains("value set") && error.contains("drfat"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn value_sets_generate_typed_nullable_params_and_results() {
+    let (_dir, config) = value_set_fixture(
+        "select status, previous from notices where status = @status and previous is @previous",
+    );
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+    let output = fs::read_to_string(config.source_root.join("notices.generated.rs")).unwrap();
+    assert!(
+        output.contains("pub status: crate::value_sets::NoticeStatus"),
+        "{output}"
+    );
+    assert!(
+        output.contains("pub previous: Option<crate::value_sets::NoticeStatus>"),
+        "{output}"
+    );
+    let (_dir, insert_config) =
+        value_set_fixture("insert into notices (status, previous) values (@status, @previous)");
+    let insert = analyze_project(&insert_config).unwrap();
+    assert_eq!(
+        insert.queries[0].parameters[0].rust_type(),
+        "crate::value_sets::NoticeStatus"
+    );
+    assert_eq!(
+        insert.queries[0].parameters[1].rust_type(),
+        "Option<crate::value_sets::NoticeStatus>"
+    );
+    let types = fs::read_to_string(config.output.join("value_sets.rs")).unwrap();
+    assert!(types.contains("pub enum NoticeStatus"));
+}
+
+#[test]
+fn value_sets_fail_closed_for_transformed_or_conflicting_values() {
+    for sql in [
+        "select upper(status) as status from notices",
+        "select status || 'suffix' as status from notices",
+        "select status from notices where lower(status) = 'draft'",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).expect_err(sql).to_string();
+        assert!(error.contains("value set"), "{error}");
+    }
+}
+
+#[test]
+fn value_set_runtime_rejects_unknown_reads_and_growth_breaks_exhaustive_matches() {
+    let (_dir, config) = value_set_fixture("select status, previous from notices where id = @id");
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+    let runtime = config.source_root.parent().unwrap();
+    fs::write(
+        runtime.join("Cargo.toml"),
+        r#"
+[package]
+name = "marmot-value-set-runtime"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+"#,
+    )
+    .unwrap();
+    fs::write(config.source_root.join("lib.rs"), r#"
+#[path = "generated/sql/value_sets.rs"]
+pub mod value_sets;
+#[path = "notices.generated.rs"]
+pub mod notices;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reads_known_nullable_and_unknown_values() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table notices(id integer, status text, previous text);
+            insert into notices values (1, 'draft', null), (2, 'legacy', 'published');").unwrap();
+        let rows = notices::query(&conn, notices::QueryParams { id: 1 }).unwrap();
+        assert_eq!(rows[0].status, value_sets::NoticeStatus::Draft);
+        assert_eq!(rows[0].previous, None);
+        let error = notices::query(&conn, notices::QueryParams { id: 2 }).unwrap_err();
+        assert!(error.to_string().contains("legacy"), "{error}");
+        conn.execute("insert into notices values (3, ?1, ?2)",
+            rusqlite::params![value_sets::NoticeStatus::Published, Some(value_sets::NoticeStatus::Draft)]).unwrap();
+        assert_eq!(notices::query(&conn, notices::QueryParams { id: 3 }).unwrap()[0].status,
+            value_sets::NoticeStatus::Published);
+    }
+}
+"#).unwrap();
+    fs::write(
+        config.source_root.join("main.rs"),
+        r#"
+use marmot_value_set_runtime::value_sets::NoticeStatus;
+fn main() {
+    let text = match NoticeStatus::Draft {
+        NoticeStatus::Draft => "draft",
+        NoticeStatus::Published => "published",
+    };
+    assert_eq!(text, "draft");
+}
+"#,
+    )
+    .unwrap();
+    let result = isolated_cargo(runtime, &["test"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let declarations = config.source_root.join("value_sets.toml");
+    let grown = fs::read_to_string(&declarations).unwrap().replace(
+        "values = [\"draft\", \"published\"]",
+        "values = [\"draft\", \"published\", \"archived\"]",
+    );
+    fs::write(declarations, grown).unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let result = isolated_cargo(runtime, &["check", "--bin", "marmot-value-set-runtime"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("non-exhaustive") && stderr.contains("Archived"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn value_set_declarations_validate_identity_and_remove_stale_output() {
+    for (old, new) in [
+        ("notices.status", "notices.absent"),
+        ("notices.status", "notices.id"),
+        ("\"draft\", \"published\"", "\"draft\", \"draft\""),
+        (
+            "module = \"crate::value_sets\"",
+            "module = \"self::value_sets\"",
+        ),
+    ] {
+        let (_dir, config) = value_set_fixture("select status from notices");
+        let path = config.source_root.join("value_sets.toml");
+        let declaration = fs::read_to_string(&path).unwrap();
+        assert!(declaration.contains(old));
+        fs::write(path, declaration.replace(old, new)).unwrap();
+        assert!(
+            analyze_project(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("value set")
+        );
+    }
+    let (_dir, config) = value_set_fixture("select status from notices");
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let output = config.output.join("value_sets.rs");
+    assert!(output.exists());
+    fs::remove_file(config.source_root.join("value_sets.toml")).unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    assert!(!output.exists());
+}
+
+#[test]
+fn value_set_conflicting_parameter_evidence_is_rejected() {
+    let (_dir, config) = value_set_fixture(
+        "select n.status from notices n join other o on n.id = o.id where n.status = @status and o.status = @status",
+    );
+    let path = config.source_root.join("value_sets.toml");
+    let mut declaration = fs::read_to_string(&path).unwrap();
+    declaration
+        .push_str("\n[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"other.status\"]\n");
+    fs::write(path, declaration).unwrap();
+    let error = analyze_project(&config).unwrap_err().to_string();
+    assert!(
+        error.contains("conflicting") && error.contains("value set"),
+        "{error}"
+    );
+}
+
+#[test]
+fn value_sets_validate_cte_sources_and_column_substitutions() {
+    for (sql, valid) in [
+        (
+            "with typed as (select status from notices where status = 'draft') select status from typed",
+            true,
+        ),
+        (
+            "with typed as (select status from notices where status = 'drfat') select status from typed",
+            false,
+        ),
+        (
+            "-- columns: status, previous\nupdate notices set {{column}} = @value where id = @id",
+            true,
+        ),
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let result = analyze_project(&config);
+        if valid {
+            result.unwrap();
+        } else {
+            assert!(result.unwrap_err().to_string().contains("drfat"));
+        }
+    }
+    let (_dir, config) = value_set_fixture(
+        "-- columns: status, id\nupdate notices set {{column}} = @value where id = @id",
+    );
+    assert!(
+        analyze_project(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("value set")
+    );
+}
+
+#[test]
+fn value_sets_follow_view_column_identity_without_rewriting_storage() {
+    for (literal, valid) in [("draft", true), ("drfat", false)] {
+        let (_dir, config) = value_set_fixture(&format!(
+            "select status from notice_view where status = '{literal}'"
+        ));
+        Connection::open(&config.database)
+            .unwrap()
+            .execute_batch("create view notice_view as select status from notices;")
+            .unwrap();
+        let result = analyze_project(&config);
+        if valid {
+            let project = result.unwrap();
+            assert_eq!(
+                project.queries[0].columns[0].rust_type(),
+                "crate::value_sets::NoticeStatus"
+            );
+        } else {
+            assert!(result.unwrap_err().to_string().contains("drfat"));
+        }
+    }
+}

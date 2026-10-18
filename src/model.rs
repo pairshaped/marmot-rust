@@ -84,6 +84,7 @@ pub enum ValueType {
     DbDateTime,
     Bytes,
     Value,
+    ValueSet(crate::value_sets::ValueSet),
 }
 
 impl ValueType {
@@ -120,7 +121,7 @@ impl ValueType {
         }
     }
 
-    pub fn rust_type(&self) -> &'static str {
+    pub fn rust_type(&self) -> &str {
         match self {
             Self::I64 => "i64",
             Self::F64 => "f64",
@@ -130,6 +131,7 @@ impl ValueType {
             Self::DbDateTime => "temporal::DbDateTime",
             Self::Bytes => "Vec<u8>",
             Self::Value => "rusqlite::types::Value",
+            Self::ValueSet(set) => &set.rust_path,
         }
     }
 }

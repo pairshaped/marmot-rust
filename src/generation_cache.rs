@@ -54,6 +54,7 @@ impl Cache {
         input.add(identity.as_bytes());
         input.add(format!("{target:?}{config:?}").as_bytes());
         input.optional_file(config_path)?;
+        input.optional_file(&target.config.source_root.join("value_sets.toml"))?;
         for file in discovery::discover_sql_files(&target.config.source_root)? {
             input.file(&file.path)?;
             input.add(

@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidValueSet {
+        reason: String,
+    },
     ReadFile {
         path: PathBuf,
         source: std::io::Error,
@@ -309,6 +312,7 @@ impl std::fmt::Display for Error {
                 f,
                 "queries use temporal types; configure [tools.marmot.temporal].module with the absolute path of the temporal module"
             ),
+            Self::InvalidValueSet { reason } => write!(f, "invalid value set: {reason}"),
             Self::InvalidTemporalConfig { reason } => {
                 write!(f, "invalid [tools.marmot.temporal] configuration: {reason}")
             }

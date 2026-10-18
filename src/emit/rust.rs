@@ -45,6 +45,13 @@ pub(super) fn render_project(
     let temporal_output = temporal_output(config, uses_temporal)?;
 
     let mut desired = BTreeMap::new();
+    let value_sets = crate::value_sets::load(&config.source_root)?;
+    if !value_sets.is_empty() {
+        desired.insert(
+            config.output.join("value_sets.rs"),
+            crate::value_sets::render(&value_sets),
+        );
+    }
     if let Some(bindings) = public_bindings {
         for module in bindings.keys() {
             if !by_module.contains_key(module.as_str()) {
@@ -95,6 +102,9 @@ pub fn output_paths(config: &Config, project: &Project) -> BTreeSet<PathBuf> {
         .iter()
         .map(adjacent_binding_path)
         .collect::<BTreeSet<_>>();
+    if config.source_root.join("value_sets.toml").is_file() {
+        paths.insert(config.output.join("value_sets.rs"));
+    }
     let uses_temporal = project_uses_temporal(project) || config.temporal.emit_without_queries;
     if let Ok(Some(temporal)) = temporal_output(config, uses_temporal) {
         paths.insert(temporal.declaration_file);

@@ -720,3 +720,44 @@ inside one SQLite read transaction. If an in-place schema change occurs after
 analysis, that run publishes no receipt for its old bindings; the next run
 regenerates. `analyzer::analyze_project_snapshot` returns the analyzed project and
 its schema identity for callers that need this guarantee.
+
+## Column value sets
+
+Put `value_sets.toml` in a generator owner's `source_root` to bind a closed Rust
+enum to exact TEXT columns:
+
+```toml
+module = "crate::value_sets"
+
+[sets.NoticeStatus]
+values = ["draft", "published"]
+columns = ["notices.status"]
+```
+
+Marmot writes `value_sets.rs` in the configured shared output folder. Declare it
+at the configured Rust path, for example:
+
+```rust
+#[path = "generated/sql/value_sets.rs"]
+pub mod value_sets;
+```
+
+Generated params and results use `NoticeStatus`, with `Option` where nullable.
+Enums implement `ToSql`, `FromSql` and `as_str`. Unknown stored text fails the
+read with its original value in the error. Adding a value adds a variant, so
+exhaustive matches must be updated. Deleting the declaration removes the generated
+file on the next generation; remove its Rust module declaration too.
+
+SQL validation follows the declared column through aliases, joins, named params,
+comparisons, `IN`, CASE and direct INSERT/UPDATE values. It rejects invalid
+literals and conflicting parameter types. Expressions that transform a declared
+value without preserving its identity fail generation; return the column and
+transform it in Rust. INSERT SELECT into a declared column is currently rejected.
+Declarations apply only to their configured owner. Other owners and raw SQL
+writers remain responsible for their own inputs.
+
+Before adopting an existing column, trace its writers and stored vocabulary.
+Replace the superseded handwritten enum and string comparisons in the same
+change. [ADR 0009](docs/adr/0009-declared-column-value-sets.md) defines ownership,
+read failures and import constraints. No SQLite constraint or table rebuild is
+needed.

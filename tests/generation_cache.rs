@@ -375,3 +375,23 @@ fn source_root_view_output_is_an_input_even_with_a_separate_analysis_root() {
     assert!(!fixture.run(&[]).contains("Skipped"));
     assert!(!fixture.file("src/generated/sql/views.sql").exists());
 }
+
+#[test]
+fn value_set_changes_invalidate_warm_generation() {
+    let fixture = Fixture::new();
+    fixture.run(&[]);
+    assert!(fixture.run(&[]).contains("Skipped"));
+    let declaration = fixture.file("src/value_sets.toml");
+    fs::write(&declaration, "module = \"crate::value_sets\"\n[sets.ItemName]\nvalues = [\"first\", \"second\"]\ncolumns = [\"items.name\"]\n").unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    let output = fixture.file("src/generated/sql/value_sets.rs");
+    assert!(fs::read_to_string(&output).unwrap().contains("Second"));
+    assert!(fixture.run(&[]).contains("Skipped"));
+    let source = fs::read_to_string(&declaration).unwrap();
+    fs::write(&declaration, source.replace("second", "changed")).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    assert!(fs::read_to_string(&output).unwrap().contains("Changed"));
+    fs::remove_file(declaration).unwrap();
+    assert!(!fixture.run(&[]).contains("Skipped"));
+    assert!(!output.exists());
+}

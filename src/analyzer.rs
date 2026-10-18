@@ -1,3 +1,4 @@
+mod value_sets;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -71,7 +72,25 @@ pub fn analyze_project_snapshot(
     let conn = &transaction;
     let schema_fingerprint =
         crate::schema::fingerprint(conn).map_err(|source| Error::InspectDatabase { source })?;
-    let schema = load_schema(conn, &config.temporal)?;
+    let mut schema = load_schema(conn, &config.temporal)?;
+    for set in crate::value_sets::load(&config.source_root)? {
+        for (table, column) in &set.columns {
+            let target = schema
+                .tables
+                .get_mut(table)
+                .and_then(|columns| columns.get_mut(column))
+                .ok_or_else(|| {
+                    crate::value_sets::invalid(format!("unknown column {table}.{column}"))
+                })?;
+            if target.column_type != ValueType::String {
+                return Err(crate::value_sets::invalid(format!(
+                    "{table}.{column} must be TEXT"
+                )));
+            }
+            target.column_type = ValueType::ValueSet(set.clone());
+        }
+    }
+    value_sets::annotate_views(conn, &mut schema, &config.database)?;
     let files = discover_sql_files(&config.source_root)?;
     let mut queries = Vec::new();
 
@@ -270,7 +289,24 @@ fn analyze_column_variants(
         let sqlite_sql = strip_nullability_overrides(&sql);
         validate_insert_values_counts(&sqlite_sql, schema, path)?;
         validate_temporal_parameter_inferences(&sqlite_sql, schema, temporal, path)?;
-        let parameters = parameters_with_temporal(&sqlite_sql, schema, temporal);
+        let typed_parameters = value_sets::validate(&sqlite_sql, schema, path)?;
+        let mut parameters = parameters_with_temporal(&sqlite_sql, schema, temporal);
+        for parameter in &mut parameters {
+            let sets = parameter
+                .sql_names
+                .iter()
+                .filter_map(|name| typed_parameters.get(name))
+                .collect::<Vec<_>>();
+            if let Some(set) = sets.first() {
+                if sets.iter().any(|candidate| candidate != set) {
+                    return Err(crate::value_sets::invalid(format!(
+                        "conflicting column identities for parameter {}",
+                        parameter.name
+                    )));
+                }
+                parameter.column_type = ValueType::ValueSet((*set).clone());
+            }
+        }
         let (columns, connection_access) = result_columns(conn, schema, path, &sql, &sqlite_sql)?;
         let return_type = if columns.is_empty() {
             ReturnType::Execute
@@ -418,6 +454,13 @@ fn merge_variant_parameters(
                 ));
             }
             if parameter.column_type != candidate.column_type {
+                if matches!(parameter.column_type, ValueType::ValueSet(_))
+                    || matches!(candidate.column_type, ValueType::ValueSet(_))
+                {
+                    return Err(crate::value_sets::invalid(format!(
+                        "{function}: column substitution mixes a declared value set with another type"
+                    )));
+                }
                 if Some(parameter.name.as_str()) != value_parameter {
                     return Err(invalid_column_substitution(
                         path,
@@ -1083,7 +1126,7 @@ fn declared_type_for_value_type(value_type: &ValueType) -> &'static str {
         ValueType::I64 => "integer",
         ValueType::F64 => "real",
         ValueType::Bool => "boolean",
-        ValueType::String => "text",
+        ValueType::String | ValueType::ValueSet(_) => "text",
         ValueType::Bytes => "blob",
         ValueType::Value => "",
         ValueType::DbDate | ValueType::DbDateTime => "text",
@@ -3936,6 +3979,20 @@ fn common_case_branch_type(branch_types: Vec<ValueType>) -> Option<CaseType> {
             mixed: false,
         });
     };
+    if let Some(set) = branch_types
+        .iter()
+        .find(|kind| matches!(kind, ValueType::ValueSet(_)))
+    {
+        if branch_types
+            .iter()
+            .all(|kind| kind == set || *kind == ValueType::String)
+        {
+            return Some(CaseType {
+                column_type: set.clone(),
+                mixed: false,
+            });
+        }
+    }
     if branch_types.iter().all(|column_type| column_type == &first) {
         Some(CaseType {
             column_type: first,
