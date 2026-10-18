@@ -79,6 +79,33 @@ Simple `CASE column WHEN literal` validates each alternative against the column'
 
 When a declared column participates in an expression whose value identity cannot be preserved, generation fails with an actionable value-set diagnostic naming the query and expression. This includes conflicting sets, unresolved column identity and transformations such as concatenation or arbitrary functions. The caller must split the expression into supported column comparisons or return the raw column and perform the transformation in Rust. A cast or result alias doesn't disable validation. Marmot must never silently fall back to String for an expression carrying a declared value set. Tests cover accepted and rejected aliases, joins, parameters, IN and CASE expressions, including ambiguity.
 
+## JSON snapshots, compounds and INSERT SELECT
+
+`json_object` and `json_array` may pack declared values into a text result.
+Marmot validates each argument, including comparisons, typed parameters and CASE
+literals, then treats the JSON result as text. `CAST` of that JSON packing to
+TEXT has the same boundary. JSON packaging cannot supply an enum result or an
+assignment to a declared column. A cast of a declared column, concatenation and
+arbitrary functions remain unsupported; packaging them in JSON does not bypass
+validation.
+
+Compound SELECT arms are validated independently with their own relation
+bindings. Parameters retain one compatible type across every arm. If a result
+position carries an enum, every arm must return the same declared set at that
+position. Conflicting sets and mixed enum/unproven text results fail generation.
+Text JSON snapshots can combine different sets inside different arms without
+claiming that the snapshot itself is an enum. These rules apply inside CTEs and
+derived tables too.
+
+For a single SELECT source in INSERT SELECT, each projection assigned to a
+declared column must be a valid literal, a named parameter bound to that set,
+or a column of the same set. Marmot validates the source predicates and joins
+in their own scope. An untyped text column, transformed value, CASE result or
+scalar subquery is not proof for an enum assignment. Compound INSERT SELECT
+sources involving declared values remain unsupported. Ordinary INSERT VALUES
+keeps its existing CASE and nullability rules. These additions preserve SQL and
+runtime behavior; they provide no general expression exemption or scan waiver.
+
 ## Import and adoption boundary
 
 Generated types constrain generated bindings. They don't constrain raw SQL writers, external importers or other owners without the declaration. Each adoption traces all its writers before choosing the vocabulary.
