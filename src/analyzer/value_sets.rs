@@ -99,16 +99,9 @@ impl Validator {
             if has_declared_source
                 && arms.iter().any(|arm| {
                     top_level_select_list(arm).is_some_and(|list| {
-                        split_top_level_commas(list).iter().any(|projection| {
-                            let projection = if projection.first().is_some_and(|token| {
-                                token_is_word(token, "DISTINCT") || token_is_word(token, "ALL")
-                            }) {
-                                &projection[1..]
-                            } else {
-                                projection
-                            };
-                            matches!(projection, [Token::Star] | [_, Token::Dot, Token::Star])
-                        })
+                        split_top_level_commas(list)
+                            .iter()
+                            .any(|projection| wildcard_projection(projection))
                     })
                 })
             {
@@ -356,11 +349,26 @@ impl Validator {
                     "scalar subquery result has no proven value set; use a typed named parameter or a known literal",
                 ));
             }
+            if top_level_compound_arms(tokens).iter().any(|arm| {
+                top_level_select_list(arm).is_some_and(|list| {
+                    split_top_level_commas(list)
+                        .iter()
+                        .any(|projection| wildcard_projection(projection))
+                })
+            }) {
+                return Err(invalid(
+                    "scalar subqueries require explicit result projections",
+                ));
+            }
             let outer_refs = self.refs.clone();
-            self.refs.extend(table_references(tokens));
-            let result = self.reject_typed(tokens);
+            let outer_schema = self.schema.clone();
+            self.refs.extend(local_refs(tokens));
+            let result = self.statement(tokens);
             self.refs = outer_refs;
-            result?;
+            self.schema = outer_schema;
+            if result?.iter().any(Option::is_some) {
+                return Err(invalid("scalar subquery enum results are unsupported"));
+            }
             return Ok(None);
         }
         if let [Token::Word(function), Token::OpenParen, ..] = tokens {
@@ -590,6 +598,18 @@ impl Validator {
         }
         Ok(())
     }
+}
+
+fn wildcard_projection(tokens: &[Token]) -> bool {
+    let tokens = if tokens
+        .first()
+        .is_some_and(|token| token_is_word(token, "DISTINCT") || token_is_word(token, "ALL"))
+    {
+        &tokens[1..]
+    } else {
+        tokens
+    };
+    matches!(tokens, [Token::Star] | [_, Token::Dot, Token::Star])
 }
 
 fn as_set(kind: &ValueType) -> Option<&ValueSet> {

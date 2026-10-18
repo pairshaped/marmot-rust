@@ -111,3 +111,9 @@ runtime behavior; they provide no general expression exemption or scan waiver.
 Generated types constrain generated bindings. They don't constrain raw SQL writers, external importers or other owners without the declaration. Each adoption traces all its writers before choosing the vocabulary.
 
 Before cutover, the pilot column holds no V2-imported values, including defaults on imported rows. After cutover, adopting a V2-origin column requires reviewing its importer, target inserts, reconciliation counts and cutover reports in the same change. Historical values must be accounted for explicitly. Mapping V2 spellings is allowed only when the import design establishes equivalent meaning; the declaration alone authorizes no rewrite. A strict declaration cannot be adopted while required historical values would fail reads.
+
+Scalar subqueries that return an ordinary value may filter on declared columns.
+Their predicates receive the same literal and parameter validation as a top-level
+SELECT, with local aliases shadowing outer aliases. They require explicit result
+projections. A scalar subquery cannot return a declared enum or prove an enum
+assignment; those uses remain rejected.

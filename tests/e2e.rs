@@ -2990,6 +2990,32 @@ fn compound_results_use_parameters_bound_by_a_later_arm() {
 }
 
 #[test]
+fn scalar_id_subqueries_validate_declared_predicates_without_enum_result_proofs() {
+    for sql in [
+        "insert into notices(id, status) values ((select id from notices where status='draft' order by id desc limit 1), 'published')",
+        "select (select id from notices where status=@state limit 1) as found",
+        "select (select n.id from notices n where n.status='draft' and n.id=o.id limit 1) as found from other o",
+        "select (select n.id from other n where n.status='unrelated' limit 1) as found from notices n",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    for sql in [
+        "select (select id from notices where status='drfat' limit 1) as found",
+        "select (select id from notices where upper(status)='draft' limit 1) as found",
+        "select (select status from notices limit 1) as found",
+        "select (select @state from other limit 1) as found from notices where status=@state",
+        "select (select n.id from notices n where n.status='drfat' limit 1) as found from other n",
+        "select (select * from (select status from notices) source limit 1) as found",
+        "insert into notices(status) values ((select status from notices limit 1))",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn value_set_snapshot_and_insert_select_execute_through_generated_bindings() {
     let (_dir, config) = value_set_fixture(
         "select cast(json_object('state', n.status) as text) as payload from notices n union all select json_object('state', o.status) from other o",
