@@ -2864,3 +2864,174 @@ fn imported_schema_errors_name_the_home_registry() {
         assert!(error.contains(column), "{error}");
     }
 }
+
+#[test]
+fn value_set_snapshot_shapes_validate_each_arm_and_keep_json_text() {
+    for sql in [
+        "select json_object('state', status) as payload from notices",
+        "select cast(json_array(status, case status when 'draft' then 1 else 0 end) as text) as payload from notices",
+        "select cast(json_object('state', r.status) as text) as payload from notices r union all select json_object('state', r.status) from other r",
+        "with snapshot as (select json_object('state', n.status) as payload from notices n union select json_object('state', n.status) from other n) select payload from snapshot",
+        "select payload from (select json_object('state', n.status) as payload from notices n union select json_object('state', n.status) from other n) snapshot",
+        "select json_object('matches', status = @state) as payload from notices where @state = 'draft'",
+        "with snapshot as (select n.status from other n join other o on n.status='unrelated') select json_object('state', n.status) as payload from notices n union select json_object('state', n.status) from snapshot n",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let project = analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        fs::remove_file(config.source_root.join("value_sets.toml")).unwrap();
+        let baseline = analyze_project(&config).unwrap();
+        assert_eq!(
+            project.queries[0].columns[0].column_type, baseline.queries[0].columns[0].column_type,
+            "{sql}"
+        );
+        assert!(
+            !matches!(
+                project.queries[0].columns[0].column_type,
+                marmot::model::ValueType::ValueSet(_)
+            ),
+            "{sql}"
+        );
+    }
+    let (_dir, config) = value_set_fixture(
+        "select n.status from notices n union all select n.previous from notices n",
+    );
+    let project = analyze_project(&config).unwrap();
+    assert_eq!(
+        project.queries[0].columns[0].column_type.rust_type(),
+        "crate::value_sets::NoticeStatus"
+    );
+}
+
+#[test]
+fn value_set_snapshot_shapes_do_not_hide_invalid_or_transformed_values() {
+    for sql in [
+        "select json_object('state', status || '') from notices",
+        "select json_array(cast(status as text)) from notices",
+        "select json_object('state', upper(status)) from notices",
+        "select json_object('matches', status = 'drfat') from notices",
+        "select cast(json_object('state', case status when 'drfat' then 1 else 0 end) as text) from notices",
+        "select json_object('state', n.status) from notices n union select json_object('matches', n.status='drfat') from notices n",
+        "with snapshot as (select json_object('state', n.status) as payload from other n union select json_object('matches', n.status='drfat') from notices n) select payload from snapshot",
+        "update notices set status = json_object('state', status)",
+        "select status from notices union select 'draft'",
+        "select * from notices union select id, status, null from other",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{sql}: {error}");
+    }
+    for sql in [
+        "select n.status from notices n union select n.status from other n",
+        "select json_object('state', n.status) from notices n where n.status=@status union select json_object('state', n.status) from other n where n.status=@status",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let registry = config.source_root.join("value_sets.toml");
+        let mut source = fs::read_to_string(&registry).unwrap();
+        source
+            .push_str("\n[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"other.status\"]\n");
+        fs::write(registry, source).unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("conflicting"), "{sql}: {error}");
+    }
+}
+
+#[test]
+fn value_set_insert_select_proves_target_projection_identity() {
+    for sql in [
+        "insert into notices (status) select 'draft' from other where status='unrelated'",
+        "insert into notices (status) select @state from other where id=@id",
+        "insert into notices (status, previous) select n.status, n.previous from notices n where n.status='draft'",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    for sql in [
+        "insert into notices (status) select 'drfat' from other",
+        "insert into notices (status) select n.status from other n",
+        "insert into notices (status) select upper(n.status) from notices n",
+        "insert into notices (status) select case when id=1 then 'draft' else 'published' end from other",
+        "insert into notices (status) select (select 'draft') from other",
+        "insert into notices (id, status, previous) select * from notices",
+        "insert into notices (status) select 'draft' from notices n where n.status='drfat'",
+        "insert into notices (status) select 'draft' from other union select 'drfat' from other",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{sql}: {error}");
+    }
+}
+
+#[test]
+fn compound_results_use_parameters_bound_by_a_later_arm() {
+    let (_dir, config) = value_set_fixture(
+        "select @state as status union all select status from notices where status=@state",
+    );
+    let project = analyze_project(&config).unwrap();
+    assert_eq!(
+        project.queries[0].columns[0].column_type.rust_type(),
+        "crate::value_sets::NoticeStatus"
+    );
+}
+
+#[test]
+fn value_set_snapshot_and_insert_select_execute_through_generated_bindings() {
+    let (_dir, config) = value_set_fixture(
+        "select cast(json_object('state', n.status) as text) as payload from notices n union all select json_object('state', o.status) from other o",
+    );
+    write_sql_file(
+        &config.source_root.join("notices"),
+        "copy.sql",
+        "insert into notices (status) select @state from other where id=@id",
+    );
+    let project = analyze_project(&config).unwrap();
+    emit_project(&config, &project).unwrap();
+    let runtime = config.source_root.parent().unwrap();
+    fs::write(
+        runtime.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "marmot-value-set-snapshot-runtime"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[dependencies]
+rusqlite = {{ version = "0.37", features = ["bundled"] }}
+marmot = {{ path = {:?} }}
+"#,
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    fs::write(config.source_root.join("lib.rs"), r##"
+#[path = "generated/sql/value_sets.rs"]
+pub mod value_sets;
+#[path = "notices.generated.rs"]
+pub mod notices;
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn preserves_snapshot_json_and_typed_assignment() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table notices(id integer primary key, status text not null, previous text);
+            create table other(id integer primary key, status text not null);
+            insert into other values(1, 'external');").unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(super::notices::copy(&tx, super::notices::CopyParams {
+            state: super::value_sets::NoticeStatus::Published, id: 1,
+        }).unwrap(), 1);
+        tx.commit().unwrap();
+        let rows = super::notices::query(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].as_deref(), Some(r#"{"state":"published"}"#));
+        assert_eq!(rows[1].as_deref(), Some(r#"{"state":"external"}"#));
+    }
+}
+"##).unwrap();
+    let result = isolated_cargo(runtime, &["test"]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

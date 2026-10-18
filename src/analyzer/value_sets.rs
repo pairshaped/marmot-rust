@@ -2,61 +2,111 @@ use super::*;
 use crate::sqlite::parse::{InsertSource, Statement, parse_statement};
 use crate::value_sets::{ValueSet, invalid};
 
-pub(super) fn validate(
-    sql: &str,
-    schema: &Schema,
-    path: &Path,
-) -> Result<BTreeMap<String, ValueSet>> {
+#[derive(Default)]
+pub(super) struct Validation {
+    pub parameters: BTreeMap<String, ValueSet>,
+    pub columns: Vec<Option<ValueSet>>,
+}
+
+pub(super) fn validate(sql: &str, schema: &Schema, path: &Path) -> Result<Validation> {
     if !schema
         .tables
         .values()
         .flat_map(|columns| columns.values())
         .any(|column| matches!(column.column_type, ValueType::ValueSet(_)))
     {
-        return Ok(BTreeMap::new());
+        return Ok(Validation::default());
     }
     let tokens = tokenize(sql);
     let schema = schema_with_ctes(&tokens, schema);
+    let schema = insert_select_tokens(&tokens)
+        .map(|source| schema_with_ctes(source, &schema))
+        .unwrap_or(schema);
     let schema = schema_with_derived_tables(&tokens, &schema);
     let mut validator = Validator {
         schema: &schema,
         refs: local_refs(&tokens),
         parameters: BTreeMap::new(),
+        compound_results: Vec::new(),
     };
     // Each pass can bind another parameter in a comparison chain. The map only
     // grows; conflicting evidence fails rather than replacing the first type.
-    loop {
+    let columns = loop {
         let before = validator.parameters.len();
-        validator
+        validator.compound_results.clear();
+        let columns = validator
             .statement(&tokens)
             .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
         if validator.parameters.len() == before {
-            break;
+            break columns;
+        }
+    };
+    // A later arm can bind a parameter used by an earlier result. The last
+    // fixed-point pass has stable identities, so only its result proof is kept.
+    for arms in &validator.compound_results {
+        for current in &arms[1..] {
+            for (left, right) in arms[0].iter().zip(current) {
+                compatible(left.as_ref(), right.as_ref())
+                    .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+                if left.is_some() != right.is_some() {
+                    return Err(invalid(format!(
+                        "{}: compound enum results require the same declared set in every arm",
+                        path.display()
+                    )));
+                }
+            }
         }
     }
-    Ok(validator.parameters)
+    Ok(Validation {
+        parameters: validator.parameters,
+        columns,
+    })
 }
 
 struct Validator<'a> {
     schema: &'a Schema,
     refs: BTreeMap<String, String>,
     parameters: BTreeMap<String, ValueSet>,
+    compound_results: Vec<Vec<Vec<Option<ValueSet>>>>,
 }
 
 impl Validator<'_> {
-    fn statement(&mut self, tokens: &[Token]) -> Result<()> {
-        if top_level(tokens).iter().any(|(_, token)| {
-            ["UNION", "EXCEPT", "INTERSECT"]
-                .iter()
-                .any(|keyword| token_is_word(token, keyword))
-        }) {
-            let outer_refs = self.refs.clone();
-            self.refs = table_references(tokens);
-            let result = self.reject_typed(tokens);
-            self.refs = outer_refs;
-            result?;
-        }
+    fn statement(&mut self, tokens: &[Token]) -> Result<Vec<Option<ValueSet>>> {
         let statement = parse_statement(tokens);
+        let arms = top_level_compound_arms(tokens);
+        if matches!(statement, Statement::Select(_)) && arms.len() > 1 {
+            let has_declared_source = arms.iter().any(|arm| {
+                local_refs(arm).values().any(|table| {
+                    self.schema.tables.get(table).is_some_and(|columns| {
+                        columns
+                            .values()
+                            .any(|column| as_set(&column.column_type).is_some())
+                    })
+                })
+            });
+            if has_declared_source
+                && arms.iter().any(|arm| {
+                    top_level_select_list(arm).is_some_and(|list| {
+                        split_top_level_commas(list).iter().any(|projection| {
+                            matches!(*projection, [Token::Star] | [_, Token::Dot, Token::Star])
+                        })
+                    })
+                })
+            {
+                return Err(invalid(
+                    "compound declared-column queries require explicit result projections",
+                ));
+            }
+            let mut results = Vec::new();
+            for arm in arms {
+                results.push(self.nested(arm)?);
+            }
+            let first = results[0].clone();
+            self.compound_results.push(results);
+            return Ok(first);
+        }
+        let mut result = Vec::new();
+        let source_has_own_scope = matches!(&statement, Statement::Insert(insert) if matches!(insert.source, InsertSource::Select(_)));
         let ctes = match &statement {
             Statement::Select(value) => &value.ctes,
             Statement::Insert(value) => &value.ctes,
@@ -73,7 +123,7 @@ impl Validator<'_> {
                     self.nested(body)?;
                 }
                 for expression in split_top_level_commas(&select.body.select_list) {
-                    self.expression(expression_without_alias(expression), None)?;
+                    result.push(self.expression(expression_without_alias(expression), None)?);
                 }
                 for expression in [
                     select.body.where_clause,
@@ -120,18 +170,67 @@ impl Validator<'_> {
                             }
                         }
                     }
-                    InsertSource::Select(_) => {
-                        // The existing analyzer understands INSERT SELECT params,
-                        // but assigning whole expression lists needs column proof.
-                        if columns.iter().any(|column| {
-                            self.schema
-                                .column(&table, column)
-                                .is_some_and(|column| as_set(&column.column_type).is_some())
-                        }) {
+                    InsertSource::Select(select) => {
+                        let source = insert_select_tokens(tokens)
+                            .ok_or_else(|| invalid("unresolved INSERT SELECT source"))?;
+                        if top_level_compound_arms(source).len() > 1
+                            && columns.iter().any(|column| {
+                                self.schema
+                                    .column(&table, column)
+                                    .is_some_and(|column| as_set(&column.column_type).is_some())
+                            })
+                        {
                             return Err(invalid(
-                                "INSERT SELECT into a declared column is ambiguous; use typed VALUES",
+                                "compound INSERT SELECT into declared columns is unsupported",
                             ));
                         }
+                        self.nested(source)?;
+                        let outer_refs = std::mem::replace(&mut self.refs, local_refs(source));
+                        let assignment = (|| {
+                            let projections = split_top_level_commas(&select.body.select_list);
+                            if projections.len() != columns.len()
+                                && columns.iter().any(|column| {
+                                    self.schema
+                                        .column(&table, column)
+                                        .is_some_and(|column| as_set(&column.column_type).is_some())
+                                })
+                            {
+                                return Err(invalid(
+                                    "INSERT SELECT declared-column assignments require explicit projections",
+                                ));
+                            }
+                            for (projection, column) in
+                                split_top_level_commas(&select.body.select_list)
+                                    .iter()
+                                    .zip(&columns)
+                            {
+                                let expected = self
+                                    .schema
+                                    .column(&table, column)
+                                    .and_then(|column| as_set(&column.column_type))
+                                    .cloned();
+                                let Some(expected) = expected else {
+                                    continue;
+                                };
+                                let projection = expression_without_alias(projection);
+                                let direct = column_ref_from_expression(projection).is_some()
+                                    || matches!(
+                                        projection,
+                                        [Token::StringLit(_) | Token::ParamNamed { .. }]
+                                    )
+                                    || (projection.len() == 1
+                                        && token_is_word(&projection[0], "NULL"));
+                                if !direct {
+                                    return Err(invalid(
+                                        "INSERT SELECT enum assignments require a known literal, typed parameter or same-set column",
+                                    ));
+                                }
+                                self.expression(projection, Some(&expected))?;
+                            }
+                            Ok(())
+                        })();
+                        self.refs = outer_refs;
+                        assignment?;
                     }
                     InsertSource::DefaultValues => (),
                 }
@@ -156,17 +255,24 @@ impl Validator<'_> {
             }
             Statement::Unsupported => self.reject_typed(tokens)?,
         }
+        if !source_has_own_scope {
+            self.joins(tokens)?;
+        }
+        Ok(result)
+    }
+
+    fn joins(&mut self, tokens: &[Token]) -> Result<()> {
         // The statement model keeps relation bindings but not ON expressions.
-        for (index, token) in tokens.iter().enumerate() {
+        let top = top_level(tokens);
+        for (position, (index, token)) in top.iter().enumerate() {
             if !token_is_word(token, "ON") {
                 continue;
             }
-            let end = tokens
+            let end = top
                 .iter()
-                .enumerate()
-                .skip(index + 1)
+                .skip(position + 1)
                 .find_map(|(i, token)| {
-                    (join_keyword(token) || from_sequence_boundary(token)).then_some(i)
+                    (join_keyword(token) || from_sequence_boundary(token)).then_some(*i)
                 })
                 .unwrap_or(tokens.len());
             self.expression(&tokens[index + 1..end], None)?;
@@ -174,9 +280,8 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn nested(&mut self, tokens: &[Token]) -> Result<()> {
-        let outer_refs = self.refs.clone();
-        self.refs = local_refs(tokens);
+    fn nested(&mut self, tokens: &[Token]) -> Result<Vec<Option<ValueSet>>> {
+        let outer_refs = std::mem::replace(&mut self.refs, local_refs(tokens));
         let result = self.statement(tokens);
         self.refs = outer_refs;
         result
@@ -234,6 +339,35 @@ impl Validator<'_> {
             self.refs = outer_refs;
             result?;
             return Ok(None);
+        }
+        if let [Token::Word(function), Token::OpenParen, ..] = tokens {
+            if matches!(
+                function.to_ascii_uppercase().as_str(),
+                "JSON_OBJECT" | "JSON_ARRAY"
+            ) && matching_open_paren(tokens, tokens.len() - 1) == Some(1)
+            {
+                if expected.is_some() {
+                    return Err(invalid("JSON packing returns text, not a declared enum"));
+                }
+                for argument in split_top_level_commas(&tokens[2..tokens.len() - 1]) {
+                    self.expression(argument, None)?;
+                }
+                return Ok(None);
+            }
+            if function.eq_ignore_ascii_case("CAST")
+                && matching_open_paren(tokens, tokens.len() - 1) == Some(1)
+            {
+                let inner = &tokens[2..tokens.len() - 1];
+                if let Some(as_index) = top_level_keyword(inner, "AS") {
+                    let value = &inner[..as_index];
+                    if matches!(inner.get(as_index + 1), Some(token) if token_is_word(token, "TEXT"))
+                        && as_index + 2 == inner.len()
+                        && matches!(value.first(), Some(Token::Word(name)) if matches!(name.to_ascii_uppercase().as_str(), "JSON_OBJECT" | "JSON_ARRAY"))
+                    {
+                        return self.expression(value, expected);
+                    }
+                }
+            }
         }
         if token_is_word(&tokens[0], "BY") {
             return self.expression(&tokens[1..], expected);
@@ -470,6 +604,29 @@ fn top_level(tokens: &[Token]) -> Vec<(usize, &Token)> {
         }
     }
     result
+}
+
+fn insert_select_tokens(tokens: &[Token]) -> Option<&[Token]> {
+    let top = top_level(tokens);
+    let insert = top
+        .iter()
+        .position(|(_, token)| token_is_word(token, "INSERT"))?;
+    let start = top.iter().skip(insert + 1).find_map(|(index, token)| {
+        (token_is_word(token, "SELECT") || token_is_word(token, "WITH")).then_some(*index)
+    })?;
+    let end = top
+        .iter()
+        .find_map(|(index, token)| {
+            (*index > start
+                && (token_is_word(token, "RETURNING")
+                    || (token_is_word(token, "ON")
+                        && tokens
+                            .get(index + 1)
+                            .is_some_and(|next| token_is_word(next, "CONFLICT")))))
+            .then_some(*index)
+        })
+        .unwrap_or(tokens.len());
+    Some(&tokens[start..end])
 }
 
 fn top_level_case_words(tokens: &[Token]) -> Vec<(usize, &str)> {

@@ -753,8 +753,15 @@ SQL validation follows the declared column through aliases, joins, named params,
 comparisons, `IN`, CASE and direct INSERT/UPDATE values. It rejects invalid
 literals and conflicting parameter types. Expressions that transform a declared
 value without preserving its identity fail generation; return the column and
-transform it in Rust. INSERT SELECT into a declared column, typed compound
-queries, and scalar-subquery results in typed contexts are currently rejected.
+transform it in Rust. JSON_OBJECT and JSON_ARRAY can pack validated arguments
+into SQLite text, including through CAST to TEXT. Their existing generated
+result representation stays unchanged and never becomes an enum. Each compound
+SELECT arm is validated with its own table bindings; enum result positions and
+parameters must agree across arms. Declared-column compounds require explicit
+projections. A single INSERT SELECT source can assign a valid literal, a typed
+parameter or a same-set column to a declared target. Transformed assignments,
+compound INSERT SELECT into declared targets and scalar-subquery enum results
+remain unsupported.
 Other owners adopt the same columns by importing the home registry from their
 own `source_root/value_sets.toml`:
 

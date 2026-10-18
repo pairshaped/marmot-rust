@@ -362,13 +362,13 @@ fn analyze_column_variants(
         let sqlite_sql = strip_nullability_overrides(&sql);
         validate_insert_values_counts(&sqlite_sql, schema, path)?;
         validate_temporal_parameter_inferences(&sqlite_sql, schema, temporal, path)?;
-        let typed_parameters = value_sets::validate(&sqlite_sql, schema, path)?;
+        let value_sets = value_sets::validate(&sqlite_sql, schema, path)?;
         let mut parameters = parameters_with_temporal(&sqlite_sql, schema, temporal);
         for parameter in &mut parameters {
             let sets = parameter
                 .sql_names
                 .iter()
-                .filter_map(|name| typed_parameters.get(name))
+                .filter_map(|name| value_sets.parameters.get(name))
                 .collect::<Vec<_>>();
             if let Some(set) = sets.first() {
                 if sets.iter().any(|candidate| candidate != set) {
@@ -380,7 +380,15 @@ fn analyze_column_variants(
                 parameter.column_type = ValueType::ValueSet((*set).clone());
             }
         }
-        let (columns, connection_access) = result_columns(conn, schema, path, &sql, &sqlite_sql)?;
+        let (mut columns, connection_access) =
+            result_columns(conn, schema, path, &sql, &sqlite_sql)?;
+        if columns.len() == value_sets.columns.len() {
+            for (column, set) in columns.iter_mut().zip(value_sets.columns) {
+                if let Some(set) = set {
+                    column.column_type = ValueType::ValueSet(set);
+                }
+            }
+        }
         let return_type = if columns.is_empty() {
             ReturnType::Execute
         } else {
