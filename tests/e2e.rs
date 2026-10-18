@@ -2293,3 +2293,40 @@ fn value_sets_do_not_silently_bypass_unreviewed_query_shapes() {
         );
     }
 }
+
+#[test]
+fn value_sets_reject_literal_only_subqueries_in_typed_contexts() {
+    for sql in [
+        "select status from notices where status = (select 'drfat')",
+        "select status from notices where status in (select 'drfat')",
+        "update notices set status = (select 'drfat')",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        assert!(
+            analyze_project(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("value set"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn value_sets_preserve_derived_table_projection_identity() {
+    for (literal, valid) in [("draft", true), ("drfat", false)] {
+        let (_dir, config) = value_set_fixture(&format!(
+            "select d.status from (select status from notices) d where d.status = '{literal}'"
+        ));
+        let result = analyze_project(&config);
+        if valid {
+            let project = result.unwrap();
+            assert_eq!(
+                project.queries[0].columns[0].column_type.rust_type(),
+                "crate::value_sets::NoticeStatus"
+            );
+        } else {
+            assert!(result.unwrap_err().to_string().contains("drfat"));
+        }
+    }
+}

@@ -121,9 +121,9 @@ Use another config path with `--config path/to/marmot.toml`. CLI flags override 
 
 `output` names the shared output folder, not the place query bindings go. Marmot
 writes each query file's bindings beside the SQL (see
-[Generated bindings](#generated-bindings)). The shared folder holds only the
-disposable `views.sql` and, when Marmot emits it, the temporal module with its
-fixed declaration.
+[Generated bindings](#generated-bindings)). The shared folder holds disposable
+`views.sql`, the temporal module and its fixed declaration when configured, and
+`value_sets.rs` when the owner declares column value sets.
 
 Multi-database projects can use named references:
 
@@ -752,7 +752,8 @@ SQL validation follows the declared column through aliases, joins, named params,
 comparisons, `IN`, CASE and direct INSERT/UPDATE values. It rejects invalid
 literals and conflicting parameter types. Expressions that transform a declared
 value without preserving its identity fail generation; return the column and
-transform it in Rust. INSERT SELECT into a declared column is currently rejected.
+transform it in Rust. INSERT SELECT into a declared column, typed compound
+queries, and scalar-subquery results in typed contexts are currently rejected.
 Declarations apply only to their configured owner. Other owners and raw SQL
 writers remain responsible for their own inputs.
 

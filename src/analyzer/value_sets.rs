@@ -17,6 +17,7 @@ pub(super) fn validate(
     }
     let tokens = tokenize(sql);
     let schema = schema_with_ctes(&tokens, schema);
+    let schema = schema_with_derived_tables(&tokens, &schema);
     let mut validator = Validator {
         schema: &schema,
         refs: local_refs(&tokens),
@@ -222,6 +223,11 @@ impl Validator<'_> {
             return Ok(None);
         }
         if token_is_word(&tokens[0], "SELECT") || token_is_word(&tokens[0], "WITH") {
+            if expected.is_some() {
+                return Err(invalid(
+                    "scalar subquery result has no proven value set; use a typed named parameter or a known literal",
+                ));
+            }
             let outer_refs = self.refs.clone();
             self.refs.extend(table_references(tokens));
             let result = self.reject_typed(tokens);
@@ -501,6 +507,9 @@ fn local_refs(tokens: &[Token]) -> BTreeMap<String, String> {
         Statement::Insert(insert) => add_table_binding_ref(&mut refs, &insert.target),
         Statement::Delete(delete) => add_table_binding_ref(&mut refs, &delete.target),
         Statement::Unsupported => refs = table_references(tokens),
+    }
+    for (alias, _) in derived_table_bodies(tokens) {
+        refs.insert(alias.to_ascii_lowercase(), alias.to_ascii_lowercase());
     }
     refs
 }
