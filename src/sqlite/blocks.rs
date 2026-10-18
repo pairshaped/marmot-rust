@@ -318,6 +318,94 @@ fn finish_block(
     Ok(())
 }
 
+fn parse_scope_directive(
+    body: &str,
+    inside: bool,
+    scope: &mut ScopeDirectives,
+) -> std::result::Result<bool, SqlBlockError> {
+    let Some(keyword) = ["produces", "consumes", "unscoped"]
+        .into_iter()
+        .find(|keyword| {
+            body.strip_prefix(keyword).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.starts_with(':')
+                    || rest.starts_with('=')
+                    || rest.starts_with(char::is_whitespace)
+            })
+        })
+    else {
+        return Ok(false);
+    };
+    let invalid = |reason: &str| SqlBlockError::InvalidScope {
+        reason: format!("{keyword}: {reason}"),
+    };
+    if !inside {
+        return Err(invalid("must appear inside a -- func: block"));
+    }
+    let value = body
+        .strip_prefix(keyword)
+        .unwrap()
+        .strip_prefix(':')
+        .ok_or_else(|| invalid("requires a colon"))?
+        .trim();
+    if keyword == "unscoped" {
+        if value.is_empty()
+            || scope.unscoped.is_some()
+            || scope.produces.is_some()
+            || !scope.consumes.is_empty()
+        {
+            return Err(invalid(
+                "requires a nonempty reason and cannot coexist with another scope directive",
+            ));
+        }
+        scope.unscoped = Some(value.to_string());
+        return Ok(true);
+    }
+    if scope.unscoped.is_some() {
+        return Err(invalid("cannot coexist with unscoped"));
+    }
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| invalid("expected name = absolute::Type"))?;
+    let name = name.trim();
+    let path = path.trim();
+    syn::parse_str::<syn::Ident>(name).map_err(|_| invalid("invalid column or parameter name"))?;
+    let parsed =
+        syn::parse_str::<syn::Path>(path).map_err(|_| invalid("invalid Rust type path"))?;
+    if parsed.segments.len() < 2
+        || parsed.leading_colon.is_some()
+        || parsed
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+        || matches!(
+            parsed.segments.first().unwrap().ident.to_string().as_str(),
+            "self" | "super" | "crate"
+        )
+    {
+        return Err(invalid("use the home registry's absolute crate path"));
+    }
+    let binding = ScopeBinding {
+        name: name.to_string(),
+        rust_path: path.to_string(),
+    };
+    if keyword == "produces" {
+        if scope.produces.replace(binding).is_some() {
+            return Err(invalid("only one produced ID is supported"));
+        }
+    } else {
+        if scope
+            .consumes
+            .iter()
+            .any(|prior| prior.name.eq_ignore_ascii_case(name))
+        {
+            return Err(invalid("duplicate consumed parameter"));
+        }
+        scope.consumes.push(binding);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,92 +621,4 @@ select 1",
             }
         );
     }
-}
-
-fn parse_scope_directive(
-    body: &str,
-    inside: bool,
-    scope: &mut ScopeDirectives,
-) -> std::result::Result<bool, SqlBlockError> {
-    let Some(keyword) = ["produces", "consumes", "unscoped"]
-        .into_iter()
-        .find(|keyword| {
-            body.strip_prefix(keyword).is_some_and(|rest| {
-                rest.is_empty()
-                    || rest.starts_with(':')
-                    || rest.starts_with('=')
-                    || rest.starts_with(char::is_whitespace)
-            })
-        })
-    else {
-        return Ok(false);
-    };
-    let invalid = |reason: &str| SqlBlockError::InvalidScope {
-        reason: format!("{keyword}: {reason}"),
-    };
-    if !inside {
-        return Err(invalid("must appear inside a -- func: block"));
-    }
-    let value = body
-        .strip_prefix(keyword)
-        .unwrap()
-        .strip_prefix(':')
-        .ok_or_else(|| invalid("requires a colon"))?
-        .trim();
-    if keyword == "unscoped" {
-        if value.is_empty()
-            || scope.unscoped.is_some()
-            || scope.produces.is_some()
-            || !scope.consumes.is_empty()
-        {
-            return Err(invalid(
-                "requires a nonempty reason and cannot coexist with another scope directive",
-            ));
-        }
-        scope.unscoped = Some(value.to_string());
-        return Ok(true);
-    }
-    if scope.unscoped.is_some() {
-        return Err(invalid("cannot coexist with unscoped"));
-    }
-    let (name, path) = value
-        .split_once('=')
-        .ok_or_else(|| invalid("expected name = absolute::Type"))?;
-    let name = name.trim();
-    let path = path.trim();
-    syn::parse_str::<syn::Ident>(name).map_err(|_| invalid("invalid column or parameter name"))?;
-    let parsed =
-        syn::parse_str::<syn::Path>(path).map_err(|_| invalid("invalid Rust type path"))?;
-    if parsed.segments.len() < 2
-        || parsed.leading_colon.is_some()
-        || parsed
-            .segments
-            .iter()
-            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
-        || matches!(
-            parsed.segments.first().unwrap().ident.to_string().as_str(),
-            "self" | "super" | "crate"
-        )
-    {
-        return Err(invalid("use the home registry's absolute crate path"));
-    }
-    let binding = ScopeBinding {
-        name: name.to_string(),
-        rust_path: path.to_string(),
-    };
-    if keyword == "produces" {
-        if scope.produces.replace(binding).is_some() {
-            return Err(invalid("only one produced ID is supported"));
-        }
-    } else {
-        if scope
-            .consumes
-            .iter()
-            .any(|prior| prior.name.eq_ignore_ascii_case(name))
-        {
-            return Err(invalid("duplicate consumed parameter"));
-        }
-        scope.consumes.push(binding);
-    }
-    Ok(true)
 }
