@@ -18,13 +18,8 @@ pub(super) fn validate(sql: &str, schema: &Schema, path: &Path) -> Result<Valida
         return Ok(Validation::default());
     }
     let tokens = tokenize(sql);
-    let schema = schema_with_ctes(&tokens, schema);
-    let schema = insert_select_tokens(&tokens)
-        .map(|source| schema_with_ctes(source, &schema))
-        .unwrap_or(schema);
-    let schema = schema_with_derived_tables(&tokens, &schema);
     let mut validator = Validator {
-        schema: &schema,
+        schema: schema.clone(),
         refs: local_refs(&tokens),
         parameters: BTreeMap::new(),
         compound_results: Vec::new(),
@@ -34,12 +29,12 @@ pub(super) fn validate(sql: &str, schema: &Schema, path: &Path) -> Result<Valida
     let columns = loop {
         let before = validator.parameters.len();
         validator.compound_results.clear();
-        let columns = validator
-            .statement(&tokens)
-            .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+        let result = validator.statement(&tokens);
         if validator.parameters.len() == before {
-            break columns;
+            break result.map_err(|error| invalid(format!("{}: {error}", path.display())))?;
         }
+        // A later arm may have supplied the parameter identity needed by a
+        // subsequent consumer of its CTE. Recheck errors with stable evidence.
     };
     // A later arm can bind a parameter used by an earlier result. The last
     // fixed-point pass has stable identities, so only its result proof is kept.
@@ -63,16 +58,33 @@ pub(super) fn validate(sql: &str, schema: &Schema, path: &Path) -> Result<Valida
     })
 }
 
-struct Validator<'a> {
-    schema: &'a Schema,
+struct Validator {
+    schema: Schema,
     refs: BTreeMap<String, String>,
     parameters: BTreeMap<String, ValueSet>,
     compound_results: Vec<Vec<Vec<Option<ValueSet>>>>,
 }
 
-impl Validator<'_> {
+impl Validator {
     fn statement(&mut self, tokens: &[Token]) -> Result<Vec<Option<ValueSet>>> {
         let statement = parse_statement(tokens);
+        add_ctes_to_schema(tokens, &mut self.schema);
+        add_derived_tables_to_schema(tokens, &mut self.schema);
+        let ctes = match &statement {
+            Statement::Select(value) => &value.ctes,
+            Statement::Insert(value) => &value.ctes,
+            Statement::Update(value) => &value.ctes,
+            Statement::Delete(value) => &value.ctes,
+            Statement::Unsupported => &Vec::new(),
+        };
+        for cte in ctes {
+            self.relation(&cte.name, &cte.columns, &cte.body)?;
+        }
+        if matches!(statement, Statement::Select(_)) {
+            for (alias, body) in derived_table_bodies(tokens) {
+                self.relation(&alias, &[], body)?;
+            }
+        }
         let arms = top_level_compound_arms(tokens);
         if matches!(statement, Statement::Select(_)) && arms.len() > 1 {
             let has_declared_source = arms.iter().any(|arm| {
@@ -88,7 +100,14 @@ impl Validator<'_> {
                 && arms.iter().any(|arm| {
                     top_level_select_list(arm).is_some_and(|list| {
                         split_top_level_commas(list).iter().any(|projection| {
-                            matches!(*projection, [Token::Star] | [_, Token::Dot, Token::Star])
+                            let projection = if projection.first().is_some_and(|token| {
+                                token_is_word(token, "DISTINCT") || token_is_word(token, "ALL")
+                            }) {
+                                &projection[1..]
+                            } else {
+                                projection
+                            };
+                            matches!(projection, [Token::Star] | [_, Token::Dot, Token::Star])
                         })
                     })
                 })
@@ -107,21 +126,8 @@ impl Validator<'_> {
         }
         let mut result = Vec::new();
         let source_has_own_scope = matches!(&statement, Statement::Insert(insert) if matches!(insert.source, InsertSource::Select(_)));
-        let ctes = match &statement {
-            Statement::Select(value) => &value.ctes,
-            Statement::Insert(value) => &value.ctes,
-            Statement::Update(value) => &value.ctes,
-            Statement::Delete(value) => &value.ctes,
-            Statement::Unsupported => &Vec::new(),
-        };
-        for cte in ctes {
-            self.nested(&cte.body)?;
-        }
         match statement {
             Statement::Select(select) => {
-                for (_, body) in derived_table_bodies(tokens) {
-                    self.nested(body)?;
-                }
                 for expression in split_top_level_commas(&select.body.select_list) {
                     result.push(self.expression(expression_without_alias(expression), None)?);
                 }
@@ -282,9 +288,26 @@ impl Validator<'_> {
 
     fn nested(&mut self, tokens: &[Token]) -> Result<Vec<Option<ValueSet>>> {
         let outer_refs = std::mem::replace(&mut self.refs, local_refs(tokens));
+        let outer_schema = self.schema.clone();
         let result = self.statement(tokens);
         self.refs = outer_refs;
+        self.schema = outer_schema;
         result
+    }
+
+    fn relation(&mut self, name: &str, names: &[String], body: &[Token]) -> Result<()> {
+        let proofs = self.nested(body)?;
+        if let Some(mut columns) = infer_cte_columns(body, names, &self.schema) {
+            for column in columns.values_mut() {
+                if let Some(Some(set)) = proofs.get(column.ordinal as usize) {
+                    column.column_type = ValueType::ValueSet(set.clone());
+                }
+            }
+            self.schema
+                .tables
+                .insert(name.to_ascii_lowercase(), columns);
+        }
+        Ok(())
     }
 
     fn column(&self, tokens: &[Token]) -> Result<Option<ValueSet>> {
@@ -308,7 +331,7 @@ impl Validator<'_> {
                 )));
             }
         }
-        Ok(resolve_column_ref(self.schema, &self.refs, &column)
+        Ok(resolve_column_ref(&self.schema, &self.refs, &column)
             .and_then(|column| as_set(&column.column_type))
             .cloned())
     }

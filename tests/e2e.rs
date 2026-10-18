@@ -2915,6 +2915,11 @@ fn value_set_snapshot_shapes_do_not_hide_invalid_or_transformed_values() {
         "update notices set status = json_object('state', status)",
         "select status from notices union select 'draft'",
         "select * from notices union select id, status, null from other",
+        "select distinct * from notices union select id, status, null from other",
+        "select distinct notices.* from notices union select id, status, null from other",
+        "select all * from notices union select id, status, null from other",
+        "with source as (select @state as status from other union all select status from notices where status=@state) select status from source where status='drfat'",
+        "select status from (select @state as status from other union all select status from notices where status=@state) source where status='drfat'",
     ] {
         let (_dir, config) = value_set_fixture(sql);
         let error = analyze_project(&config).unwrap_err().to_string();
@@ -2963,14 +2968,25 @@ fn value_set_insert_select_proves_target_projection_identity() {
 
 #[test]
 fn compound_results_use_parameters_bound_by_a_later_arm() {
-    let (_dir, config) = value_set_fixture(
+    for sql in [
         "select @state as status union all select status from notices where status=@state",
+        "with source as (select @state as status from other union all select status from notices where status=@state) select status from source",
+        "with source(renamed) as (select @state as status from other union all select status from notices where status=@state) select renamed from source",
+        "select status from (select @state as status from other union all select status from notices where status=@state) source",
+        "with source as (select @state as status from other union all select status from notices where status=@state), forwarded as (select status from source) select status from forwarded",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let project = analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert_eq!(
+            project.queries[0].columns[0].column_type.rust_type(),
+            "crate::value_sets::NoticeStatus",
+            "{sql}"
+        );
+    }
+    let (_dir, config) = value_set_fixture(
+        "with source as (select @state as status from other union all select status from notices where status=@state) insert into notices(status) select status from source",
     );
-    let project = analyze_project(&config).unwrap();
-    assert_eq!(
-        project.queries[0].columns[0].column_type.rust_type(),
-        "crate::value_sets::NoticeStatus"
-    );
+    analyze_project(&config).unwrap();
 }
 
 #[test]
