@@ -302,6 +302,69 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_analysis_declaration_admits_empty_index_but_rejects_data() {
+        for deterministic in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let migrations = temp.path().join("migrations");
+            fs::create_dir(&migrations).unwrap();
+            fs::write(
+                migrations.join("001_spellings.sql"),
+                "create table spellings(email text);
+                 create index spelling_identity on spellings(identity_key(email));",
+            )
+            .unwrap();
+            let init = temp.path().join("init.sql");
+            fs::write(
+                &init,
+                format!(
+                    "-- marmot: scalar identity_key 1{}\n",
+                    if deterministic { " deterministic" } else { "" }
+                ),
+            )
+            .unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            let result =
+                migrate_connection_with_init_sql(&conn, &migrations, TRACKING_TABLE, Some(&init));
+            if !deterministic {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("non-deterministic functions")
+                );
+                assert!(applied_versions(&conn).is_empty());
+                assert!(conn.is_autocommit());
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(applied_versions(&conn), ["001_spellings"]);
+            conn.prepare("select email from spellings where identity_key(email)=?1")
+                .unwrap();
+            fs::write(
+                migrations.join("002_seed.sql"),
+                "insert into spellings values('member@example.test');",
+            )
+            .unwrap();
+            let error =
+                migrate_connection_with_init_sql(&conn, &migrations, TRACKING_TABLE, Some(&init))
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("analysis-only scalar cannot execute")
+            );
+            assert_eq!(applied_versions(&conn), ["001_spellings"]);
+            assert_eq!(
+                conn.query_row("select count(*) from spellings", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(conn.is_autocommit());
+        }
+    }
+
+    #[test]
     fn invalid_scalar_declarations_fail_before_migrations() {
         let temp = tempfile::tempdir().unwrap();
         let migrations = temp.path().join("migrations");

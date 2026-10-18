@@ -224,6 +224,11 @@ or application data. Register the real function on every application connection.
 Cast function results when they appear in selected columns, because the stub
 does not define a result type.
 
+For a deterministic application function, add the optional suffix:
+`-- marmot: scalar FUNCTION_NAME ARITY deterministic`. This lets Marmot prepare
+expression-index schemas and create an index on an empty table. The stub still
+rejects execution, so reset or migration cannot use it to populate that index.
+
 Generate Rust files:
 
 ```sh
