@@ -3016,6 +3016,52 @@ fn scalar_id_subqueries_validate_declared_predicates_without_enum_result_proofs(
 }
 
 #[test]
+fn ordinary_wrappers_do_not_hide_declared_subquery_filters() {
+    for sql in [
+        "select coalesce((select n.id from notices n where n.status='draft' limit 1), 0) as found",
+        "select exists(select 1 from notices n where n.status='draft') as found",
+        "select coalesce((select json_object('state', n.status) from notices n limit 1), '{}') as found",
+        "select coalesce((select json_group_array(n.status) from (select status from notices where status='draft') n), '[]') as found",
+        "select cast(json_group_array(status) as text) as found from notices",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let project = analyze_project(&config).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        fs::remove_file(config.source_root.join("value_sets.toml")).unwrap();
+        let baseline = analyze_project(&config).unwrap();
+        assert_eq!(
+            project.queries[0].columns, baseline.queries[0].columns,
+            "{sql}"
+        );
+    }
+    for sql in [
+        "select coalesce((select n.id from notices n where n.status='drfat' limit 1), 0) as found",
+        "select coalesce((select n.status from notices n limit 1), '') as found",
+        "select exists(select 1 from notices n where n.status='drfat') as found",
+        "select coalesce((select json_group_array(n.status) from notices n where n.status='drfat'), '[]') as found",
+        "select json_group_array(upper(status)) from notices",
+        "update notices set status=json_group_array(status)",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{sql}: {error}");
+    }
+    for sql in [
+        "select (select o.id from other o where o.status=@state limit 1) as found from notices n where n.status=@state",
+        "select coalesce((select o.id from other o where o.status=@state limit 1), 0) as found from notices n where n.status=@state",
+        "select exists(select 1 from other o where o.status=@state) as found from notices n where n.status=@state",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let registry = config.source_root.join("value_sets.toml");
+        let mut source = fs::read_to_string(&registry).unwrap();
+        source
+            .push_str("\n[sets.OtherStatus]\nvalues = [\"ready\"]\ncolumns = [\"other.status\"]\n");
+        fs::write(registry, source).unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("conflicting"), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn value_set_snapshot_and_insert_select_execute_through_generated_bindings() {
     let (_dir, config) = value_set_fixture(
         "select cast(json_object('state', n.status) as text) as payload from notices n union all select json_object('state', o.status) from other o",

@@ -753,7 +753,7 @@ SQL validation follows the declared column through aliases, joins, named params,
 comparisons, `IN`, CASE and direct INSERT/UPDATE values. It rejects invalid
 literals and conflicting parameter types. Expressions that transform a declared
 value without preserving its identity fail generation; return the column and
-transform it in Rust. JSON_OBJECT and JSON_ARRAY can pack validated arguments
+transform it in Rust. JSON_OBJECT, JSON_ARRAY and JSON_GROUP_ARRAY can pack validated arguments
 into SQLite text, including through CAST to TEXT. Their existing generated
 result representation stays unchanged and never becomes an enum. Each compound
 SELECT arm is validated with its own table bindings; enum result positions and

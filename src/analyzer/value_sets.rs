@@ -374,7 +374,7 @@ impl Validator {
         if let [Token::Word(function), Token::OpenParen, ..] = tokens {
             if matches!(
                 function.to_ascii_uppercase().as_str(),
-                "JSON_OBJECT" | "JSON_ARRAY"
+                "JSON_OBJECT" | "JSON_ARRAY" | "JSON_GROUP_ARRAY"
             ) && matching_open_paren(tokens, tokens.len() - 1) == Some(1)
             {
                 if expected.is_some() {
@@ -393,7 +393,7 @@ impl Validator {
                     let value = &inner[..as_index];
                     if matches!(inner.get(as_index + 1), Some(token) if token_is_word(token, "TEXT"))
                         && as_index + 2 == inner.len()
-                        && matches!(value.first(), Some(Token::Word(name)) if matches!(name.to_ascii_uppercase().as_str(), "JSON_OBJECT" | "JSON_ARRAY"))
+                        && matches!(value.first(), Some(Token::Word(name)) if matches!(name.to_ascii_uppercase().as_str(), "JSON_OBJECT" | "JSON_ARRAY" | "JSON_GROUP_ARRAY"))
                     {
                         return self.expression(value, expected);
                     }
@@ -571,9 +571,21 @@ impl Validator {
         Ok(result)
     }
 
-    fn reject_typed(&self, tokens: &[Token]) -> Result<()> {
-        for index in 0..tokens.len() {
+    fn reject_typed(&mut self, tokens: &[Token]) -> Result<()> {
+        let mut index = 0;
+        while index < tokens.len() {
+            if matches!(tokens[index], Token::OpenParen)
+                && tokens.get(index + 1).is_some_and(|token| {
+                    token_is_word(token, "SELECT") || token_is_word(token, "WITH")
+                })
+            {
+                let (body, after) = collect_balanced_parens(tokens, index);
+                self.expression(body, None)?;
+                index = after;
+                continue;
+            }
             if index > 0 && matches!(tokens[index - 1], Token::Dot) {
+                index += 1;
                 continue;
             }
             if let Some(column) = column_ref_starting_at(tokens, index) {
@@ -595,6 +607,7 @@ impl Validator {
                     "unsupported expression involving a typed parameter",
                 ));
             }
+            index += 1;
         }
         Ok(())
     }

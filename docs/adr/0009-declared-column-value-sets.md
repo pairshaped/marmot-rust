@@ -81,7 +81,7 @@ Outside the explicit JSON serialization boundary below, when a declared column p
 
 ## JSON snapshots, compounds and INSERT SELECT
 
-`json_object` and `json_array` may pack declared values into a text result.
+`json_object`, `json_array` and `json_group_array` may pack declared values into a text result.
 Marmot validates each argument, including comparisons, typed parameters and CASE
 literals, then treats the JSON result as SQLite text, preserving its existing generated result representation. `CAST` of that JSON packing to
 TEXT has the same boundary. JSON packaging cannot supply an enum result or an
@@ -117,3 +117,9 @@ Their predicates receive the same literal and parameter validation as a top-leve
 SELECT, with local aliases shadowing outer aliases. They require explicit result
 projections. A scalar subquery cannot return a declared enum or prove an enum
 assignment; those uses remain rejected.
+
+An ordinary wrapper or EXISTS predicate cannot hide a nested SELECT. Marmot
+validates each nested query in its local and correlated relation scope before
+checking the surrounding expression. A nested query must return an ordinary
+value or explicit JSON packing; returning an enum remains unsupported. Direct
+transformations of declared values remain rejected.
