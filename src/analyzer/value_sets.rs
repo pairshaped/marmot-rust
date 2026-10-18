@@ -44,11 +44,30 @@ struct Validator<'a> {
 
 impl Validator<'_> {
     fn statement(&mut self, tokens: &[Token]) -> Result<()> {
-        match parse_statement(tokens) {
+        if top_level(tokens).iter().any(|(_, token)| {
+            ["UNION", "EXCEPT", "INTERSECT"]
+                .iter()
+                .any(|keyword| token_is_word(token, keyword))
+        }) {
+            let outer_refs = self.refs.clone();
+            self.refs = table_references(tokens);
+            let result = self.reject_typed(tokens);
+            self.refs = outer_refs;
+            result?;
+        }
+        let statement = parse_statement(tokens);
+        let ctes = match &statement {
+            Statement::Select(value) => &value.ctes,
+            Statement::Insert(value) => &value.ctes,
+            Statement::Update(value) => &value.ctes,
+            Statement::Delete(value) => &value.ctes,
+            Statement::Unsupported => &Vec::new(),
+        };
+        for cte in ctes {
+            self.nested(&cte.body)?;
+        }
+        match statement {
             Statement::Select(select) => {
-                for cte in &select.ctes {
-                    self.nested(&cte.body)?;
-                }
                 for (_, body) in derived_table_bodies(tokens) {
                     self.nested(body)?;
                 }
@@ -128,6 +147,11 @@ impl Validator<'_> {
                 if let Some(condition) = delete.where_clause {
                     self.expression(&condition, None)?;
                 }
+                if let Some(returning) = delete.returning {
+                    for part in split_top_level_commas(&returning) {
+                        self.expression(expression_without_alias(part), None)?;
+                    }
+                }
             }
             Statement::Unsupported => self.reject_typed(tokens)?,
         }
@@ -195,6 +219,14 @@ impl Validator<'_> {
             tokens = &tokens[1..tokens.len() - 1];
         }
         if tokens.is_empty() {
+            return Ok(None);
+        }
+        if token_is_word(&tokens[0], "SELECT") || token_is_word(&tokens[0], "WITH") {
+            let outer_refs = self.refs.clone();
+            self.refs.extend(table_references(tokens));
+            let result = self.reject_typed(tokens);
+            self.refs = outer_refs;
+            result?;
             return Ok(None);
         }
         if token_is_word(&tokens[0], "BY") {

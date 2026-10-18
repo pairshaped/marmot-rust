@@ -2274,3 +2274,22 @@ fn value_sets_reject_predicates_in_text_assignments() {
         assert!(error.contains("value set"), "{error}");
     }
 }
+
+#[test]
+fn value_sets_do_not_silently_bypass_unreviewed_query_shapes() {
+    for sql in [
+        "select status from notices union select 'drfat'",
+        "select 'draft' union select status from notices",
+        "select (select n.status from notices n where n.status='drfat') as status from other",
+        "delete from notices returning case status when 'drfat' then 'draft' else status end as status",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        assert!(
+            analyze_project(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("value set"),
+            "{sql}"
+        );
+    }
+}

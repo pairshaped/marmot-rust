@@ -3982,16 +3982,14 @@ fn common_case_branch_type(branch_types: Vec<ValueType>) -> Option<CaseType> {
     if let Some(set) = branch_types
         .iter()
         .find(|kind| matches!(kind, ValueType::ValueSet(_)))
-    {
-        if branch_types
+        && branch_types
             .iter()
             .all(|kind| kind == set || *kind == ValueType::String)
-        {
-            return Some(CaseType {
-                column_type: set.clone(),
-                mixed: false,
-            });
-        }
+    {
+        return Some(CaseType {
+            column_type: set.clone(),
+            mixed: false,
+        });
     }
     if branch_types.iter().all(|column_type| column_type == &first) {
         Some(CaseType {
