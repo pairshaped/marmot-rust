@@ -18,7 +18,23 @@ The file is schema metadata scoped to that generator owner. It is separate from 
 
 Marmot emits `value_sets.rs` under the configured shared output folder. The owner declares that module at the configured absolute Rust path. It is a shared generated artifact alongside temporal types and view installation SQL. Normal managed-output reconciliation removes it when the declaration disappears; the owner removes its module declaration in the same change. The set name is the Rust enum name; values become PascalCase variants. Invalid Rust names, duplicate values, variant collisions, duplicate column bindings, unknown columns, and non-TEXT columns fail generation. Multiple columns share a type only by appearing in the same set's `columns` list. Columns with the same name or vocabulary don't implicitly share a type. Declaration and SQL identifiers follow SQLite's case-insensitive identity rules.
 
-One declaration owns each generated enum and its database mappings. The initial boundary is one generator owner; it doesn't claim that another independently configured owner adopts the same column. Cross-owner adoption needs an explicit shared type owner and import contract before use. Declarations never inspect stored rows to guess a vocabulary.
+One home owner declares each generated enum and its database mappings. Declarations never inspect stored rows to guess a vocabulary.
+
+## Cross-owner imports
+
+Other owners import home registries directly from their own `source_root/value_sets.toml`, following [ADR 0010](0010-scoped-tenant-ids.md):
+
+```toml
+imports = ["../../curling_core/src/value_sets.toml"]
+```
+
+Paths resolve relative to the importing source root. An imported home registry must declare sets and must not itself import another registry. Imports expose every set and column binding in that registry; they are not transitive. Duplicate set names or column bindings across local and imported declarations fail generation, as do missing registries. A query cannot refer to an undeclared set. Diagnostics identify the registry or companion SQL responsible.
+
+A home module can use `crate::value_sets` for local-only declarations, or its crate's absolute Rust path, such as `curling_core::value_sets`, for sharing. Imported homes must use a crate-named path, since `crate::` would name the importing crate. Generated parameters and results use the home's exact path. Importers emit no enum copy. An owner can import sets and declare its own sets in the same registry; only its local declarations are emitted in its shared output folder.
+
+For Curling, `curling_core/src/value_sets.toml` declares shared sets with `module = "curling_core::value_sets"`. Feature crates import that registry with the relative path above. The Root owner's configured source root is `apps/curling/platform/src`, so its `src/value_sets.toml` imports `"../crates/curling_core/src/value_sets.toml"`; `marmot.toml` needs no new option. Each owner generates independently against the same schema. Its analysis, output and freshness receipts include imported registry contents, so a vocabulary change invalidates every importing owner's generated bindings.
+
+Imported columns receive the same literal validation and strict unknown-value reads as local columns. Importing a registry authorizes no stored-value rewrite and does not relax the adoption boundary below. Normal managed-output reconciliation removes an importer's obsolete local enum output when its last local declaration is replaced by an import.
 
 ## Parameters, results and reads
 
