@@ -12,5 +12,7 @@ defines the public boundary and implementation entry points.
 - [0007: Use Rust-neutral CLI configuration](0007-rust-cli-configuration.md)
 - [0008: Treat SQLite views as declarative database code](0008-declarative-sqlite-views.md)
 
+- [0009: Declare column value sets](0009-declared-column-value-sets.md)
+
 Numbering is unique and append-only. Update the owning decision when the design
 changes. Beans own delivery status and do not belong in ADR status sections.
