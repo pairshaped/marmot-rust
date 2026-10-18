@@ -2240,3 +2240,37 @@ fn value_sets_follow_view_column_identity_without_rewriting_storage() {
         }
     }
 }
+
+#[test]
+fn value_sets_keep_window_partitions_and_case_sorting_typed() {
+    let (_dir, config) = value_set_fixture(
+        "with ranked as (select status, row_number() over (partition by status order by id desc) as position from notices where status in (@draft, @published)) select status from ranked where position <= @limit order by case status when @draft then 0 when @published then 1 end asc",
+    );
+    let project = analyze_project(&config).unwrap();
+    assert_eq!(
+        project.queries[0].columns[0].column_type.rust_type(),
+        "crate::value_sets::NoticeStatus"
+    );
+    assert_eq!(
+        project.queries[0]
+            .parameters
+            .iter()
+            .find(|p| p.name == "draft")
+            .unwrap()
+            .column_type
+            .rust_type(),
+        "crate::value_sets::NoticeStatus"
+    );
+}
+
+#[test]
+fn value_sets_reject_predicates_in_text_assignments() {
+    for sql in [
+        "insert into notices (status) values (1 = 1)",
+        "update notices set status = (id in (1, 2))",
+    ] {
+        let (_dir, config) = value_set_fixture(sql);
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value set"), "{error}");
+    }
+}

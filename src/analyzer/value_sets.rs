@@ -197,11 +197,52 @@ impl Validator<'_> {
         if tokens.is_empty() {
             return Ok(None);
         }
+        if token_is_word(&tokens[0], "BY") {
+            return self.expression(&tokens[1..], expected);
+        }
+        if tokens
+            .last()
+            .is_some_and(|token| token_is_word(token, "ASC") || token_is_word(token, "DESC"))
+        {
+            return self.expression(&tokens[..tokens.len() - 1], expected);
+        }
+        if let Some(Token::Word(function)) = tokens.first()
+            && matches!(
+                function.to_ascii_uppercase().as_str(),
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK"
+            )
+            && let Some(over) = tokens.iter().position(|token| token_is_word(token, "OVER"))
+            && matches!(tokens.get(over + 1), Some(Token::OpenParen))
+            && matches!(tokens.last(), Some(Token::CloseParen))
+        {
+            if expected.is_some() {
+                return Err(invalid(
+                    "a window rank cannot produce a declared text value",
+                ));
+            }
+            let window = &tokens[over + 2..tokens.len() - 1];
+            for keyword in ["PARTITION", "ORDER"] {
+                if let Some(start) = top_level_keyword(window, keyword) {
+                    let end = if keyword == "PARTITION" {
+                        top_level_keyword(window, "ORDER").unwrap_or(window.len())
+                    } else {
+                        window.len()
+                    };
+                    for part in split_top_level_commas(&window[start + 2..end]) {
+                        self.expression(part, None)?;
+                    }
+                }
+            }
+            return Ok(None);
+        }
         if token_is_word(&tokens[0], "CASE") {
             return self.case(tokens, expected);
         }
         for (index, token) in top_level(tokens) {
             if token_is_word(token, "AND") || token_is_word(token, "OR") {
+                if expected.is_some() {
+                    return Err(invalid("a predicate cannot produce a declared text value"));
+                }
                 self.expression(&tokens[..index], None)?;
                 self.expression(&tokens[index + 1..], None)?;
                 return Ok(None);
@@ -209,6 +250,9 @@ impl Validator<'_> {
         }
         for (index, token) in top_level(tokens) {
             if comparison_operator(token) || token_is_word(token, "IS") {
+                if expected.is_some() {
+                    return Err(invalid("a comparison cannot produce a declared text value"));
+                }
                 let left = self.expression(&tokens[..index], None)?;
                 let right_tokens = if tokens
                     .get(index + 1)
@@ -223,6 +267,9 @@ impl Validator<'_> {
                 return Ok(None);
             }
             if token_is_word(token, "IN") {
+                if expected.is_some() {
+                    return Err(invalid("IN cannot produce a declared text value"));
+                }
                 let left_end = if index > 0 && token_is_word(&tokens[index - 1], "NOT") {
                     index - 1
                 } else {
@@ -333,7 +380,7 @@ impl Validator<'_> {
                     .is_some()
                 {
                     return Err(invalid(format!(
-                        "unsupported expression involving declared column {}; return the column and transform it in Rust",
+                        "unsupported expression {tokens:?} involving declared column {}; return the column and transform it in Rust",
                         column.column
                     )));
                 }
@@ -456,7 +503,18 @@ pub(super) fn annotate_views(conn: &Connection, schema: &mut Schema, path: &Path
                 .ok_or_else(|| invalid(format!("view {name} has no SELECT")))?;
             let body = &sql[start..];
             validate(body, schema, path)?;
-            let (columns, _) = result_columns(conn, schema, path, body, body)?;
+            let view_query = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+            let (mut columns, _) = result_columns(conn, schema, path, &view_query, &view_query)?;
+            let inferred =
+                select_expression_inferences(body, schema, &outer_join_nullable_tables(body));
+            for (index, column) in columns.iter_mut().enumerate() {
+                if let Some(inference) = inferred.by_index.get(index).and_then(Option::as_ref)
+                    && let Some(kind @ ValueType::ValueSet(_)) = &inference.column_type
+                {
+                    column.column_type = kind.clone();
+                    column.nullable = inference.inferred_nullable.unwrap_or(column.nullable);
+                }
+            }
             let names = schema.column_names_in_table_order(name);
             for (column, name_column) in columns.iter().zip(names) {
                 if let Some(set) = as_set(&column.column_type) {
