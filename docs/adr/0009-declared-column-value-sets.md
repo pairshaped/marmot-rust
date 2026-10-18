@@ -36,6 +36,35 @@ For Curling, `curling_core/src/value_sets.toml` declares shared sets with `modul
 
 Imported columns receive the same literal validation and strict unknown-value reads as local columns. Importing a registry authorizes no stored-value rewrite and does not relax the adoption boundary below. Normal managed-output reconciliation removes an importer's obsolete local enum output when its last local declaration is replaced by an import.
 
+## Rust attributes
+
+A set may opt into Rust attributes on its generated enum, so an existing public
+contract can use the home enum without keeping a handwritten duplicate:
+
+```toml
+[sets.ConversationState]
+values = ["idle", "running"]
+columns = ["assistant_conversations.state"]
+rust_attributes = [
+  '#[derive(serde::Serialize, serde::Deserialize, ts_rs::TS)]',
+  '#[serde(rename_all = "snake_case")]',
+  '#[cfg_attr(feature = "client-contract-generation", derive(schemars::JsonSchema))]',
+]
+```
+
+Each string must parse as exactly one outer Rust attribute; malformed syntax,
+inner attributes and trailing tokens fail generation with the registry path.
+Attributes are emitted in declaration order on the enum, alongside its standard
+traits. Rust checks macro resolution, feature selection and attribute meaning
+when the owner compiles. The owner supplies any dependencies these attributes
+require. Marmot adds no serialization, TypeScript or schema dependency to its
+default output. Sets without attributes retain byte-identical output.
+
+Attributes do not change SQL validation or database mappings. Adopting an
+existing wire contract must prove that its serialized values, TypeScript type
+and JSON schema still agree with that contract. Shared callers re-export the
+home enum instead of retaining a second enum or string mapping.
+
 ## Parameters, results and reads
 
 Known variants implement `rusqlite::ToSql` and `FromSql`, with an `as_str` method for existing text boundaries. Nullable params and results use `Option<Enum>`. There is no string constructor that accepts arbitrary values. `FromSql` rejects unknown stored text with an error that retains the value and type name. Strict rejection is the fixed read policy for every declared column. Supporting lossless historical reads later requires separate read and write types so an unknown read cannot become an accepted write by accident.
