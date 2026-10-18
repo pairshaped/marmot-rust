@@ -145,10 +145,11 @@ pub fn reset_with_views_bootstrap_and_seeds_with_init_sql_from(
 ) -> Result<(Vec<String>, Vec<String>, views::ViewAudit), ResetError> {
     let database_path = database_path.as_ref();
     drop_database(database_path)?;
-    let applied_migrations = migrations::migrate_from_with_tracking_table(
+    let applied_migrations = migrations::migrate_from_with_tracking_table_and_init_sql(
         database_path,
         migrations_dir,
         tracking_table,
+        init_sql,
     )?;
     let audit =
         views::reconcile_database_with_init_sql(database_path, source_root.as_ref(), init_sql)?;
@@ -228,6 +229,66 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[test]
+    fn reset_declared_deterministic_index_does_not_execute_analysis_scalar() {
+        let temp = tempfile::tempdir().unwrap();
+        let migrations = temp.path().join("migrations");
+        let seeds = temp.path().join("seeds");
+        let source = temp.path().join("source");
+        for directory in [&migrations, &seeds, &source] {
+            fs::create_dir(directory).unwrap();
+        }
+        let init = temp.path().join("init.sql");
+        fs::write(&init, "-- marmot: scalar application_key 1 deterministic\n").unwrap();
+        fs::write(migrations.join("001_expression.sql"),
+            "create table spellings(value text); create index spelling_key on spellings(application_key(value));").unwrap();
+        fs::write(seeds.join("001_spelling.sql"), "select 1;").unwrap();
+        let database = temp.path().join("app.db");
+        let (applied, _, _) = reset_with_views_bootstrap_and_seeds_with_init_sql_from(
+            &database,
+            &migrations,
+            None::<&Path>,
+            &seeds,
+            &source,
+            migrations::TRACKING_TABLE,
+            Some(&init),
+        )
+        .unwrap();
+        assert_eq!(applied, ["001_expression"]);
+        let conn = Connection::open(&database).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from spellings", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        fs::write(
+            seeds.join("001_spelling.sql"),
+            "insert into spellings values('Must use application normalization')",
+        )
+        .unwrap();
+        assert!(matches!(
+            reset_with_views_bootstrap_and_seeds_with_init_sql_from(
+                &database,
+                &migrations,
+                None::<&Path>,
+                &seeds,
+                &source,
+                migrations::TRACKING_TABLE,
+                Some(&init),
+            ),
+            Err(ResetError::SeedError(_))
+        ));
+        let conn = Connection::open(&database).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from spellings", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn reset_deletes_database_then_runs_migrations_and_seeds() {

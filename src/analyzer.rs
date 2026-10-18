@@ -287,7 +287,9 @@ pub(crate) fn register_analysis_functions(conn: &Connection, path: &Path, sql: &
         let mut parts = declaration.split_whitespace();
         let name = parts.next().unwrap_or_default();
         let arity = parts.next().and_then(|value| value.parse::<i32>().ok());
+        let option = parts.next();
         if parts.next().is_some()
+            || !matches!(option, None | Some("deterministic"))
             || !name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
             || !name
                 .chars()
@@ -297,14 +299,18 @@ pub(crate) fn register_analysis_functions(conn: &Connection, path: &Path, sql: &
             return Err(Error::InvalidAnalysisFunction {
                 path: path.to_path_buf(),
                 line: index + 1,
-                reason: "expected `-- marmot: scalar FUNCTION_NAME ARITY` with arity 0..127"
+                reason: "expected `-- marmot: scalar FUNCTION_NAME ARITY [deterministic]` with arity 0..127"
                     .to_string(),
             });
+        }
+        let mut flags = rusqlite::functions::FunctionFlags::SQLITE_UTF8;
+        if option == Some("deterministic") {
+            flags |= rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC;
         }
         conn.create_scalar_function(
             name,
             arity.expect("validated arity"),
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            flags,
             |_| -> rusqlite::Result<rusqlite::types::Null> {
                 Err(rusqlite::Error::UserFunctionError(Box::new(
                     std::io::Error::other("analysis-only scalar cannot execute"),
@@ -4222,6 +4228,71 @@ mod tests {
             register_analysis_functions(&conn, path, "-- marmot: scalar invalid-name 1\n"),
             Err(Error::InvalidAnalysisFunction { line: 1, .. })
         ));
+    }
+
+    #[test]
+    fn deterministic_analysis_scalar_prepares_indexed_schema_without_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        let path = Path::new("marmot_init.sql");
+        register_analysis_functions(
+            &conn,
+            path,
+            "-- marmot: scalar identity_key 1 deterministic\n",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "create table spellings(email text);
+            create index spelling_identity on spellings(identity_key(email));",
+        )
+        .unwrap();
+        conn.prepare("select email from spellings where identity_key(email)=?1")
+            .unwrap();
+        for query in [
+            "select identity_key('member@example.test')",
+            "select identity_key(NULL)",
+        ] {
+            let error = conn
+                .query_row(query, [], |row| row.get::<_, Option<String>>(0))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("analysis-only scalar cannot execute")
+            );
+        }
+        assert!(
+            conn.execute("insert into spellings values('member@example.test')", [])
+                .is_err()
+        );
+        assert_eq!(
+            conn.query_row("select count(*) from spellings", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn deterministic_analysis_scalar_rejects_unknown_or_extra_declaration_options() {
+        let conn = Connection::open_in_memory().unwrap();
+        for declaration in [
+            "identity_key 1 stable",
+            "identity_key 1 deterministic extra",
+            "identity_key 128 deterministic",
+            "identity_key -1 deterministic",
+        ] {
+            assert!(
+                matches!(
+                    register_analysis_functions(
+                        &conn,
+                        Path::new("init.sql"),
+                        &format!("-- marmot: scalar {declaration}\n")
+                    ),
+                    Err(Error::InvalidAnalysisFunction { line: 1, .. })
+                ),
+                "{declaration}"
+            );
+        }
     }
 
     fn write_sql_file(module_path: &Path, file_name: &str, sql: impl AsRef<str>) {
