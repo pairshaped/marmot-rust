@@ -2009,6 +2009,204 @@ fn value_sets_validate_literals_by_column_identity() {
 }
 
 #[test]
+fn value_set_rust_controls_preserve_defaults_and_reject_invalid_settings() {
+    let (_dir, config) = value_set_fixture("select status from notices");
+    let declarations = config.source_root.join("value_sets.toml");
+    let original = fs::read_to_string(&declarations).unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    let output = config.output.join("value_sets.rs");
+    let default = fs::read(&output).unwrap();
+    fs::write(&declarations, format!("{original}\n[sets.NoticeStatus.rust]\nvisibility = 'pub'\nas_str_visibility = 'pub'\nemission = 'always'\n")).unwrap();
+    emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+    assert_eq!(fs::read(&output).unwrap(), default);
+    for settings in [
+        "visibility = 'private'",
+        "emission = 'sometimes'",
+        "unknown = true",
+        "visibility = 'pub(crate)'\nas_str_visibility = 'pub'",
+    ] {
+        fs::write(
+            &declarations,
+            format!("{original}\n[sets.NoticeStatus.rust]\n{settings}\n"),
+        )
+        .unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(error.contains("value_sets.toml"), "{error}");
+    }
+}
+
+#[test]
+fn value_set_rust_nonruntime_emission_keeps_literal_checks_and_refuses_typed_bindings() {
+    for emission in ["test", "none"] {
+        for sql in [
+            "select status from notices",
+            "select id from notices where status = @status",
+        ] {
+            let (_dir, config) = value_set_fixture(sql);
+            let declarations = config.source_root.join("value_sets.toml");
+            let source = fs::read_to_string(&declarations).unwrap();
+            fs::write(
+                &declarations,
+                format!("{source}\n[sets.NoticeStatus.rust]\nemission = '{emission}'\n"),
+            )
+            .unwrap();
+            let project = analyze_project(&config).unwrap();
+            let error = emit_project(&config, &project).unwrap_err().to_string();
+            assert!(
+                error.contains("NoticeStatus") && error.contains(emission),
+                "{error}"
+            );
+            let mut scoped = project.clone();
+            scoped.scoped_ids.push(marmot::model::ScopedIdDefinition {
+                id_type: marmot::model::ScopedIdType {
+                    name: "NoticeId".into(),
+                    rust_type: "i64".into(),
+                    rust_path: "crate::NoticeId".into(),
+                },
+                gates: vec![marmot::model::ScopedGate {
+                    query: scoped.queries.remove(0),
+                    id_index: 0,
+                }],
+            });
+            let error = emit_project(&config, &scoped).unwrap_err().to_string();
+            assert!(
+                error.contains("NoticeStatus") && error.contains(emission),
+                "{error}"
+            );
+        }
+        let (_dir, config) = value_set_fixture("select id from notices where status = 'legacy'");
+        let declarations = config.source_root.join("value_sets.toml");
+        let source = fs::read_to_string(&declarations).unwrap();
+        fs::write(
+            &declarations,
+            format!("{source}\n[sets.NoticeStatus.rust]\nemission = '{emission}'\n"),
+        )
+        .unwrap();
+        let error = analyze_project(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("legacy") && error.contains("value set"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn value_set_rust_imported_nonruntime_types_are_rejected_by_ordinary_and_scoped_bindings() {
+    for emission in ["test", "none"] {
+        for sql in [
+            "select status from notices",
+            "select id from notices where status = @status",
+        ] {
+            let (_dir, config) = value_set_fixture(sql);
+            let declarations = config.source_root.join("value_sets.toml");
+            let source = fs::read_to_string(&declarations)
+                .unwrap()
+                .replace("crate::value_sets", "home_owner::value_sets");
+            let home = config.source_root.parent().unwrap().join("home");
+            fs::create_dir(&home).unwrap();
+            fs::write(
+                home.join("value_sets.toml"),
+                format!("{source}\n[sets.NoticeStatus.rust]\nemission = '{emission}'\n"),
+            )
+            .unwrap();
+            fs::write(&declarations, "imports = ['../home/value_sets.toml']\n").unwrap();
+            let mut project = analyze_project(&config).unwrap();
+            let error = emit_project(&config, &project).unwrap_err().to_string();
+            assert!(
+                error.contains("NoticeStatus") && error.contains(emission),
+                "{error}"
+            );
+            let query = project.queries.remove(0);
+            project.scoped_ids.push(marmot::model::ScopedIdDefinition {
+                id_type: marmot::model::ScopedIdType {
+                    name: "NoticeId".into(),
+                    rust_type: "i64".into(),
+                    rust_path: "crate::NoticeId".into(),
+                },
+                gates: vec![marmot::model::ScopedGate { query, id_index: 0 }],
+            });
+            let error = emit_project(&config, &project).unwrap_err().to_string();
+            assert!(
+                error.contains("NoticeStatus") && error.contains(emission),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn value_set_rust_emission_compiles_private_and_test_only_types_without_dead_code() {
+    for emission in ["always", "public_adapter", "test", "none"] {
+        let (_dir, config) = value_set_fixture("select id from notices where status = 'draft'");
+        let declarations = config.source_root.join("value_sets.toml");
+        let source = fs::read_to_string(&declarations).unwrap();
+        let controls = if emission == "public_adapter" {
+            "visibility = 'pub'\nas_str_visibility = 'pub(crate)'\nemission = 'always'".to_string()
+        } else {
+            format!("visibility = 'pub(crate)'\nemission = '{emission}'")
+        };
+        fs::write(
+            &declarations,
+            format!("{source}\n[sets.NoticeStatus.rust]\n{controls}\n"),
+        )
+        .unwrap();
+        emit_project(&config, &analyze_project(&config).unwrap()).unwrap();
+        let generated = fs::read_to_string(config.output.join("value_sets.rs")).unwrap();
+        assert_eq!(
+            generated.matches("#[cfg(test)]").count(),
+            if emission == "test" { 4 } else { 0 }
+        );
+        assert_eq!(generated.contains("enum NoticeStatus"), emission != "none");
+        let runtime = config.source_root.parent().unwrap();
+        fs::write(runtime.join("Cargo.toml"), "[package]\nname='marmot-visibility-owner'\nversion='0.0.0'\nedition='2024'\n[workspace]\n[dependencies]\nrusqlite={version='0.37',features=['bundled']}\n").unwrap();
+        let body = match emission {
+            "always" | "public_adapter" => {
+                "pub fn encode() -> &'static str { value_sets::NoticeStatus::Draft.as_str() }"
+            }
+            "test" => {
+                r#"pub fn encode() -> &'static str { "draft" }
+#[cfg(test)] mod tests { #[test] fn roundtrip() {
+    use rusqlite::types::{FromSql, ValueRef, ToSql};
+    let value = super::value_sets::NoticeStatus::column_result(ValueRef::Text(b"draft")).unwrap();
+    assert_eq!(value.as_str(), "draft");
+    assert_eq!(value.to_sql().unwrap(), rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(b"draft")));
+    assert!(super::value_sets::NoticeStatus::column_result(ValueRef::Text(b"legacy")).is_err());
+} }"#
+            }
+            _ => "pub fn encode() -> &'static str { \"draft\" }",
+        };
+        fs::write(config.source_root.join("lib.rs"), format!("#![deny(warnings)]\n#[path=\"generated/sql/value_sets.rs\"] pub mod value_sets;\n{body}\n")).unwrap();
+        let consumer = runtime.join("consumer");
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::write(consumer.join("Cargo.toml"), "[package]\nname='marmot-visibility-consumer'\nversion='0.0.0'\nedition='2024'\n[workspace]\n[dependencies]\nmarmot-visibility-owner={path='..'}\n").unwrap();
+        let external_type = if emission == "public_adapter" {
+            "pub use marmot_visibility_owner::value_sets::NoticeStatus;\n"
+        } else {
+            ""
+        };
+        fs::write(consumer.join("src/lib.rs"), format!("{external_type}pub fn encode() -> &'static str {{ marmot_visibility_owner::encode() }}\n")).unwrap();
+        let result = isolated_cargo(&consumer, &["check", "--offline"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{emission}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if emission == "test" {
+            let result = isolated_cargo(runtime, &["test", "--offline", "--lib"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn value_sets_generate_typed_nullable_params_and_results() {
     let (_dir, config) = value_set_fixture(
         "select status, previous from notices where status = @status and previous is @previous",
