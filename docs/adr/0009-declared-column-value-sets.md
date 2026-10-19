@@ -30,7 +30,7 @@ imports = ["../../curling_core/src/value_sets.toml"]
 
 Paths resolve relative to the importing source root. An imported home registry must declare sets and must not itself import another registry. Imports expose every set and column binding in that registry; they are not transitive. Duplicate set names or column bindings across local and imported declarations fail generation, as do missing registries. A query cannot refer to an undeclared set. Diagnostics identify the registry or companion SQL responsible.
 
-A home module can use `crate::value_sets` for local-only declarations, or its crate's absolute Rust path, such as `curling_core::value_sets`, for sharing. Imported homes must use a crate-named path, since `crate::` would name the importing crate. Generated parameters and results use the home's exact path. Shared home modules must be public to importing crates, and generated enums are public. A local-only home module may remain crate-local. Importers emit no enum copy. An owner can import sets and declare its own sets in the same registry; only its local declarations are emitted in its shared output folder.
+A home module can use `crate::value_sets` for local-only declarations, or its crate's absolute Rust path, such as `curling_core::value_sets`, for sharing. Imported homes must use a crate-named path, since `crate::` would name the importing crate. Generated parameters and results use the home's exact path. Types used by importing crates require a public home module and public enum. Generated enums are public by default; a home may restrict declarations used only within its crate through the Rust emission controls below. A local-only home module may remain crate-local. Importers emit no enum copy. An owner can import sets and declare its own sets in the same registry; only its local declarations are emitted in its shared output folder.
 
 For Curling, `curling_core/src/value_sets.toml` declares shared sets with `module = "curling_core::value_sets"`. Feature crates import that registry with the relative path above. The Root owner's configured source root is `apps/curling/platform/src`, so its `src/value_sets.toml` imports `"../crates/curling_core/src/value_sets.toml"`; `marmot.toml` needs no new option. Each owner generates independently against the same schema. Its analysis, output and freshness receipts include imported registry contents, so a vocabulary change invalidates every importing owner's generated bindings.
 
@@ -64,6 +64,42 @@ Attributes do not change SQL validation or database mappings. Adopting an
 existing wire contract must prove that its serialized values, TypeScript type
 and JSON schema still agree with that contract. Shared callers re-export the
 home enum instead of retaining a second enum or string mapping.
+
+## Rust visibility and emission
+
+Each set may configure a `rust` object:
+
+```toml
+[sets.NoticeStatus.rust]
+visibility = "pub(crate)"
+as_str_visibility = "pub(crate)"
+emission = "always"
+```
+
+`visibility` accepts `pub` or `pub(crate)` and defaults to `pub`.
+`as_str_visibility` accepts the same values and defaults to the enum's visibility.
+A method cannot be more visible than its enum. `emission` accepts `always`,
+`test` or `none` and defaults to `always`. Unknown settings and values fail
+generation. Omitting these controls preserves the existing generated output.
+The controls belong to the home declaration and remain private generator
+metadata; the exported Marmot `ValueSet`, `Project` and `Config` structures
+remain unchanged.
+
+`always` emits the enum, its text adapter and both SQLite trait implementations
+with the selected visibility. `test` emits those same items under matching
+`#[cfg(test)]` attributes, for vocabularies used only by the home crate's unit
+tests. `none` emits no Rust declaration or implementation. All three modes
+retain the declared vocabulary and column mappings for SQL analysis, including
+strict literal validation.
+
+Rust generation rejects any ordinary query or scoped-gate parameter or result
+that requires a `test` or `none` set, including sets imported from another home.
+It cannot substitute `String` for the missing type or skip vocabulary checks.
+These modes serve metadata-only columns and handwritten owner unit tests.
+Types used by generated bindings require `always`. Rust checks visibility,
+module paths and imported accessibility when each owner compiles, as it does
+for the declared home module. Public payload and serialization contracts must
+retain the visibility their callers require.
 
 ## Parameters, results and reads
 
