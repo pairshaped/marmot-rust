@@ -35,6 +35,9 @@ pub enum SeedError {
         source: std::io::Error,
     },
 
+    #[error("duplicate migration number: {first} and {second}")]
+    DuplicateNumber { first: PathBuf, second: PathBuf },
+
     #[error("invalid seed filename: {path}")]
     InvalidSeedFilename { path: PathBuf },
 
@@ -210,6 +213,9 @@ fn map_error(error: SqlFilesError) -> SeedError {
             SeedError::SeedFileReadError { path, source }
         }
         SqlFilesError::InvalidFilename { path } => SeedError::InvalidSeedFilename { path },
+        SqlFilesError::DuplicateNumber { first, second } => {
+            SeedError::DuplicateNumber { first, second }
+        }
         SqlFilesError::SqlError { path, source } => SeedError::SeedSqlError { path, source },
     }
 }

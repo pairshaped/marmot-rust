@@ -50,6 +50,9 @@ pub enum MigrationError {
         source: std::io::Error,
     },
 
+    #[error("duplicate migration number: {first} and {second}")]
+    DuplicateNumber { first: PathBuf, second: PathBuf },
+
     #[error("invalid migration filename: {path}")]
     InvalidMigrationFilename { path: PathBuf },
 
@@ -200,6 +203,9 @@ fn map_error(error: SqlFilesError) -> MigrationError {
         SqlFilesError::InvalidFilename { path } => {
             MigrationError::InvalidMigrationFilename { path }
         }
+        SqlFilesError::DuplicateNumber { first, second } => {
+            MigrationError::DuplicateNumber { first, second }
+        }
         SqlFilesError::SqlError { path, source } => {
             MigrationError::MigrationSqlError { path, source }
         }
@@ -213,6 +219,34 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[test]
+    fn discovery_rejects_duplicate_numbers_and_names_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("140_first.sql");
+        let second = dir.path().join("140_second.sql");
+        fs::write(&first, "not SQL").unwrap();
+        fs::write(&second, "not SQL").unwrap();
+        let error = versions_from(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("140_first.sql"));
+        assert!(error.to_string().contains("140_second.sql"));
+        assert!(
+            matches!(error, MigrationError::DuplicateNumber { first: a, second: b }
+            if a == first && b == second)
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_distinct_full_versions_in_number_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["141_next.sql", "139_previous.sql", "140_current.sql"] {
+            fs::write(dir.path().join(name), "not SQL").unwrap();
+        }
+        assert_eq!(
+            versions_from(dir.path()).unwrap(),
+            ["139_previous", "140_current", "141_next"]
+        );
+    }
 
     #[test]
     fn forward_migration_validates_views_with_declared_application_scalars() {

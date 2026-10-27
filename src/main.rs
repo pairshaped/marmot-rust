@@ -37,6 +37,11 @@ enum Command {
     Inspect(Args),
     Generate(GenerateArgs),
     Migrate(MigrateArgs),
+    /// Check numbered migration filenames without opening a database.
+    CheckMigrations {
+        #[arg(required = true)]
+        directories: Vec<PathBuf>,
+    },
     Bootstrap(BootstrapArgs),
     Seed(SeedArgs),
     Reset(ResetArgs),
@@ -234,6 +239,13 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::CheckMigrations { directories } = &cli.command {
+        for directory in directories {
+            migrations::versions_from(directory)?;
+            println!("Checked migrations in {}", directory.display());
+        }
+        return Ok(());
+    }
     let mut file_config = FileConfig::read_optional(&cli.config)?;
     if let Some(init_sql) = cli.init_sql {
         for target in file_config.databases.values_mut() {
@@ -242,6 +254,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         file_config.init_sql = Some(init_sql);
     }
     match cli.command {
+        Command::CheckMigrations { .. } => unreachable!(),
         Command::Inspect(args) => {
             for target in configs(args, &file_config)? {
                 let project = analyze_project_with_sources(

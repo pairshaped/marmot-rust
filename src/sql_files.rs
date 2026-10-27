@@ -29,6 +29,9 @@ pub enum SqlFilesError {
     #[error("invalid SQL filename: {path}")]
     InvalidFilename { path: PathBuf },
 
+    #[error("duplicate migration number: {first} and {second}")]
+    DuplicateNumber { first: PathBuf, second: PathBuf },
+
     #[error("SQL failed in {path}: {source}")]
     SqlError {
         path: PathBuf,
@@ -97,10 +100,21 @@ pub(crate) fn discover_files(
     }
 
     entries.sort();
-    entries
+    let files = entries
         .into_iter()
         .map(|path| sql_file_from_path(path, filename_style))
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?;
+    if matches!(filename_style, FilenameStyle::Numbered) {
+        for pair in files.windows(2) {
+            if pair[0].version[..3] == pair[1].version[..3] {
+                return Err(SqlFilesError::DuplicateNumber {
+                    first: pair[0].path.clone(),
+                    second: pair[1].path.clone(),
+                });
+            }
+        }
+    }
+    Ok(files)
 }
 
 pub(crate) fn read_versions(

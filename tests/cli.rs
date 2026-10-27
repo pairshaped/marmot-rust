@@ -2290,3 +2290,36 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
     assert!(feature.join("values.generated.rs").is_file());
     assert!(!feature.join("generated/db_views").exists());
 }
+
+#[test]
+fn check_migrations_needs_no_database_or_configuration_and_rejects_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let migrations = dir.path().join("migrations");
+    fs::create_dir(&migrations).unwrap();
+    // Discovery checks filenames only, without reading SQL or configuration.
+    fs::write(dir.path().join("marmot.toml"), "not valid toml").unwrap();
+    for name in ["139_previous.sql", "140_current.sql", "141_next.sql"] {
+        fs::write(migrations.join(name), "not SQL").unwrap();
+    }
+    let check = || {
+        Command::new(env!("CARGO_BIN_EXE_marmot"))
+            .arg("check-migrations")
+            .arg(&migrations)
+            .current_dir(dir.path())
+            .env_remove("DATABASE_URL")
+            .output()
+            .unwrap()
+    };
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(migrations.join("140_collision.sql"), "not SQL").unwrap();
+    let output = check();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("140_current.sql"), "{error}");
+    assert!(error.contains("140_collision.sql"), "{error}");
+}
