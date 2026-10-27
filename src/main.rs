@@ -37,7 +37,7 @@ enum Command {
     Inspect(Args),
     Generate(GenerateArgs),
     Migrate(MigrateArgs),
-    /// Check numbered migration filenames without opening a database.
+    /// Replay numbered migrations in memory and check the resulting SQL policy.
     CheckMigrations {
         #[arg(required = true)]
         directories: Vec<PathBuf>,
@@ -241,7 +241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if let Command::CheckMigrations { directories } = &cli.command {
         for directory in directories {
-            migrations::versions_from(directory)?;
+            marmot::migration_check::check_from(directory)?;
             println!("Checked migrations in {}", directory.display());
         }
         return Ok(());

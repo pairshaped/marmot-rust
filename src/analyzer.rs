@@ -741,7 +741,7 @@ fn load_schema(conn: &Connection, temporal: &TemporalConfig) -> Result<Schema> {
     Ok(schema)
 }
 
-fn named_boolean_columns(
+pub(crate) fn named_boolean_columns(
     table: &str,
     create_sql: &str,
     declared_types: &BTreeMap<String, String>,

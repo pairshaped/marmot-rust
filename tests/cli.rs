@@ -2292,14 +2292,12 @@ fn scalar_view_validation_covers_reset_generate_and_audit_without_running_init_s
 }
 
 #[test]
-fn check_migrations_needs_no_database_or_configuration_and_rejects_duplicates() {
+fn check_migrations_needs_no_database_and_rejects_duplicates_before_replay() {
     let dir = tempfile::tempdir().unwrap();
     let migrations = dir.path().join("migrations");
     fs::create_dir(&migrations).unwrap();
-    // Discovery checks filenames only, without reading SQL or configuration.
-    fs::write(dir.path().join("marmot.toml"), "not valid toml").unwrap();
     for name in ["139_previous.sql", "140_current.sql", "141_next.sql"] {
-        fs::write(migrations.join(name), "not SQL").unwrap();
+        fs::write(migrations.join(name), "SELECT 1;").unwrap();
     }
     let check = || {
         Command::new(env!("CARGO_BIN_EXE_marmot"))
@@ -2317,9 +2315,39 @@ fn check_migrations_needs_no_database_or_configuration_and_rejects_duplicates() 
         String::from_utf8_lossy(&output.stderr)
     );
     fs::write(migrations.join("140_collision.sql"), "not SQL").unwrap();
+    fs::write(dir.path().join("marmot.toml"), "not valid toml").unwrap();
     let output = check();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("140_current.sql"), "{error}");
     assert!(error.contains("140_collision.sql"), "{error}");
+}
+
+#[test]
+fn check_migrations_replays_sql_and_rejects_policy_violations() {
+    let dir = tempfile::tempdir().unwrap();
+    let migrations = dir.path().join("migrations");
+    fs::create_dir(&migrations).unwrap();
+    for (sql, expected) in [
+        (
+            "CREATE TABLE items(id INTEGER); SELECT missing FROM items;",
+            "001_schema.sql",
+        ),
+        ("CREATE TABLE items(id INTEGER CHECK(id>0));", "table items"),
+        (
+            "CREATE TABLE items(id INTEGER); CREATE TRIGGER business AFTER INSERT ON items BEGIN SELECT RAISE(ABORT, 'no'); END;",
+            "trigger business",
+        ),
+    ] {
+        fs::write(migrations.join("001_schema.sql"), sql).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_marmot"))
+            .arg("check-migrations")
+            .arg(&migrations)
+            .env_remove("DATABASE_URL")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{error}");
+    }
 }

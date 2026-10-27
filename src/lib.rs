@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod emit;
 pub mod error;
 pub mod maintenance;
+pub mod migration_check;
 pub mod migrations;
 pub mod model;
 mod mutation_connection;

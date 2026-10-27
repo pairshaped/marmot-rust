@@ -31,6 +31,8 @@ pub struct FileConfig {
     pub schema_output: Option<PathBuf>,
     pub databases: BTreeMap<String, DatabaseReference>,
     pub serialize_modules: BTreeSet<String>,
+    /// Explicit exceptions for structural schema maintenance, never business validation.
+    pub structural_triggers: BTreeSet<String>,
     /// When configured, generated bindings are crate-visible unless listed here.
     pub public_bindings: Option<BTreeMap<String, BTreeSet<String>>>,
     pub temporal: TemporalConfig,
@@ -174,6 +176,11 @@ impl FileConfig {
             databases: toml_database_references(marmot)?,
             serialize_modules: marmot
                 .and_then(|table| toml_string_array(table, "serialize_modules"))
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            structural_triggers: marmot
+                .and_then(|table| toml_string_array(table, "structural_triggers"))
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
