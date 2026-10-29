@@ -86,6 +86,9 @@ pub enum ValidationError {
 
     #[error("could not inspect SQLite runtime: {0}")]
     Runtime(rusqlite::Error),
+
+    #[error(transparent)]
+    ViewFunctions(#[from] views::ViewError),
 }
 
 pub fn validate(config: &ValidationConfig) -> Result<ValidationReport, ValidationError> {
@@ -98,13 +101,23 @@ pub fn validate(config: &ValidationConfig) -> Result<ValidationReport, Validatio
         source,
     })?;
 
+    views::register_view_analysis_functions(&connection, config.init_sql.as_deref())?;
+    validate_connection(&connection, config)
+}
+
+/// Validate an application-owned connection with its runtime functions already registered.
+/// Initialization SQL and analysis declarations are ignored on this connection.
+pub fn validate_connection(
+    connection: &Connection,
+    config: &ValidationConfig,
+) -> Result<ValidationReport, ValidationError> {
     let checks = vec![
-        integrity_check(&connection, config.integrity_mode),
-        foreign_key_check(&connection),
-        view_check(&connection, &config.source_root, config.init_sql.as_deref()),
-        migration_check(&connection, &config.migrations_dir, &config.migration_table),
+        integrity_check(connection, config.integrity_mode),
+        foreign_key_check(connection),
+        view_check(connection, &config.source_root),
+        migration_check(connection, &config.migrations_dir, &config.migration_table),
     ];
-    let runtime = runtime_report(&connection)?;
+    let runtime = runtime_report(connection)?;
 
     Ok(ValidationReport {
         database: config.database.display().to_string(),
@@ -150,13 +163,8 @@ fn foreign_key_check(connection: &Connection) -> ValidationCheck {
     }
 }
 
-fn view_check(
-    connection: &Connection,
-    source_root: &Path,
-    init_sql: Option<&Path>,
-) -> ValidationCheck {
-    let result = views::register_view_analysis_functions(connection, init_sql)
-        .and_then(|()| views::discover(source_root))
+fn view_check(connection: &Connection, source_root: &Path) -> ValidationCheck {
+    let result = views::discover(source_root)
         .and_then(|definitions| views::audit_connection(connection, &definitions));
     match result {
         Ok(audit) if audit.database_only.is_empty() => passed("views"),
@@ -337,6 +345,41 @@ mod tests {
         assert!(!report.runtime.sqlite_version.is_empty());
         assert!(!report.runtime.compile_options.is_empty());
         assert!(!report.runtime.planner_statistics.present);
+    }
+
+    #[test]
+    fn connection_validation_keeps_runtime_scalars_for_populated_expression_indexes() {
+        let (_temporary, mut config) = fixture();
+        let connection = Connection::open(&config.database).unwrap();
+        connection
+            .create_scalar_function(
+                "identity_key",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE emails(email TEXT);
+             INSERT INTO emails VALUES ('Rehearsal@Example.test');
+             CREATE INDEX email_identity ON emails(identity_key(email));",
+            )
+            .unwrap();
+        let declarations = config.source_root.join("analysis.sql");
+        fs::write(
+            &declarations,
+            "-- marmot: scalar identity_key 1 deterministic\n",
+        )
+        .unwrap();
+        config.init_sql = Some(declarations);
+        config.integrity_mode = IntegrityMode::Full;
+        assert!(validate_connection(&connection, &config).unwrap().passed());
+        let key: String = connection
+            .query_row("SELECT identity_key('UPPER')", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(key, "upper");
     }
 
     #[test]
