@@ -96,7 +96,8 @@ pub(crate) fn run_in_current_transaction(
     {
         let sql = read_file(&file)?;
         if table_rebuild(&sql)
-            || controls_transaction(&sql).map_err(|source| error(file.path.clone(), source))?
+            || controls_transaction(&sql, true)
+                .map_err(|source| error(file.path.clone(), source))?
         {
             return Err(error(file.path, rusqlite::Error::InvalidQuery));
         }
