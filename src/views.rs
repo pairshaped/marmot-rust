@@ -208,11 +208,22 @@ pub fn reconcile_connection(
     connection: &mut Connection,
     source_root: &Path,
 ) -> Result<ViewAudit, ViewError> {
-    let definitions = discover(source_root)?;
     let transaction = connection
         .transaction()
         .map_err(|source| ViewError::InspectDatabase { source })?;
+    let audit = reconcile_connection_in_transaction(&transaction, source_root)?;
+    transaction
+        .commit()
+        .map_err(|source| ViewError::InspectDatabase { source })?;
+    Ok(audit)
+}
 
+/// Reconcile views without committing the caller's migration transaction.
+pub fn reconcile_connection_in_transaction(
+    transaction: &Connection,
+    source_root: &Path,
+) -> Result<ViewAudit, ViewError> {
+    let definitions = discover(source_root)?;
     for definition in &definitions {
         transaction
             .execute_batch(&format!(
@@ -234,11 +245,7 @@ pub fn reconcile_connection(
                 source,
             })?;
     }
-    let audit = audit_connection(&transaction, &definitions)?;
-    transaction
-        .commit()
-        .map_err(|source| ViewError::InspectDatabase { source })?;
-    Ok(audit)
+    audit_connection(transaction, &definitions)
 }
 
 pub fn audit_database(database_path: &Path, source_root: &Path) -> Result<ViewAudit, ViewError> {

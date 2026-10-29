@@ -144,6 +144,29 @@ pub fn migrate_connection(
     Ok(applied)
 }
 
+/// Apply pending versions without committing. The caller owns rollback, view
+/// reconciliation and validation, and must enable foreign keys before beginning.
+/// Rebuild directives that need foreign_keys=OFF are rejected in this mode.
+pub fn migrate_connection_in_transaction(
+    conn: &Connection,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+) -> Result<Vec<String>, MigrationError> {
+    validate_tracking_table(tracking_table)?;
+    let applied =
+        sql_files::run_in_current_transaction(conn, migrations_dir.as_ref(), tracking_table)
+            .map_err(map_error)?;
+    if !applied.is_empty() {
+        maintenance::optimize(conn, OptimizeScope::SchemaChange).map_err(|source| {
+            MigrationError::OptimizationError {
+                path: migrations_dir.as_ref().to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(applied)
+}
+
 /// Register declared scalars for schema validation, without executing initialization SQL.
 /// These placeholders refuse evaluation; callers with real application functions should
 /// use `migrate_connection` instead.

@@ -72,6 +72,40 @@ pub(crate) fn run_connection(
     }
 }
 
+/// Apply a release batch inside the caller's transaction. Transaction control and
+/// rebuilds requiring foreign_keys=OFF cannot be nested in this boundary.
+pub(crate) fn run_in_current_transaction(
+    conn: &Connection,
+    directory: &Path,
+    tracking_table: &str,
+) -> Result<Vec<String>, SqlFilesError> {
+    let error = |path, source| SqlFilesError::SqlError { path, source };
+    if conn.is_autocommit() {
+        return Err(error(
+            directory.to_path_buf(),
+            rusqlite::Error::InvalidQuery,
+        ));
+    }
+    let files = discover_files(directory, FilenameStyle::Numbered)?;
+    ensure_tracking_table(conn, tracking_table)?;
+    let applied = read_applied_versions(conn, tracking_table)?;
+    let mut versions = Vec::new();
+    for file in files
+        .into_iter()
+        .filter(|file| !applied.contains(&file.version))
+    {
+        let sql = read_file(&file)?;
+        if table_rebuild(&sql)
+            || controls_transaction(&sql).map_err(|source| error(file.path.clone(), source))?
+        {
+            return Err(error(file.path, rusqlite::Error::InvalidQuery));
+        }
+        execute_sql(conn, Some(tracking_table), &file, &sql)?;
+        versions.push(file.version);
+    }
+    Ok(versions)
+}
+
 pub(crate) fn discover_files(
     directory: &Path,
     filename_style: FilenameStyle,
@@ -261,7 +295,7 @@ fn apply_file(
     if !conn.is_autocommit() {
         return Err(sql_error(rusqlite::Error::InvalidQuery));
     }
-    if rebuild && controls_transaction(&sql).map_err(sql_error)? {
+    if rebuild && controls_transaction(&sql, false).map_err(sql_error)? {
         return Err(sql_error(rusqlite::Error::InvalidQuery));
     }
     let foreign_keys: bool = conn
@@ -307,12 +341,35 @@ fn table_rebuild(sql: &str) -> bool {
         .any(|line| line.trim().trim_start_matches('\u{feff}').trim() == "-- marmot: rebuild-table")
 }
 
-fn controls_transaction(sql: &str) -> rusqlite::Result<bool> {
+fn controls_transaction(sql: &str, atomic_release: bool) -> rusqlite::Result<bool> {
     use crate::sqlite::tokenize::{Token, tokenize_spans};
     let tokens = tokenize_spans(sql);
     let transaction_statement = |tokens: &[crate::sqlite::tokenize::SpannedToken]| {
-        matches!(tokens.iter().map(|span| &span.token).find(|token| !matches!(token, Token::Semicolon | Token::Unknown('\u{feff}')) && !matches!(token, Token::Word(word) if word.trim_start_matches('\u{feff}').is_empty())),
-            Some(Token::Word(word)) if ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"].iter().any(|keyword| word.trim_start_matches('\u{feff}').eq_ignore_ascii_case(keyword)))
+        let mut words = tokens.iter().filter_map(|span| match &span.token {
+            Token::Word(word) if !word.trim_start_matches('\u{feff}').is_empty() => {
+                Some(word.trim_start_matches('\u{feff}'))
+            }
+            _ => None,
+        });
+        let Some(first) = words.next() else {
+            return false;
+        };
+        if ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"]
+            .iter()
+            .any(|keyword| first.eq_ignore_ascii_case(keyword))
+        {
+            return true;
+        }
+        // Connection settings and attached databases can escape rollback. Only
+        // the transaction-local constraint deferral used by migrations is safe.
+        atomic_release
+            && (["ATTACH", "DETACH", "VACUUM"]
+                .iter()
+                .any(|keyword| first.eq_ignore_ascii_case(keyword))
+                || (first.eq_ignore_ascii_case("PRAGMA")
+                    && !words
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("defer_foreign_keys"))))
     };
     let mut byte_start = 0;
     let mut token_start = 0;
