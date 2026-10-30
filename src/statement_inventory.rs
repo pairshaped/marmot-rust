@@ -533,6 +533,40 @@ mod tests {
                             && before.source_sha256 == after.source_sha256
                     })
         }));
+        let before_choices = git(root, &["rev-parse", "HEAD"]);
+        let renamed_sql = root.join("app/src/renamed.sql");
+        let source = fs::read_to_string(&renamed_sql).unwrap();
+        fs::write(
+            &renamed_sql,
+            source.replace(
+                "-- columns: id, name\nselect {{column}} from people",
+                "-- columns: id, email\nselect {{column}} from people where active=1",
+            ),
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Change column choices fixture"]);
+        let choices = run(&Request {
+            repository: root.into(),
+            platform_root: "app".into(),
+            base: before_choices,
+            owner_configs: vec!["marmot.toml".into()],
+            before_owner_configs: None,
+        })
+        .unwrap();
+        assert_eq!(choices.changes.len(), 3);
+        for change in &choices.changes {
+            assert_eq!(change.statement, "src/renamed.sql#chosen");
+            match change.column.as_deref() {
+                Some("id") => assert_ne!(
+                    change.before.as_ref().unwrap().source_sha256,
+                    change.after.as_ref().unwrap().source_sha256
+                ),
+                Some("name") => assert!(change.before.is_some() && change.after.is_none()),
+                Some("email") => assert!(change.before.is_none() && change.after.is_some()),
+                other => panic!("Unexpected changed column: {other:?}"),
+            }
+        }
         fs::create_dir_all(root.join("app/src/nested")).unwrap();
         fs::write(
             root.join("app/src/nested/marmot.toml"),
