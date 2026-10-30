@@ -19,10 +19,11 @@ let text="";process.stdin.on("data",chunk=>text+=chunk);process.stdin.on("end",(
 const artifacts=text.split("\n").flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}}).filter(row=>row.reason==="compiler-artifact"&&row.target.name==="marmot"&&row.executable);
 if(artifacts.length!==1)process.exit(1);process.stdout.write(artifacts[0].executable);
 });')"
-git diff --quiet "$commit" -- "${inputs[@]}" || {
+if ! git diff --quiet "$commit" -- "${inputs[@]}" \
+  || [[ -n "$(git ls-files --others --exclude-standard -- "${inputs[@]}")" ]]; then
   echo "Tool inputs changed during build" >&2
   exit 1
-}
+fi
 cp "$artifact" "$version/marmot"
 chmod +x "$version/marmot"
 node - "$version" "$commit" "$cache" <<'JS'

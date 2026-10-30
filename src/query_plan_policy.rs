@@ -1,5 +1,5 @@
 //! Audit companion SQL plans with explicit, source-bound exceptions.
-use crate::query_plans::{StatementPlan, digest, explain_statement, normalized_tokens};
+use crate::query_plans::{PlanInspector, StatementPlan, digest, normalized_tokens};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -302,6 +302,7 @@ pub fn check_sources(
         }
     }
     let fixed = policy.fixed_tables.keys().cloned().collect::<BTreeSet<_>>();
+    let inspector = PlanInspector::new(connection)?;
     let exceptions = policy
         .exceptions
         .iter()
@@ -362,7 +363,7 @@ pub fn check_sources(
                             reason,
                         }
                     })?;
-                    let plan = explain_statement(connection, &sql, &fixed).map_err(|source| {
+                    let plan = inspector.explain(&sql, &fixed).map_err(|source| {
                         crate::Error::PrepareSql {
                             path: PathBuf::from(&label),
                             source,
