@@ -35,6 +35,19 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Inspect(Args),
+    /// List changed raw companion statements from two committed Git trees.
+    ChangedStatements {
+        #[arg(long)]
+        base: String,
+        #[arg(long, default_value = ".")]
+        repo_root: PathBuf,
+        #[arg(long, default_value = ".")]
+        platform_root: PathBuf,
+        #[arg(long, required = true)]
+        owner_config: Vec<PathBuf>,
+        #[arg(long, num_args = 0..)]
+        before_owner_config: Option<Vec<PathBuf>>,
+    },
     /// Inspect raw companion SQL against the database without executing it.
     CheckPlans {
         #[arg(long)]
@@ -259,6 +272,25 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::ChangedStatements {
+        base,
+        repo_root,
+        platform_root,
+        owner_config,
+        before_owner_config,
+    } = &cli.command
+    {
+        let inventory = marmot::statement_inventory::run(&marmot::statement_inventory::Request {
+            repository: repo_root.clone(),
+            platform_root: platform_root.clone(),
+            base: base.clone(),
+            owner_configs: owner_config.clone(),
+            before_owner_configs: before_owner_config.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
+        return Ok(());
+    }
     if let Command::CheckMigrations { directories } = &cli.command {
         for directory in directories {
             marmot::migration_check::check_from(directory)?;
@@ -274,7 +306,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         file_config.init_sql = Some(init_sql);
     }
     match cli.command {
-        Command::CheckMigrations { .. } => unreachable!(),
+        Command::CheckMigrations { .. } | Command::ChangedStatements { .. } => unreachable!(),
         Command::CheckPlans {
             schema,
             baseline,

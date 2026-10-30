@@ -20,6 +20,7 @@ pub mod seeds;
 mod sql_files;
 pub mod sql_text;
 pub mod sqlite;
+pub mod statement_inventory;
 pub mod validation;
 pub mod value_sets;
 pub mod views;

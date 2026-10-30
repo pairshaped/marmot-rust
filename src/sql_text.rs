@@ -1,3 +1,27 @@
+pub fn prepare_companion_sql(
+    block: &crate::sqlite::blocks::SqlBlock,
+    column: Option<&str>,
+) -> Result<String, String> {
+    let selected = if let Some(columns) = &block.column_substitution {
+        let column =
+            column.ok_or("Choose a declared column before measuring column-substituted SQL")?;
+        if !columns.choices.iter().any(|choice| choice == column) {
+            return Err("The selected identifier is not a declared column choice".into());
+        }
+        block.sql.replace(
+            "{{column}}",
+            &format!("\"{}\"", column.replace('"', "\"\"")),
+        )
+    } else {
+        if column.is_some() {
+            return Err("This statement has no declared column choices".into());
+        }
+        block.sql.clone()
+    };
+    let sql = validate_sql(&selected).map_err(|error| error.to_string())?;
+    Ok(crate::analyzer::strip_nullability_overrides(&sql))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlValidationError {
     Empty,
