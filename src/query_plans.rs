@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::sqlite::{
     parse,
-    tokenize::{Token, tokenize},
+    tokenize::{SpannedToken, Token, tokenize, tokenize_spans},
 };
 
 fn fixed_source(name: &str) -> bool {
@@ -43,6 +43,7 @@ pub struct StatementPlan {
     pub growing_scans: BTreeSet<String>,
     pub temporary_sorts: Vec<String>,
     pub unresolved_reads: BTreeSet<String>,
+    pub growing_output: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -59,7 +60,20 @@ struct Aliases {
     tables: BTreeMap<String, BTreeSet<String>>,
     qualified: BTreeMap<String, BTreeSet<bool>>,
     source_hash: String,
-    sources: Vec<Vec<Token>>,
+    sources: Vec<SqlSource>,
+}
+
+struct SqlSource {
+    sql: String,
+    tokens: Vec<Token>,
+    spans: Vec<SpannedToken>,
+}
+
+struct KeyRead<'a> {
+    source: &'a str,
+    table: Option<&'a str>,
+    columns: &'a [String],
+    sole_root_read: bool,
 }
 
 impl Catalog {
@@ -135,7 +149,11 @@ impl Catalog {
         let mut sources = Vec::new();
         while let Some(sql) = pending.pop() {
             let tokens = tokenize(&sql);
-            sources.push(tokens.clone());
+            sources.push(SqlSource {
+                spans: tokenize_spans(&sql),
+                sql: sql.clone(),
+                tokens: tokens.clone(),
+            });
             // Binding discovery must stop at the enclosing parenthesis. Keep
             // this traversal separate from Marmot's type-inference parser.
             let bounded = tokens
@@ -221,17 +239,20 @@ impl Catalog {
                 }
             }
             for binding in bindings {
-                if let Some(alias) = &binding.alias {
-                    qualified
-                        .entry(alias.clone())
-                        .or_default()
-                        .insert(binding.table.schema.is_some());
-                }
-                let table = binding.table.name;
-                aliases
-                    .entry(binding.alias.unwrap_or_else(|| table.clone()))
+                let name = binding.alias.clone().unwrap_or_else(|| {
+                    binding
+                        .table
+                        .schema
+                        .as_ref()
+                        .map(|schema| format!("{schema}.{}", binding.table.name))
+                        .unwrap_or_else(|| binding.table.name.clone())
+                });
+                qualified
+                    .entry(name.clone())
                     .or_default()
-                    .insert(table.clone());
+                    .insert(binding.table.schema.is_some());
+                let table = binding.table.name;
+                aliases.entry(name).or_default().insert(table.clone());
                 if let Some(view) = self.views.get(&table)
                     && visited.insert(table)
                 {
@@ -302,11 +323,12 @@ impl Catalog {
             }
         }
         let source = read_source(detail)?.to_ascii_lowercase();
-        let source = source
+        if let Some(table) = source
             .strip_prefix("main.")
             .or_else(|| source.strip_prefix("temp."))
-            .unwrap_or(&source)
-            .to_owned();
+        {
+            return self.tables.contains(table).then(|| table.to_owned());
+        }
 
         if let Some(tables) = aliases.get(&source) {
             if tables.len() == 1 {
@@ -338,51 +360,73 @@ fn matching_paren(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
-fn operand_scope(tokens: &[Token], index: usize) -> Vec<parse::TableBinding> {
+fn scope_start(tokens: &[Token], index: usize) -> Option<usize> {
     let mut closing = 0usize;
     for start in (0..index).rev() {
         match &tokens[start] {
             Token::CloseParen => closing += 1,
             Token::OpenParen if closing > 0 => closing -= 1,
-            token
+            Token::Word(word)
                 if closing == 0
-                    && identifier(token).is_some_and(|word| {
-                        ["select", "update", "delete"]
-                            .iter()
-                            .any(|kind| word.eq_ignore_ascii_case(kind))
-                    }) =>
+                    && ["select", "update", "delete"]
+                        .iter()
+                        .any(|kind| word.eq_ignore_ascii_case(kind)) =>
             {
-                return match parse::parse_statement(&tokens[start..]) {
-                    parse::Statement::Select(select) => select
-                        .body
-                        .from
-                        .into_iter()
-                        .map(|item| item.binding)
-                        .collect(),
-                    parse::Statement::Update(update) => vec![update.target],
-                    parse::Statement::Delete(delete) => vec![delete.target],
-                    _ => Vec::new(),
-                };
+                return Some(start);
             }
             _ => {}
         }
     }
-    Vec::new()
+    None
 }
 
-// A unique-key probe is bounded per outer row, except when an IN input
-// repeatedly supplies its key. Inspect that operand, not sibling subqueries.
+fn root_scope_start(tokens: &[Token]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::OpenParen => depth += 1,
+            Token::CloseParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if depth == 0
+                    && ["select", "update", "delete"]
+                        .iter()
+                        .any(|kind| word.eq_ignore_ascii_case(kind)) =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scope_bindings(tokens: &[Token], start: usize) -> Vec<parse::TableBinding> {
+    match parse::parse_statement(&tokens[start..]) {
+        parse::Statement::Select(select) => select
+            .body
+            .from
+            .into_iter()
+            .map(|item| item.binding)
+            .collect(),
+        parse::Statement::Update(update) => vec![update.target],
+        parse::Statement::Delete(delete) => vec![delete.target],
+        _ => Vec::new(),
+    }
+}
+
+// A unique-key probe is bounded per outer row, except when its own IN
+// operand supplies a growing set. Prepare that SQL to prove its cardinality.
 fn key_has_growing_in(
-    sources: &[Vec<Token>],
-    source: &str,
-    key: &[String],
+    sources: &[SqlSource],
+    read: KeyRead<'_>,
     fixed: &BTreeSet<String>,
     catalog: &Catalog,
+    mut rhs_can_grow: impl FnMut(&str) -> bool,
 ) -> bool {
-    let source = source.rsplit('.').next().unwrap_or(source);
+    let source = read.source.rsplit('.').next().unwrap_or(read.source);
     let cte_names = sources
         .iter()
-        .flat_map(|tokens| match parse::parse_statement(tokens) {
+        .flat_map(|source| match parse::parse_statement(&source.tokens) {
             parse::Statement::Select(select) => select
                 .ctes
                 .into_iter()
@@ -391,14 +435,64 @@ fn key_has_growing_in(
             _ => Vec::new(),
         })
         .collect::<BTreeSet<_>>();
-    sources.iter().any(|tokens| {
+    sources.iter().any(|sql_source| {
+        let tokens = &sql_source.tokens;
+        let root = root_scope_start(tokens);
+        let roots = root
+            .map(|start| scope_bindings(tokens, start))
+            .unwrap_or_default();
+        let root_owner = read
+            .sole_root_read
+            .then(|| {
+                roots.iter().find(|binding| {
+                    binding
+                        .alias
+                        .as_deref()
+                        .unwrap_or(&binding.table.name)
+                        .eq_ignore_ascii_case(source)
+                        && catalog.tables.contains(&binding.table.name)
+                        && !cte_names.contains(&binding.table.name)
+                        && read.table.is_none_or(|table| table == binding.table.name)
+                })
+            })
+            .flatten();
+        let table = read
+            .table
+            .or_else(|| root_owner.map(|binding| binding.table.name.as_str()));
         tokens
             .iter()
             .enumerate()
-            .filter(|(_, token)| {
-                identifier(token).is_some_and(|word| word.eq_ignore_ascii_case("in"))
-            })
+            .filter(
+                |(_, token)| matches!(token, Token::Word(word) if word.eq_ignore_ascii_case("in")),
+            )
             .any(|(index, _)| {
+                let owner_scope = scope_start(tokens, index);
+                if root_owner.is_some() && owner_scope != root {
+                    return false;
+                }
+                let owners = owner_scope
+                    .map(|start| scope_bindings(tokens, start))
+                    .unwrap_or_default();
+                let matching_owners = owners
+                    .iter()
+                    .filter(|binding| {
+                        binding
+                            .alias
+                            .as_deref()
+                            .unwrap_or(&binding.table.name)
+                            .eq_ignore_ascii_case(source)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(table) = table
+                    && !matching_owners.is_empty()
+                    && matching_owners.iter().all(|binding| {
+                        catalog.tables.contains(&binding.table.name)
+                            && !cte_names.contains(&binding.table.name)
+                            && binding.table.name != table
+                    })
+                {
+                    return false;
+                }
                 let operands = if tokens.get(index.wrapping_sub(1)) == Some(&Token::CloseParen) {
                     (0..index)
                         .rev()
@@ -417,7 +511,11 @@ fn key_has_growing_in(
                         let Some(column) = operand.last().and_then(identifier) else {
                             return false;
                         };
-                        if !key.iter().any(|key| key.eq_ignore_ascii_case(column)) {
+                        if !read
+                            .columns
+                            .iter()
+                            .any(|key| key.eq_ignore_ascii_case(column))
+                        {
                             return false;
                         }
                         if operand.len() >= 3 && operand[operand.len() - 2] == Token::Dot {
@@ -426,16 +524,11 @@ fn key_has_growing_in(
                                 .and_then(identifier)
                                 .is_some_and(|qualifier| qualifier.eq_ignore_ascii_case(source))
                         } else {
-                            let owners = operand_scope(tokens, index);
                             owners.is_empty()
-                                || owners.iter().any(|binding| {
-                                    binding
-                                        .alias
-                                        .as_deref()
-                                        .unwrap_or(&binding.table.name)
-                                        .eq_ignore_ascii_case(source)
-                                        || !catalog.tables.contains(&binding.table.name)
-                                })
+                                || !matching_owners.is_empty()
+                                || owners
+                                    .iter()
+                                    .any(|binding| !catalog.tables.contains(&binding.table.name))
                         }
                     });
                 if !matches {
@@ -445,16 +538,25 @@ fn key_has_growing_in(
                     return tokens
                         .get(index + 1)
                         .and_then(identifier)
-                        .is_none_or(|name| !fixed_source(name));
+                        .is_none_or(|name| {
+                            cte_names.contains(name)
+                                || (!fixed.contains(name) && !fixed_source(name))
+                        });
                 }
                 let Some(end) = matching_paren(tokens, index + 1) else {
                     return true;
                 };
                 let body = &tokens[index + 2..end];
-                parse::all_from_items(body).iter().any(|item| {
-                    let table = &item.binding.table.name;
-                    cte_names.contains(table) || (!fixed.contains(table) && !fixed_source(table))
-                })
+                if !body.first().and_then(identifier).is_some_and(|word| {
+                    ["select", "with", "values"]
+                        .iter()
+                        .any(|kind| word.eq_ignore_ascii_case(kind))
+                }) {
+                    return false;
+                }
+                let start = sql_source.spans[index + 2].start;
+                let end = sql_source.spans[end - 1].end;
+                rhs_can_grow(&sql_source.sql[start..end])
             })
     })
 }
@@ -684,7 +786,11 @@ impl<'a> PlanInspector<'a> {
             });
             let rowid_point = step.detail.starts_with("SEARCH ")
                 && step.detail.contains("USING INTEGER PRIMARY KEY (rowid=?)");
-            let mut rowid_keys = vec!["rowid".into(), "_rowid_".into(), "oid".into()];
+            let physical = catalog.read_table(&step.detail, aliases);
+            let mut rowid_keys = physical
+                .as_ref()
+                .and_then(|table| catalog.point_key(table, &step.detail))
+                .unwrap_or_else(|| vec!["rowid".into(), "_rowid_".into(), "oid".into()]);
             if let Some(tables) = aliases.get(source.rsplit('.').next().unwrap_or(source)) {
                 for table in tables {
                     if let Some(key) = catalog.primary_keys.get(table).filter(|key| key.len() == 1)
@@ -698,9 +804,31 @@ impl<'a> PlanInspector<'a> {
             } else {
                 definition_for(source, step)
             };
-            let input = if rowid_point
-                && !key_has_growing_in(sources, source, &rowid_keys, fixed_tables, catalog)
-            {
+            let sole_root_read = step.parent == 0
+                && steps
+                    .iter()
+                    .filter(|other| other.parent == 0 && read_source(&other.detail) == Some(source))
+                    .count()
+                    == 1;
+            let key_grows = |columns: &[String]| {
+                key_has_growing_in(
+                    sources,
+                    KeyRead {
+                        source,
+                        table: physical.as_deref(),
+                        columns,
+                        sole_root_read,
+                    },
+                    fixed_tables,
+                    catalog,
+                    |rhs| {
+                        !self.explain(rhs, fixed_tables).is_ok_and(|plan| {
+                            plan.growing_output.is_empty() && plan.unresolved_reads.is_empty()
+                        })
+                    },
+                )
+            };
+            let input = if rowid_point && !key_grows(&rowid_keys) {
                 ReadInput::Point
             } else if !indexed
                 && bindings
@@ -712,13 +840,14 @@ impl<'a> PlanInspector<'a> {
                 ReadInput::Unknown
             } else if let Some(parent) = definition {
                 ReadInput::Materialized(parent)
-            } else if let Some(table) = catalog.read_table(&step.detail, aliases) {
-                if catalog.point_key(&table, &step.detail).is_some_and(|key| {
-                    !key_has_growing_in(sources, source, &key, fixed_tables, catalog)
-                }) {
+            } else if let Some(table) = &physical {
+                if catalog
+                    .point_key(table, &step.detail)
+                    .is_some_and(|key| !key_grows(&key))
+                {
                     ReadInput::Point
                 } else {
-                    ReadInput::Table(table)
+                    ReadInput::Table(table.clone())
                 }
             } else if let Some(candidates) = aliases.get(source).filter(|targets| {
                 targets.len() > 1
@@ -814,6 +943,11 @@ impl<'a> PlanInspector<'a> {
             }
         }
 
+        let growing_output = inputs
+            .scope_tables(0, &mut BTreeSet::new())
+            .into_iter()
+            .filter(|table| !fixed_tables.contains(table))
+            .collect();
         Ok(StatementPlan {
             source_hash,
             finding_counts,
@@ -821,6 +955,7 @@ impl<'a> PlanInspector<'a> {
             growing_scans,
             temporary_sorts,
             unresolved_reads,
+            growing_output,
         })
     }
 }
@@ -839,6 +974,13 @@ mod tests {
         let bounded = explain_statement(&connection,
             "with participants as materialized (select code from countries) select code from participants order by code", &fixed).unwrap();
         assert!(bounded.temporary_sorts.is_empty(), "{bounded:?}");
+        let growing = explain_statement(&connection,
+            "with participants as materialized (select code from countries) select main.participants.name, (select count(*) from participants) from main.participants order by main.participants.name", &fixed).unwrap();
+        assert!(
+            growing.growing_scans.contains("participants"),
+            "{growing:?}"
+        );
+        assert_eq!(growing.temporary_sorts.len(), 1, "{growing:?}");
         assert!(bounded.growing_scans.is_empty(), "{bounded:?}");
         let bounded = explain_statement(&connection,
             "with countries as materialized (select name from participants) select c.code, (select count(*) from countries) from main.countries c order by c.code", &fixed).unwrap();
@@ -858,6 +1000,30 @@ mod tests {
             "select c.code from countries c join participants p on p.id in (select value from json_each(@ids)) where c.code in (select p2.name from participants p2) order by c.code",
             &BTreeSet::from(["countries".into()])).unwrap();
         assert!(plan.temporary_sorts.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn query_plans_keep_nested_alias_reuse_and_bounded_in_inputs_out_of_fixed_sorts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("create table countries(code text); create table participants(id integer primary key, email text unique); create table memberships(email text unique);").unwrap();
+        let plan = explain_statement(&connection,
+            "select c.code from countries c join participants p on p.email=@email where exists (select 1 from memberships p where p.email in (select email from participants where id=@id)) order by c.code",
+            &BTreeSet::from(["countries".into()])).unwrap();
+        assert!(plan.temporary_sorts.is_empty(), "{plan:?}");
+        let fixed = BTreeSet::from(["countries".into()]);
+        let plan = explain_statement(&connection,
+            "select c.code from countries c join participants p on p.email=@email where exists (select 1 from participants p where p.email in (select email from memberships)) order by c.code", &fixed).unwrap();
+        assert!(plan.temporary_sorts.is_empty(), "{plan:?}");
+        let plan = explain_statement(&connection,
+            "select email from memberships where email in (select email from participants where id=@id) order by length(email)", &fixed).unwrap();
+        assert!(plan.temporary_sorts.is_empty(), "{plan:?}");
+        for sql in [
+            "select email from (select p.email from participants p where p.email in (select email from memberships)) order by length(email)",
+            "select email from main.participants where id in (select rowid from memberships) order by length(email)",
+        ] {
+            let plan = explain_statement(&connection, sql, &fixed).unwrap();
+            assert_eq!(plan.temporary_sorts.len(), 1, "{plan:?}");
+        }
     }
 
     #[test]
