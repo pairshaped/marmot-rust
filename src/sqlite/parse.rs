@@ -193,12 +193,29 @@ fn parse_ctes(tokens: &[Token]) -> (Vec<CteDef>, &[Token]) {
         if !tokens
             .get(index)
             .is_some_and(|token| token_is_word(token, "AS"))
-            || !matches!(tokens.get(index + 1), Some(Token::OpenParen))
         {
             break;
         }
+        index += 1;
+        if tokens
+            .get(index)
+            .is_some_and(|token| token_is_word(token, "NOT"))
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token_is_word(token, "MATERIALIZED"))
+        {
+            index += 2;
+        } else if tokens
+            .get(index)
+            .is_some_and(|token| token_is_word(token, "MATERIALIZED"))
+        {
+            index += 1;
+        }
+        if !matches!(tokens.get(index), Some(Token::OpenParen)) {
+            break;
+        }
 
-        let (body, after_body) = collect_balanced_parens(tokens, index + 1);
+        let (body, after_body) = collect_balanced_parens(tokens, index);
         ctes.push(CteDef {
             name,
             columns,
@@ -1831,6 +1848,34 @@ mod tests {
             resolve_bare(&unknown_table_aliases, "x", &schema),
             ColumnResolution::UnknownTableRef
         );
+    }
+
+    #[test]
+    fn materialized_ctes_preserve_bodies_and_outer_statement_kind() {
+        for hint in ["MATERIALIZED", "not materialized"] {
+            let sql = format!(
+                "with picked(id) as {hint} (select id from users where id=@id),
+                 other as (select id from picked) select id from other"
+            );
+            let Statement::Select(select) = parse_statement(&tokenize(&sql)) else {
+                panic!("materialization hints must preserve SELECT classification");
+            };
+            assert_eq!(select.ctes.len(), 2);
+            assert_eq!(select.ctes[0].columns, ["id"]);
+            assert_eq!(
+                select.ctes[0].body,
+                tokenize("select id from users where id=@id")
+            );
+
+            let sql = format!(
+                "with picked as {hint} (select id from users where id=@id)
+                 update users set email=@email where id in (select id from picked)"
+            );
+            assert!(matches!(
+                parse_statement(&tokenize(&sql)),
+                Statement::Update(_)
+            ));
+        }
     }
 
     #[test]
