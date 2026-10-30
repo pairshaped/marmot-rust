@@ -727,7 +727,7 @@ pub fn table_references(tokens: &[Token]) -> BTreeMap<String, String> {
     refs
 }
 
-fn all_from_items(tokens: &[Token]) -> Vec<FromItem> {
+pub(crate) fn all_from_items(tokens: &[Token]) -> Vec<FromItem> {
     let mut items = Vec::new();
     let mut index = 0usize;
 

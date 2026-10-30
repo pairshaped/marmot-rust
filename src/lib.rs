@@ -11,6 +11,8 @@ pub mod migrations;
 pub mod model;
 mod mutation_connection;
 mod publication;
+pub mod query_plan_policy;
+pub mod query_plans;
 pub mod reset;
 pub mod schema;
 pub mod scoped_ids;

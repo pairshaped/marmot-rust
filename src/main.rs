@@ -35,6 +35,26 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Inspect(Args),
+    /// Inspect raw companion SQL against the database without executing it.
+    CheckPlans {
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long)]
+        baseline_base: Option<PathBuf>,
+        #[arg(long, conflicts_with = "capture_initial_baseline")]
+        ratchet: bool,
+        #[arg(long)]
+        capture_initial_baseline: bool,
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Additional SQL owner configs, resolved from this command's working directory.
+        #[arg(long)]
+        owner_config: Vec<PathBuf>,
+    },
     Generate(GenerateArgs),
     Migrate(MigrateArgs),
     /// Replay numbered migrations in memory and check the resulting SQL policy.
@@ -255,6 +275,164 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     match cli.command {
         Command::CheckMigrations { .. } => unreachable!(),
+        Command::CheckPlans {
+            schema,
+            baseline,
+            baseline_base,
+            ratchet,
+            capture_initial_baseline,
+            policy,
+            report,
+            owner_config,
+        } => {
+            let policy_text = std::fs::read_to_string(&policy)?;
+            let mut policy: marmot::query_plan_policy::Policy = serde_json::from_str(&policy_text)?;
+            if (ratchet || capture_initial_baseline) && baseline.is_none() {
+                return Err("--baseline is required for updates".into());
+            }
+            if let Some(path) = &baseline {
+                if path.exists() {
+                    if capture_initial_baseline {
+                        return Err("initial baseline already exists; it may only shrink".into());
+                    }
+                    policy.baseline = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                } else if !capture_initial_baseline {
+                    return Err("baseline missing; initial capture is explicit".into());
+                }
+            }
+            let prior =
+                baseline_base
+                    .map(
+                        |path| -> Result<
+                            marmot::query_plan_policy::Baseline,
+                            Box<dyn std::error::Error>,
+                        > {
+                            Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+                        },
+                    )
+                    .transpose()?;
+            if prior
+                .as_ref()
+                .is_some_and(|prior| !policy.baseline.is_reduction_of(prior))
+            {
+                return Err(
+                    "baseline grew or an existing plan worsened relative to its Git target".into(),
+                );
+            }
+            let database = file_config
+                .database
+                .as_ref()
+                .ok_or("check-plans requires one configured database")?;
+            let mut roots = Vec::new();
+            if owner_config.is_empty() {
+                roots.push(
+                    file_config
+                        .source_root
+                        .clone()
+                        .ok_or("check-plans requires source_root")?,
+                );
+            } else {
+                for path in owner_config {
+                    let owner = FileConfig::read_optional(&path)?;
+                    if owner.database.as_ref() != Some(database)
+                        || owner.init_sql != file_config.init_sql
+                    {
+                        return Err(format!(
+                            "{} must use the check-plans database and scalar declarations",
+                            path.display()
+                        )
+                        .into());
+                    }
+                    roots.push(
+                        owner
+                            .source_root
+                            .ok_or_else(|| format!("{} has no source_root", path.display()))?,
+                    );
+                }
+            }
+            let schema = schema
+                .or_else(|| file_config.schema_output.clone())
+                .ok_or("check-plans requires --schema or schema_output from reset")?;
+            let result = marmot::query_plan_policy::check_schema(
+                &schema,
+                &roots,
+                file_config.init_sql.as_deref(),
+                &std::env::current_dir()?,
+                &policy,
+            )?;
+            if capture_initial_baseline {
+                if result.statements.iter().any(|statement| {
+                    statement
+                        .findings
+                        .iter()
+                        .any(|finding| finding.starts_with("unresolved:"))
+                }) {
+                    return Err("fix unresolved plan inputs before baseline capture".into());
+                }
+                let initial = marmot::query_plan_policy::Baseline {
+                    version: 1,
+                    entries: result
+                        .statements
+                        .iter()
+                        .filter(|statement| !statement.findings.is_empty() && !statement.excepted)
+                        .map(|statement| statement.baseline_entry())
+                        .collect(),
+                };
+                if prior
+                    .as_ref()
+                    .is_some_and(|prior| !initial.is_reduction_of(prior))
+                {
+                    return Err("baseline capture cannot grow the Git baseline".into());
+                }
+                marmot::query_plan_policy::write_baseline(baseline.as_ref().unwrap(), &initial)?;
+                eprintln!(
+                    "Captured {} existing query-plan findings",
+                    initial.entries.len()
+                );
+                return Ok(());
+            }
+            let reduced = result.next_baseline != policy.baseline;
+            if ratchet && result.passed() && reduced {
+                if !result.next_baseline.is_reduction_of(&policy.baseline) {
+                    return Err("internal error: ratchet attempted to grow".into());
+                }
+                marmot::query_plan_policy::write_baseline(
+                    baseline.as_ref().unwrap(),
+                    &result.next_baseline,
+                )?;
+            }
+            let json = serde_json::to_string_pretty(&result)?;
+            if let Some(path) = report {
+                std::fs::write(path, &json)?;
+            } else {
+                println!("{json}");
+            }
+            let failed = result
+                .statements
+                .iter()
+                .filter(|statement| statement.failure.is_some())
+                .count();
+            for statement in result
+                .statements
+                .iter()
+                .filter(|statement| statement.failure.is_some())
+            {
+                eprintln!(
+                    "{}: {} ({:?})",
+                    statement.statement,
+                    statement.failure.as_deref().unwrap(),
+                    statement.findings
+                );
+            }
+            eprintln!(
+                "Query plans: {} statements, {failed} failing, {} unused exceptions",
+                result.statements.len(),
+                result.unused_exceptions.len()
+            );
+            if !result.passed() || (reduced && !ratchet) {
+                return Err("query-plan policy failed or baseline can shrink; inspect report, run --ratchet for reductions".into());
+            }
+        }
         Command::Inspect(args) => {
             for target in configs(args, &file_config)? {
                 let project = analyze_project_with_sources(

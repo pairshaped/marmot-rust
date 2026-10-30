@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$root"
+inputs=(crates/marmot Cargo.toml Cargo.lock .cargo rust-toolchain.toml rust-toolchain bin/cargo)
+commit="$(git rev-parse origin/master)"
+git rev-parse --verify origin/master >/dev/null
+if ! git diff --quiet "$commit" -- "${inputs[@]}" \
+  || [[ -n "$(git ls-files --others --exclude-standard -- "${inputs[@]}")" ]]; then
+  echo "Install from a checkout whose Marmot sources and Cargo inputs match origin/master." >&2
+  exit 1
+fi
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/sports-sql-tools/marmot"
+mkdir -p "$cache"
+version="$(mktemp -d "$cache/version.XXXXXXXX")"
+trap 'if [[ -n "${version:-}" ]]; then find "$version" -type f -delete; rmdir "$version"; fi' EXIT
+artifact="$(bin/cargo build --locked -p marmot --bin marmot --message-format=json | node -e '
+let text="";process.stdin.on("data",chunk=>text+=chunk);process.stdin.on("end",()=>{
+const artifacts=text.split("\n").flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}}).filter(row=>row.reason==="compiler-artifact"&&row.target.name==="marmot"&&row.executable);
+if(artifacts.length!==1)process.exit(1);process.stdout.write(artifacts[0].executable);
+});')"
+git diff --quiet "$commit" -- "${inputs[@]}" || {
+  echo "Tool inputs changed during build" >&2
+  exit 1
+}
+cp "$artifact" "$version/marmot"
+chmod +x "$version/marmot"
+node - "$version" "$commit" "$cache" <<'JS'
+const {readFileSync,writeFileSync,symlinkSync,renameSync}=require("node:fs");
+const {createHash}=require("node:crypto");
+const {join,basename}=require("node:path");
+const [directory,commit,cache]=process.argv.slice(2);
+const sha256=createHash("sha256").update(readFileSync(join(directory,"marmot"))).digest("hex");
+writeFileSync(join(directory,"manifest.json"),JSON.stringify({commit,sha256},null,2)+"\n");
+const link=join(cache,`${basename(directory)}.link`);
+symlinkSync(basename(directory),link);
+renameSync(link,join(cache,"current"));
+JS
+version=""
+echo "Installed stable Marmot from $commit at $cache/current/marmot"
