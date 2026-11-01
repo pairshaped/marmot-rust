@@ -322,7 +322,7 @@ impl Catalog {
                 return Some(table.clone());
             }
         }
-        let source = read_source(detail)?.to_ascii_lowercase();
+        let source = read_source(detail, &self.tables, aliases)?.to_ascii_lowercase();
         if let Some(table) = source
             .strip_prefix("main.")
             .or_else(|| source.strip_prefix("temp."))
@@ -561,22 +561,35 @@ fn key_has_growing_in(
     })
 }
 
-fn read_source(detail: &str) -> Option<&str> {
+fn read_source<'a>(
+    detail: &'a str,
+    tables: &BTreeSet<String>,
+    aliases: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<&'a str> {
     let detail = detail.strip_suffix(" LEFT-JOIN").unwrap_or(detail);
     let source = detail
         .strip_prefix("SCAN ")
         .or_else(|| detail.strip_prefix("SEARCH "))?;
     let source = source.strip_prefix("TABLE ").unwrap_or(source);
-    Some(
-        source
-            .split(" USING ")
-            .next()
-            .unwrap()
-            .split(" VIRTUAL TABLE ")
-            .next()
-            .unwrap()
-            .trim(),
-    )
+    let source = source
+        .split(" USING ")
+        .next()
+        .unwrap()
+        .split(" VIRTUAL TABLE ")
+        .next()
+        .unwrap()
+        .trim();
+    // SQLite 3.51 marks an EXISTS probe before USING. Keep real quoted
+    // identifiers ending in EXISTS when the SQL catalog identifies them.
+    if let Some(base) = source.strip_suffix(" EXISTS")
+        && !aliases.contains_key(&source.to_ascii_lowercase())
+        && (aliases.contains_key(&base.to_ascii_lowercase())
+            || !tables.contains(&source.to_ascii_lowercase()))
+    {
+        Some(base)
+    } else {
+        Some(source)
+    }
 }
 
 #[derive(Debug)]
@@ -775,8 +788,14 @@ impl<'a> PlanInspector<'a> {
         };
         let mut unresolved_reads = BTreeSet::new();
         let mut reads = BTreeMap::new();
+        let exists_probe = |step: &PlanStep| {
+            read_source(&step.detail, &catalog.tables, aliases).is_some_and(|source| {
+                step.detail
+                    .starts_with(&format!("SEARCH {source} EXISTS USING "))
+            })
+        };
         for step in &steps {
-            let Some(source) = read_source(&step.detail) else {
+            let Some(source) = read_source(&step.detail, &catalog.tables, aliases) else {
                 continue;
             };
             let lowered = step.detail.to_ascii_lowercase();
@@ -807,7 +826,11 @@ impl<'a> PlanInspector<'a> {
             let sole_root_read = step.parent == 0
                 && steps
                     .iter()
-                    .filter(|other| other.parent == 0 && read_source(&other.detail) == Some(source))
+                    .filter(|other| {
+                        other.parent == 0
+                            && !exists_probe(other)
+                            && read_source(&other.detail, &catalog.tables, aliases) == Some(source)
+                    })
                     .count()
                     == 1;
             let key_grows = |columns: &[String]| {
@@ -828,7 +851,9 @@ impl<'a> PlanInspector<'a> {
                     },
                 )
             };
-            let input = if rowid_point && !key_grows(&rowid_keys) {
+            let input = if (exists_probe(step) && (physical.is_some() || definition.is_some()))
+                || (rowid_point && !key_grows(&rowid_keys))
+            {
                 ReadInput::Point
             } else if !indexed
                 && bindings
@@ -906,7 +931,7 @@ impl<'a> PlanInspector<'a> {
             .iter()
             .filter_map(|step| match inputs.reads.get(&step.id) {
                 Some(ReadInput::Table(table)) => Some(table.clone()),
-                _ => read_source(&step.detail).map(str::to_owned),
+                _ => read_source(&step.detail, &catalog.tables, aliases).map(str::to_owned),
             })
             .collect();
         for step in &scan_steps {
@@ -1215,5 +1240,31 @@ mod tests {
         .unwrap();
         assert!(plan.unresolved_reads.is_empty(), "{plan:?}");
         assert!(!plan.growing_scans.is_empty(), "{plan:?}");
+    }
+    #[test]
+    fn query_plans_resolve_indexed_exists_search_inputs() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("create table participants(id integer primary key); create table marks(participant_id integer, seq integer, primary key(participant_id,seq)) without rowid;").unwrap();
+        let plan=explain_statement(&connection,"select p.id from participants p where exists(select 1 from marks m where m.participant_id=p.id and m.seq>0)",&BTreeSet::new()).unwrap();
+        assert!(plan.unresolved_reads.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.growing_scans,
+            BTreeSet::from(["participants".to_string()])
+        );
+    }
+    #[test]
+    fn query_plans_preserve_quoted_aliases_ending_in_exists() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("create table participants(id integer primary key);")
+            .unwrap();
+        let plan = explain_statement(
+            &connection,
+            "select \"m EXISTS\".id from participants as \"m EXISTS\" where \"m EXISTS\".id=@id",
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(plan.unresolved_reads.is_empty(), "{plan:?}");
+        assert!(plan.growing_scans.is_empty(), "{plan:?}");
     }
 }
