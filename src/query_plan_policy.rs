@@ -17,6 +17,10 @@ pub struct BaselineEntry {
     pub findings: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_shapes: Option<PlanShapes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub foreign_key_searches: BTreeSet<String>,
 }
 
 impl BaselineEntry {
@@ -31,8 +35,10 @@ impl BaselineEntry {
             return true;
         }
         if self.findings == current.findings
+            && self.sql_fingerprint.is_some()
+            && self.sql_fingerprint == current.sql_fingerprint
             && let (Some(before), Some(after)) = (&self.plan_shapes, &current.plan_shapes)
-            && added_indexed_searches_only(before, after)
+            && added_indexed_searches_only(before, after, &current.foreign_key_searches)
         {
             return true;
         }
@@ -42,6 +48,73 @@ impl BaselineEntry {
             .all(|(finding, count)| self.findings.get(finding).is_some_and(|old| count <= old));
         no_new && current.findings.values().sum::<usize>() < self.findings.values().sum::<usize>()
     }
+}
+
+type ForeignKeyIndexes = BTreeMap<String, BTreeSet<(String, String)>>;
+
+fn foreign_key_indexes(connection: &rusqlite::Connection) -> rusqlite::Result<ForeignKeyIndexes> {
+    let mut query = connection.prepare(
+        "select distinct lower(fk.\"table\"), child.name, idx.name
+         from sqlite_schema child, pragma_foreign_key_list(child.name) fk, pragma_index_list(child.name) idx
+         where child.type='table' and idx.partial=0 and not exists (
+           select 1 from pragma_foreign_key_list(child.name) part
+           where part.id=fk.id and not exists (
+             select 1 from pragma_index_info(idx.name) col
+             where col.seqno=part.seq and col.name=part.\"from\" collate nocase
+           )
+         )")?;
+    let mut indexes = ForeignKeyIndexes::new();
+    for row in query.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (parent, child, index) = row?;
+        indexes.entry(parent).or_default().insert((child, index));
+    }
+    Ok(indexes)
+}
+
+fn foreign_key_searches(
+    sql: &str,
+    variants: &[Variant],
+    indexes: &ForeignKeyIndexes,
+) -> BTreeSet<String> {
+    use crate::sqlite::{
+        parse::{Statement, parse_statement},
+        tokenize::tokenize,
+    };
+    let parent = match parse_statement(&tokenize(sql)) {
+        Statement::Insert(statement) => statement.target.table,
+        Statement::Update(statement) => statement.target.table,
+        Statement::Delete(statement) => statement.target.table,
+        _ => return BTreeSet::new(),
+    };
+    if parent
+        .schema
+        .as_deref()
+        .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+    {
+        return BTreeSet::new();
+    }
+    let Some(children) = indexes.get(&parent.name.to_lowercase()) else {
+        return BTreeSet::new();
+    };
+    variants
+        .iter()
+        .flat_map(|variant| &variant.plan.steps)
+        .filter(|step| {
+            children.iter().any(|(child, index)| {
+                ["INDEX", "COVERING INDEX"].iter().any(|kind| {
+                    step.detail
+                        .starts_with(&format!("SEARCH {child} USING {kind} {index} ("))
+                })
+            })
+        })
+        .map(|step| step.detail.clone())
+        .collect()
 }
 
 fn plan_shapes(variants: &[Variant]) -> PlanShapes {
@@ -68,7 +141,11 @@ fn plan_shapes(variants: &[Variant]) -> PlanShapes {
         .collect()
 }
 
-fn added_indexed_searches_only(before: &PlanShapes, after: &PlanShapes) -> bool {
+fn added_indexed_searches_only(
+    before: &PlanShapes,
+    after: &PlanShapes,
+    foreign_key_searches: &BTreeSet<String>,
+) -> bool {
     if before.len() != after.len() {
         return false;
     }
@@ -99,7 +176,10 @@ fn added_indexed_searches_only(before: &PlanShapes, after: &PlanShapes) -> bool 
                 let indexed = detail.starts_with("SEARCH ")
                     && (detail.contains(" USING INDEX ")
                         || detail.contains(" USING COVERING INDEX "));
-                if !indexed || new.iter().any(|(parent, _)| *parent == Some(position)) {
+                if !indexed
+                    || !foreign_key_searches.contains(detail)
+                    || new.iter().any(|(parent, _)| *parent == Some(position))
+                {
                     return false;
                 }
                 added = true;
@@ -205,6 +285,8 @@ pub struct Variant {
 pub struct StatementReport {
     pub statement: String,
     pub source_hash: String,
+    pub sql_fingerprint: String,
+    pub foreign_key_searches: BTreeSet<String>,
     pub plan_hash: String,
     pub variants: Vec<Variant>,
     pub findings: BTreeSet<String>,
@@ -230,6 +312,8 @@ impl StatementReport {
             plan_hash: self.plan_hash.clone(),
             findings: self.finding_counts.clone(),
             plan_shapes: Some(plan_shapes(&self.variants)),
+            sql_fingerprint: Some(self.sql_fingerprint.clone()),
+            foreign_key_searches: self.foreign_key_searches.clone(),
         }
     }
 }
@@ -241,6 +325,28 @@ impl Baseline {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if entry.sql_fingerprint.as_ref().is_some_and(|hash| {
+                hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return Err("baseline SQL fingerprint must be SHA-256".into());
+            }
+            if !entry.foreign_key_searches.is_empty()
+                && (entry.sql_fingerprint.is_none()
+                    || !entry.plan_shapes.as_ref().is_some_and(|shapes| {
+                        entry.foreign_key_searches.iter().all(|search| {
+                            shapes
+                                .iter()
+                                .any(|(_, steps)| steps.iter().any(|(_, detail)| detail == search))
+                        })
+                    }))
+            {
+                return Err(
+                    "baseline FK searches require SQL identity and matching physical steps".into(),
+                );
+            }
             if let Some(shapes) = &entry.plan_shapes
                 && digest(&serde_json::to_vec(shapes).expect("serialize query plans"))
                     != entry.plan_hash
@@ -390,6 +496,7 @@ pub fn check_sources(
     }
     let fixed = policy.fixed_tables.keys().cloned().collect::<BTreeSet<_>>();
     let inspector = PlanInspector::new(connection)?;
+    let foreign_key_indexes = foreign_key_indexes(connection)?;
     let exceptions = policy
         .exceptions
         .iter()
@@ -494,6 +601,14 @@ pub fn check_sources(
                     ))
                     .expect("serialize source hash"),
                 );
+                let sql_fingerprint = digest(
+                    &serde_json::to_vec(&normalized_tokens(
+                        &crate::analyzer::strip_nullability_overrides(&block.sql),
+                    ))
+                    .expect("serialize SQL"),
+                );
+                let foreign_key_searches =
+                    foreign_key_searches(&block.sql, &variants, &foreign_key_indexes);
                 let shapes = plan_shapes(&variants);
                 let plan_hash =
                     digest(&serde_json::to_vec(&shapes).expect("serialize query plans"));
@@ -503,6 +618,8 @@ pub fn check_sources(
                     plan_hash: plan_hash.clone(),
                     findings: finding_counts.clone(),
                     plan_shapes: Some(shapes),
+                    sql_fingerprint: Some(sql_fingerprint.clone()),
+                    foreign_key_searches: foreign_key_searches.clone(),
                 };
                 let mut excepted = false;
                 let failure = if let Some(exception) = exceptions.get(label.as_str()) {
@@ -539,6 +656,8 @@ pub fn check_sources(
                 statements.push(StatementReport {
                     statement: label,
                     source_hash,
+                    sql_fingerprint,
+                    foreign_key_searches,
                     plan_hash,
                     variants,
                     findings,
@@ -702,6 +821,8 @@ mod tests {
             plan_hash: "old-plan".into(),
             findings: BTreeMap::from([("scan:participants".into(), 2)]),
             plan_shapes: None,
+            sql_fingerprint: None,
+            foreign_key_searches: BTreeSet::new(),
         };
         assert!(previous.permits(&previous));
         let mut improved = previous.clone();
@@ -826,6 +947,8 @@ mod tests {
             plan_hash: digest(&serde_json::to_vec(&old_shapes).unwrap()),
             findings: BTreeMap::from([("scan:retained".into(), 1)]),
             plan_shapes: Some(old_shapes.clone()),
+            sql_fingerprint: Some("0".repeat(64)),
+            foreign_key_searches: BTreeSet::new(),
         };
         let baseline = Baseline {
             version: 1,
@@ -842,6 +965,7 @@ mod tests {
             let entry = BaselineEntry {
                 plan_hash: digest(&serde_json::to_vec(&shapes).unwrap()),
                 plan_shapes: Some(shapes),
+                foreign_key_searches: BTreeSet::from([detail.to_string()]),
                 ..old.clone()
             };
             assert!(
@@ -917,6 +1041,33 @@ mod tests {
                 entries: vec![legacy]
             }),
             "old exact hashes can acquire matching physical evidence"
+        );
+    }
+    #[test]
+    fn query_plan_baseline_rejects_a_new_indexed_read_in_changed_sql() {
+        let (directory, connection, roots) =
+            fixture("-- func: list\nselect p.id from participants p");
+        connection.execute_batch("create table lookup(parent_id integer); create index lookup_parent on lookup(parent_id);").unwrap();
+        let mut policy = Policy {
+            version: 1,
+            fixed_tables: BTreeMap::new(),
+            exceptions: Vec::new(),
+            baseline: Baseline::default(),
+        };
+        let before = check_sources(&connection, &roots, directory.path(), &policy).unwrap();
+        policy
+            .baseline
+            .entries
+            .push(before.statements[0].baseline_entry());
+        std::fs::write(roots[0].join("people.sql"),"-- func: list\nselect p.id from participants p cross join lookup l indexed by lookup_parent where l.parent_id=p.id").unwrap();
+        let after = check_sources(&connection, &roots, directory.path(), &policy).unwrap();
+        assert_eq!(
+            before.statements[0].finding_counts,
+            after.statements[0].finding_counts
+        );
+        assert!(
+            !after.passed(),
+            "a newly written indexed read is not a mechanical FK plan change: {after:?}"
         );
     }
 }
