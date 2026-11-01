@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+// Parent positions, rather than SQLite instruction IDs, keep physical topology
+// stable when SQLite inserts a foreign-key child lookup.
+pub type PlanShapes = Vec<(Option<String>, Vec<(Option<usize>, String)>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BaselineEntry {
@@ -11,6 +15,8 @@ pub struct BaselineEntry {
     pub fingerprint: String,
     pub plan_hash: String,
     pub findings: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_shapes: Option<PlanShapes>,
 }
 
 impl BaselineEntry {
@@ -24,12 +30,86 @@ impl BaselineEntry {
         {
             return true;
         }
+        if self.findings == current.findings
+            && let (Some(before), Some(after)) = (&self.plan_shapes, &current.plan_shapes)
+            && added_indexed_searches_only(before, after)
+        {
+            return true;
+        }
         let no_new = current
             .findings
             .iter()
             .all(|(finding, count)| self.findings.get(finding).is_some_and(|old| count <= old));
         no_new && current.findings.values().sum::<usize>() < self.findings.values().sum::<usize>()
     }
+}
+
+fn plan_shapes(variants: &[Variant]) -> PlanShapes {
+    variants
+        .iter()
+        .map(|variant| {
+            let positions = variant
+                .plan
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(position, step)| (step.id, position))
+                .collect::<BTreeMap<_, _>>();
+            (
+                variant.column.clone(),
+                variant
+                    .plan
+                    .steps
+                    .iter()
+                    .map(|step| (positions.get(&step.parent).copied(), step.detail.clone()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn added_indexed_searches_only(before: &PlanShapes, after: &PlanShapes) -> bool {
+    if before.len() != after.len() {
+        return false;
+    }
+    let mut added = false;
+    for ((old_column, old), (new_column, new)) in before.iter().zip(after) {
+        if old_column != new_column {
+            return false;
+        }
+        let mut matched = 0;
+        let mut positions = BTreeMap::new();
+        for (position, (parent, detail)) in new.iter().enumerate() {
+            let mapped_parent = match parent {
+                None => None,
+                Some(parent) => match positions.get(parent) {
+                    Some(parent) => Some(*parent),
+                    None => return false,
+                },
+            };
+            if old
+                .get(matched)
+                .is_some_and(|step| step == &(mapped_parent, detail.clone()))
+            {
+                positions.insert(position, matched);
+                matched += 1;
+            } else {
+                // Additional work must be an indexed leaf lookup. A new scan,
+                // sort, primary-key probe or subtree still needs review.
+                let indexed = detail.starts_with("SEARCH ")
+                    && (detail.contains(" USING INDEX ")
+                        || detail.contains(" USING COVERING INDEX "));
+                if !indexed || new.iter().any(|(parent, _)| *parent == Some(position)) {
+                    return false;
+                }
+                added = true;
+            }
+        }
+        if matched != old.len() {
+            return false;
+        }
+    }
+    added
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -149,6 +229,7 @@ impl StatementReport {
             fingerprint: self.source_hash.clone(),
             plan_hash: self.plan_hash.clone(),
             findings: self.finding_counts.clone(),
+            plan_shapes: Some(plan_shapes(&self.variants)),
         }
     }
 }
@@ -160,6 +241,12 @@ impl Baseline {
         }
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
+            if let Some(shapes) = &entry.plan_shapes
+                && digest(&serde_json::to_vec(shapes).expect("serialize query plans"))
+                    != entry.plan_hash
+            {
+                return Err("baseline physical plan does not match its hash".into());
+            }
             for hash in [&entry.fingerprint, &entry.plan_hash] {
                 if hash.len() != 64
                     || !hash
@@ -407,25 +494,7 @@ pub fn check_sources(
                     ))
                     .expect("serialize source hash"),
                 );
-                let shapes = variants
-                    .iter()
-                    .map(|variant| {
-                        let positions = variant
-                            .plan
-                            .steps
-                            .iter()
-                            .enumerate()
-                            .map(|(position, step)| (step.id, position))
-                            .collect::<BTreeMap<_, _>>();
-                        let steps = variant
-                            .plan
-                            .steps
-                            .iter()
-                            .map(|step| (positions.get(&step.parent).copied(), &step.detail))
-                            .collect::<Vec<_>>();
-                        (&variant.column, steps)
-                    })
-                    .collect::<Vec<_>>();
+                let shapes = plan_shapes(&variants);
                 let plan_hash =
                     digest(&serde_json::to_vec(&shapes).expect("serialize query plans"));
                 let current = BaselineEntry {
@@ -433,6 +502,7 @@ pub fn check_sources(
                     fingerprint: source_hash.clone(),
                     plan_hash: plan_hash.clone(),
                     findings: finding_counts.clone(),
+                    plan_shapes: Some(shapes),
                 };
                 let mut excepted = false;
                 let failure = if let Some(exception) = exceptions.get(label.as_str()) {
@@ -631,6 +701,7 @@ mod tests {
             fingerprint: "old-source".into(),
             plan_hash: "old-plan".into(),
             findings: BTreeMap::from([("scan:participants".into(), 2)]),
+            plan_shapes: None,
         };
         assert!(previous.permits(&previous));
         let mut improved = previous.clone();
@@ -712,6 +783,140 @@ mod tests {
         assert!(
             !worse.passed(),
             "dropping an unrelated sort cannot excuse a worse scan: {worse:?}"
+        );
+    }
+    #[test]
+    fn query_plan_baseline_accepts_an_added_indexed_foreign_key_check() {
+        let (directory, connection, roots) =
+            fixture("-- func: remove\ndelete from participants where id=@id");
+        connection.execute_batch("pragma foreign_keys=on; create table retained_child(participant_id integer references participants(id));").unwrap();
+        let mut policy = Policy {
+            version: 1,
+            fixed_tables: BTreeMap::new(),
+            exceptions: Vec::new(),
+            baseline: Baseline::default(),
+        };
+        let before = check_sources(&connection, &roots, directory.path(), &policy).unwrap();
+        policy
+            .baseline
+            .entries
+            .push(before.statements[0].baseline_entry());
+        connection.execute_batch("create table indexed_child(participant_id integer references participants(id)); create index indexed_child_parent on indexed_child(participant_id);").unwrap();
+        let after = check_sources(&connection, &roots, directory.path(), &policy).unwrap();
+        assert_eq!(
+            before.statements[0].finding_counts,
+            after.statements[0].finding_counts
+        );
+        assert_ne!(
+            before.statements[0].plan_hash,
+            after.statements[0].plan_hash
+        );
+        assert!(
+            after.passed(),
+            "an added indexed FK lookup preserves existing findings: {after:?}"
+        );
+        assert!(after.next_baseline.is_reduction_of(&policy.baseline));
+    }
+    #[test]
+    fn query_plan_baseline_limits_additions_to_indexed_leaf_searches() {
+        let old_shapes = vec![(None, vec![(None, "SCAN retained".to_string())])];
+        let old = BaselineEntry {
+            statement: "src/people.sql#list".into(),
+            fingerprint: "0".repeat(64),
+            plan_hash: digest(&serde_json::to_vec(&old_shapes).unwrap()),
+            findings: BTreeMap::from([("scan:retained".into(), 1)]),
+            plan_shapes: Some(old_shapes.clone()),
+        };
+        let baseline = Baseline {
+            version: 1,
+            entries: vec![old.clone()],
+        };
+        for detail in [
+            "SEARCH child USING INDEX child_parent (parent_id=?)",
+            "SEARCH child USING COVERING INDEX child_parent (parent_id=?)",
+        ] {
+            let shapes = vec![(
+                None,
+                vec![(None, detail.to_string()), (None, "SCAN retained".into())],
+            )];
+            let entry = BaselineEntry {
+                plan_hash: digest(&serde_json::to_vec(&shapes).unwrap()),
+                plan_shapes: Some(shapes),
+                ..old.clone()
+            };
+            assert!(
+                Baseline {
+                    version: 1,
+                    entries: vec![entry]
+                }
+                .is_reduction_of(&baseline),
+                "{detail}"
+            );
+        }
+        for steps in [
+            vec![
+                (None, "SCAN child".to_string()),
+                (None, "SCAN retained".into()),
+            ],
+            vec![
+                (None, "USE TEMP B-TREE FOR ORDER BY".into()),
+                (None, "SCAN retained".into()),
+            ],
+            vec![
+                (
+                    None,
+                    "SEARCH child USING INTEGER PRIMARY KEY (rowid=?)".into(),
+                ),
+                (None, "SCAN retained".into()),
+            ],
+            vec![
+                (
+                    None,
+                    "SEARCH child USING INDEX child_parent (parent_id=?)".into(),
+                ),
+                (Some(0), "SCAN retained".into()),
+            ],
+            vec![(
+                None,
+                "SEARCH child USING INDEX child_parent (parent_id=?)".into(),
+            )],
+            vec![(None, "SCAN changed".into())],
+        ] {
+            let shapes = vec![(None, steps)];
+            let entry = BaselineEntry {
+                plan_hash: digest(&serde_json::to_vec(&shapes).unwrap()),
+                plan_shapes: Some(shapes),
+                ..old.clone()
+            };
+            assert!(
+                !Baseline {
+                    version: 1,
+                    entries: vec![entry]
+                }
+                .is_reduction_of(&baseline)
+            );
+        }
+        let mut forged = old.clone();
+        forged.plan_shapes.as_mut().unwrap()[0].1.push((
+            None,
+            "SEARCH child USING INDEX child_parent (parent_id=?)".into(),
+        ));
+        assert!(
+            Baseline {
+                version: 1,
+                entries: vec![forged]
+            }
+            .validate()
+            .is_err()
+        );
+        let mut legacy = old.clone();
+        legacy.plan_shapes = None;
+        assert!(
+            baseline.is_reduction_of(&Baseline {
+                version: 1,
+                entries: vec![legacy]
+            }),
+            "old exact hashes can acquire matching physical evidence"
         );
     }
 }
