@@ -1248,6 +1248,10 @@ mod tests {
         let plan=explain_statement(&connection,"select p.id from participants p where exists(select 1 from marks m where m.participant_id=p.id and m.seq>0)",&BTreeSet::new()).unwrap();
         assert!(plan.unresolved_reads.is_empty(), "{plan:?}");
         assert_eq!(
+            plan.growing_output,
+            BTreeSet::from(["participants".to_string()])
+        );
+        assert_eq!(
             plan.growing_scans,
             BTreeSet::from(["participants".to_string()])
         );
