@@ -228,6 +228,8 @@ pub struct Exception {
     pub reason: String,
     pub follow_up: String,
     pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_plan_shapes: Option<PlanShapes>,
 }
 
 impl Policy {
@@ -704,6 +706,7 @@ mod tests {
                 reason: "".into(),
                 follow_up: "".into(),
                 findings: vec!["scan:participants".into()],
+                previous_plan_shapes: None,
             }],
         };
         assert!(policy.validate().is_err());
@@ -740,6 +743,7 @@ mod tests {
             reason: "Existing name scan needs an index".into(),
             follow_up: "sports-21ba".into(),
             findings: row.findings.iter().cloned().collect(),
+            previous_plan_shapes: None,
         });
         assert!(
             check_sources(&connection, &roots, directory.path(), &policy)
