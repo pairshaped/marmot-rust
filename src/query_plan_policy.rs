@@ -42,12 +42,254 @@ impl BaselineEntry {
         {
             return true;
         }
+        if self.sql_fingerprint.is_some()
+            && self.sql_fingerprint == current.sql_fingerprint
+            && let (Some(before), Some(after)) = (&self.plan_shapes, &current.plan_shapes)
+        {
+            if self.findings == current.findings && automatic_index_replacement_only(before, after)
+            {
+                return true;
+            }
+            if strict_scan_reduction_with_stable_sorts(self, current, before, after) {
+                return true;
+            }
+        }
+        if let (Some(before), Some(after)) = (&self.plan_shapes, &current.plan_shapes)
+            && !retains_read_paths(before, after)
+        {
+            return false;
+        }
         let no_new = current
             .findings
             .iter()
             .all(|(finding, count)| self.findings.get(finding).is_some_and(|old| count <= old));
         no_new && current.findings.values().sum::<usize>() < self.findings.values().sum::<usize>()
     }
+}
+
+// Count occurrences as well as aliases: one removed scan cannot fund a new
+// independent probe, even when the finding keys are otherwise unchanged.
+fn retains_read_paths(before: &PlanShapes, after: &PlanShapes) -> bool {
+    if before.len() != after.len() {
+        return false;
+    }
+    before
+        .iter()
+        .zip(after)
+        .all(|((column, old), (new_column, new))| {
+            if column != new_column {
+                return false;
+            }
+            let mut budget = BTreeMap::new();
+            for (parent, detail) in old {
+                if let Some(alias) = detail
+                    .strip_prefix("SCAN ")
+                    .or_else(|| detail.strip_prefix("SEARCH "))
+                    .and_then(|read| read.split_whitespace().next())
+                {
+                    *budget.entry((*parent, alias)).or_insert(0usize) += 1;
+                }
+            }
+            for (parent, detail) in new {
+                if let Some(alias) = detail
+                    .strip_prefix("SCAN ")
+                    .or_else(|| detail.strip_prefix("SEARCH "))
+                    .and_then(|read| read.split_whitespace().next())
+                {
+                    let Some(count) = budget.get_mut(&(*parent, alias)) else {
+                        return false;
+                    };
+                    if *count == 0 {
+                        return false;
+                    }
+                    *count -= 1;
+                }
+            }
+            true
+        })
+}
+
+// SQL identity fixes alias bindings. Preserve topology and predicates while
+// allowing SQLite's transient equality index to become a persistent index.
+fn automatic_index_replacement_only(before: &PlanShapes, after: &PlanShapes) -> bool {
+    let mut replaced = false;
+    if before.len() != after.len() {
+        return false;
+    }
+    for ((column, old), (new_column, new)) in before.iter().zip(after) {
+        if column != new_column || old.len() != new.len() {
+            return false;
+        }
+        for ((parent, detail), (new_parent, new_detail)) in old.iter().zip(new) {
+            if parent != new_parent {
+                return false;
+            }
+            if detail == new_detail {
+                continue;
+            }
+            let Some((source, index)) = detail.split_once(" USING AUTOMATIC ") else {
+                return false;
+            };
+            if !source.starts_with("SEARCH ") {
+                return false;
+            }
+            let Some(predicate) = index
+                .strip_prefix("COVERING INDEX ")
+                .or_else(|| index.strip_prefix("PARTIAL COVERING INDEX "))
+            else {
+                return false;
+            };
+            if !predicate.starts_with('(')
+                || !predicate.ends_with(')')
+                || !predicate[1..predicate.len() - 1]
+                    .split(" AND ")
+                    .all(|term| {
+                        term.strip_suffix("=?").is_some_and(|column| {
+                            !column.is_empty()
+                                && column
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        })
+                    })
+            {
+                return false;
+            }
+            let Some(index) = new_detail.strip_prefix(&format!("{source} USING ")) else {
+                return false;
+            };
+            let Some(index) = index
+                .strip_prefix("INDEX ")
+                .or_else(|| index.strip_prefix("COVERING INDEX "))
+            else {
+                return false;
+            };
+            let Some((name, new_predicate)) = index.split_once(' ') else {
+                return false;
+            };
+            if name.is_empty() || new_predicate != predicate {
+                return false;
+            }
+            replaced = true;
+        }
+    }
+    replaced
+}
+
+fn strict_scan_reduction_with_stable_sorts(
+    old: &BaselineEntry,
+    new: &BaselineEntry,
+    before: &PlanShapes,
+    after: &PlanShapes,
+) -> bool {
+    // Only sort ownership may change, and only while scans strictly decrease.
+    let non_sorts = |entry: &BaselineEntry| {
+        entry
+            .findings
+            .iter()
+            .filter(|(key, _)| !key.starts_with("sort:"))
+            .map(|(key, count)| (key.clone(), *count))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let old_reads = non_sorts(old);
+    let new_reads = non_sorts(new);
+    if !new_reads
+        .iter()
+        .all(|(key, count)| old_reads.get(key).is_some_and(|old| count <= old))
+        || new_reads.values().sum::<usize>() >= old_reads.values().sum::<usize>()
+        || before.len() != after.len()
+    {
+        return false;
+    }
+    let sorts = |entry: &BaselineEntry| {
+        let mut result = BTreeMap::new();
+        for (key, count) in &entry.findings {
+            if key.starts_with("sort:") {
+                let (_, detail) = key.split_once("}:")?;
+                *result.entry(detail.to_owned()).or_insert(0usize) += count;
+            }
+        }
+        Some(result)
+    };
+    if sorts(old).is_none() || sorts(old) != sorts(new) {
+        return false;
+    }
+    for key in new.findings.keys().filter(|key| key.starts_with("sort:")) {
+        let Some((tables, detail)) = key
+            .strip_prefix("sort:")
+            .and_then(|key| key.split_once("}:"))
+        else {
+            return false;
+        };
+        let tables = tables
+            .trim_start_matches('{')
+            .split(", ")
+            .collect::<BTreeSet<_>>();
+        if !old
+            .findings
+            .keys()
+            .filter(|key| key.starts_with("sort:"))
+            .any(|key| {
+                key.strip_prefix("sort:")
+                    .and_then(|key| key.split_once("}:"))
+                    .is_some_and(|(old_tables, old_detail)| {
+                        old_detail == detail
+                            && old_tables
+                                .trim_start_matches('{')
+                                .split(", ")
+                                .all(|table| tables.contains(table))
+                    })
+            })
+        {
+            return false;
+        }
+    }
+    for ((column, old), (new_column, new)) in before.iter().zip(after) {
+        if column != new_column {
+            return false;
+        }
+        // A removed scan cannot pay for an added read elsewhere in the plan.
+        let accesses = |steps: &Vec<(Option<usize>, String)>| {
+            let mut reads = steps
+                .iter()
+                .filter_map(|(parent, detail)| {
+                    detail
+                        .strip_prefix("SCAN ")
+                        .or_else(|| detail.strip_prefix("SEARCH "))
+                        .and_then(|read| read.split_whitespace().next())
+                        .map(|alias| (*parent, alias.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            reads.sort();
+            reads
+        };
+        if accesses(old) != accesses(new) {
+            return false;
+        }
+        // Each sort must retain its parent scope and the same input aliases.
+        let scope = |steps: &Vec<(Option<usize>, String)>| {
+            steps
+                .iter()
+                .filter(|(_, detail)| detail.contains("TEMP B-TREE"))
+                .map(|(parent, detail)| {
+                    let reads = steps
+                        .iter()
+                        .filter(|(p, _)| p == parent)
+                        .filter_map(|(_, read)| {
+                            read.strip_prefix("SCAN ")
+                                .or_else(|| read.strip_prefix("SEARCH "))
+                        })
+                        .filter_map(|read| read.split_whitespace().next())
+                        .map(str::to_owned)
+                        .collect::<BTreeSet<_>>();
+                    (*parent, detail.clone(), reads)
+                })
+                .collect::<Vec<_>>()
+        };
+        if scope(old) != scope(new) {
+            return false;
+        }
+    }
+    true
 }
 
 type ForeignKeyIndexes = BTreeMap<String, BTreeSet<(String, String)>>;
@@ -692,6 +934,141 @@ pub fn check_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn query_plan_gate_index_improvements_and_negative_paths() {
+        let shape = |details: &[&str]| {
+            vec![(
+                None,
+                details
+                    .iter()
+                    .map(|detail| (None, (*detail).into()))
+                    .collect(),
+            )]
+        };
+        let entry = |shapes: PlanShapes, findings: &[(&str, usize)]| BaselineEntry {
+            statement: "same.sql#read".into(),
+            fingerprint: "source".into(),
+            plan_hash: digest(&serde_json::to_vec(&shapes).unwrap()),
+            plan_shapes: Some(shapes),
+            sql_fingerprint: Some("sql".into()),
+            foreign_key_searches: BTreeSet::new(),
+            findings: findings
+                .iter()
+                .map(|(key, count)| ((*key).into(), *count))
+                .collect(),
+        };
+        let old = entry(
+            shape(&[
+                "SCAN c",
+                "SEARCH a USING AUTOMATIC COVERING INDEX (command_id=?)",
+            ]),
+            &[("scan:c", 1)],
+        );
+        let new = entry(
+            shape(&[
+                "SCAN c",
+                "SEARCH a USING INDEX attempts_command (command_id=?)",
+            ]),
+            &[("scan:c", 1)],
+        );
+        assert!(old.permits(&new));
+        assert!(!new.permits(&old), "explicit to automatic");
+        for detail in [
+            "SEARCH a USING INDEX attempts_command (other_id=?)",
+            "SEARCH b USING INDEX attempts_command (command_id=?)",
+            "SEARCH a USING INDEX attempts_command (command_id>?)",
+        ] {
+            let changed = entry(shape(&["SCAN c", detail]), &[("scan:c", 1)]);
+            assert!(!old.permits(&changed), "{detail}");
+        }
+        for detail in [
+            "SCAN b",
+            "USE TEMP B-TREE FOR ORDER BY",
+            "SEARCH b USING INDEX b_key (id=?)",
+        ] {
+            let changed = entry(
+                shape(&[
+                    "SCAN c",
+                    "SEARCH a USING INDEX attempts_command (command_id=?)",
+                    detail,
+                ]),
+                &[("scan:c", 1)],
+            );
+            assert!(!old.permits(&changed), "added {detail}");
+        }
+        let old = entry(
+            shape(&[
+                "SCAN a",
+                "SEARCH cmd USING INDEX command_id (id=?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ]),
+            &[
+                ("scan:a", 1),
+                ("sort:{\"attempts\"}:USE TEMP B-TREE FOR ORDER BY", 1),
+            ],
+        );
+        let mut new = entry(
+            shape(&[
+                "SEARCH cmd USING INDEX conversation_id (conversation_id=?)",
+                "SEARCH a USING INDEX attempts_command (command_id=?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ]),
+            &[(
+                "sort:{\"attempts\", \"commands\"}:USE TEMP B-TREE FOR ORDER BY",
+                1,
+            )],
+        );
+        assert!(old.permits(&new));
+        let mut same_sort_reduction = new.clone();
+        same_sort_reduction.findings = old
+            .findings
+            .iter()
+            .filter(|(key, _)| key.starts_with("sort:"))
+            .map(|(key, count)| (key.clone(), *count))
+            .collect();
+        assert!(old.permits(&same_sort_reduction));
+        for alias in ["independent", "a"] {
+            let mut bypass = same_sort_reduction.clone();
+            let steps = &mut bypass.plan_shapes.as_mut().unwrap()[0].1;
+            let parent = steps.len();
+            steps.push((None, "SCALAR SUBQUERY 1".into()));
+            steps.push((
+                Some(parent),
+                format!("SEARCH {alias} USING INDEX independent_key (id=?)"),
+            ));
+            assert!(
+                !old.permits(&bypass),
+                "unchanged sort key cannot hide independent {alias} lookup"
+            );
+        }
+        let mut duplicate = same_sort_reduction.clone();
+        duplicate.plan_shapes.as_mut().unwrap()[0].1.push((
+            None,
+            "SEARCH a USING INDEX attempts_command (command_id=?)".into(),
+        ));
+        assert!(!old.permits(&duplicate), "duplicate read occurrence");
+        let mut extra_access = new.clone();
+        extra_access.plan_shapes.as_mut().unwrap()[0]
+            .1
+            .push((None, "SEARCH b USING INDEX b_key (id=?)".into()));
+        assert!(
+            !old.permits(&extra_access),
+            "scan reduction cannot pay for new access path"
+        );
+        new.findings = BTreeMap::from([(
+            "sort:{\"unrelated\"}:USE TEMP B-TREE FOR ORDER BY".into(),
+            1,
+        )]);
+        assert!(!old.permits(&new));
+        new.findings = BTreeMap::from([(
+            "sort:{\"attempts\", \"commands\"}:USE TEMP B-TREE FOR ORDER BY".into(),
+            2,
+        )]);
+        assert!(!old.permits(&new));
+        new.findings.insert("scan:b".into(), 1);
+        assert!(!old.permits(&new));
+    }
+
     #[test]
     fn query_plan_policy_requires_a_reviewable_exception() {
         let policy = Policy {
