@@ -72,12 +72,41 @@ pub(crate) fn run_connection(
     }
 }
 
-/// Apply a release batch inside the caller's transaction. Transaction control and
-/// rebuilds requiring foreign_keys=OFF cannot be nested in this boundary.
+pub(crate) fn pending_table_rebuild(
+    conn: &Connection,
+    directory: &Path,
+    tracking_table: &str,
+) -> Result<bool, SqlFilesError> {
+    let files = discover_files(directory, FilenameStyle::Numbered)?;
+    let applied = if conn
+        .table_exists(Some("main"), tracking_table)
+        .map_err(|source| SqlFilesError::SqlError {
+            path: directory.to_path_buf(),
+            source,
+        })? {
+        read_applied_versions(conn, tracking_table)?
+    } else {
+        Vec::new()
+    };
+    for file in files
+        .into_iter()
+        .filter(|file| !applied.contains(&file.version))
+    {
+        if table_rebuild(&read_file(&file)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Apply a release batch inside the caller's transaction. Transaction control
+/// stays forbidden. Only the owned batch may admit rebuilds, with FK enforcement
+/// already disabled before the transaction began.
 pub(crate) fn run_in_current_transaction(
     conn: &Connection,
     directory: &Path,
     tracking_table: &str,
+    allow_rebuild: bool,
 ) -> Result<Vec<String>, SqlFilesError> {
     let error = |path, source| SqlFilesError::SqlError { path, source };
     if conn.is_autocommit() {
@@ -86,6 +115,9 @@ pub(crate) fn run_in_current_transaction(
             rusqlite::Error::InvalidQuery,
         ));
     }
+    let foreign_keys: bool = conn
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .map_err(|source| error(directory.to_path_buf(), source))?;
     let files = discover_files(directory, FilenameStyle::Numbered)?;
     ensure_tracking_table(conn, tracking_table)?;
     let applied = read_applied_versions(conn, tracking_table)?;
@@ -95,7 +127,7 @@ pub(crate) fn run_in_current_transaction(
         .filter(|file| !applied.contains(&file.version))
     {
         let sql = read_file(&file)?;
-        if table_rebuild(&sql)
+        if (table_rebuild(&sql) && (!allow_rebuild || foreign_keys))
             || controls_transaction(&sql, true)
                 .map_err(|source| error(file.path.clone(), source))?
         {

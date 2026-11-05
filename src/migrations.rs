@@ -154,7 +154,7 @@ pub fn migrate_connection_in_transaction(
 ) -> Result<Vec<String>, MigrationError> {
     validate_tracking_table(tracking_table)?;
     let applied =
-        sql_files::run_in_current_transaction(conn, migrations_dir.as_ref(), tracking_table)
+        sql_files::run_in_current_transaction(conn, migrations_dir.as_ref(), tracking_table, false)
             .map_err(map_error)?;
     if !applied.is_empty() {
         maintenance::optimize(conn, OptimizeScope::SchemaChange).map_err(|source| {
@@ -165,6 +165,85 @@ pub fn migrate_connection_in_transaction(
         })?;
     }
     Ok(applied)
+}
+
+/// Apply and validate one release batch, including referenced-table rebuilds.
+/// The connection must be outside a transaction. Pending rebuilds disable foreign
+/// keys before BEGIN; all versions and caller validation share that transaction.
+/// Dry runs and errors roll back the whole batch. Foreign keys are ON on return.
+pub fn migrate_connection_atomically<E>(
+    conn: &mut Connection,
+    migrations_dir: impl AsRef<Path>,
+    tracking_table: &str,
+    dry_run: bool,
+    validate: impl FnOnce(&Connection) -> Result<(), E>,
+) -> Result<Vec<String>, E>
+where
+    E: From<MigrationError>,
+{
+    let directory = migrations_dir.as_ref();
+    let sql_error = |source| MigrationError::MigrationSqlError {
+        path: directory.to_path_buf(),
+        source,
+    };
+    if !conn.is_autocommit() {
+        return Err(sql_error(rusqlite::Error::InvalidQuery).into());
+    }
+    let result = (|| -> Result<Vec<String>, E> {
+        validate_tracking_table(tracking_table)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(sql_error)?;
+        let rebuild =
+            sql_files::pending_table_rebuild(conn, directory, tracking_table).map_err(map_error)?;
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", false)
+                .map_err(sql_error)?;
+        }
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let applied =
+            sql_files::run_in_current_transaction(&tx, directory, tracking_table, rebuild)
+                .map_err(map_error)?;
+        if !applied.is_empty() {
+            maintenance::optimize(&tx, OptimizeScope::SchemaChange).map_err(|source| {
+                MigrationError::OptimizationError {
+                    path: directory.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        validate(&tx)?;
+        if rebuild
+            && tx
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(sql_error)?
+                .exists([])
+                .map_err(sql_error)?
+        {
+            return Err(sql_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some("release batch leaves invalid foreign keys".into()),
+            ))
+            .into());
+        }
+        if dry_run {
+            tx.rollback().map_err(sql_error)?;
+        } else {
+            tx.commit().map_err(sql_error)?;
+        }
+        Ok(applied)
+    })();
+    // Any failed transaction has dropped and rolled back before restoring this
+    // connection setting, which SQLite cannot change inside a transaction.
+    let restored = conn
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(sql_error)
+        .map_err(E::from);
+    match (result, restored) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(applied), Ok(())) => Ok(applied),
+    }
 }
 
 /// Register declared scalars for schema validation, without executing initialization SQL.
@@ -883,5 +962,248 @@ CREATE TABLE new_orgs (id INTEGER PRIMARY KEY);
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
+    }
+    fn atomic_rebuild_fixture() -> (tempfile::TempDir, Connection) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("migrations")).unwrap();
+        let conn = Connection::open(directory.path().join("fixture.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE schema_versions(version TEXT PRIMARY KEY,applied_at TEXT NOT NULL) STRICT;
+            INSERT INTO schema_versions VALUES('001_baseline','2026-01-01');
+            CREATE TABLE parents(id INTEGER PRIMARY KEY,note TEXT,obsolete TEXT) STRICT;
+            CREATE TABLE children(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE) STRICT;
+            INSERT INTO parents VALUES(1,'retained','old');INSERT INTO children VALUES(1,1);").unwrap();
+        fs::write(
+            directory.path().join("migrations/001_baseline.sql"),
+            "SELECT 1;",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("migrations/002_before.sql"),
+            "UPDATE parents SET note='updated';",
+        )
+        .unwrap();
+        fs::write(directory.path().join("migrations/003_rebuild.sql"),"-- marmot: rebuild-table\nCREATE TABLE new_parents(id INTEGER PRIMARY KEY,note TEXT) STRICT;INSERT INTO new_parents SELECT id,note FROM parents;DROP TABLE parents;ALTER TABLE new_parents RENAME TO parents;").unwrap();
+        fs::write(directory.path().join("migrations/004_after.sql"),"CREATE TABLE final_marker(id INTEGER PRIMARY KEY) STRICT;INSERT INTO final_marker VALUES(1);").unwrap();
+        (directory, conn)
+    }
+
+    #[test]
+    fn atomic_batch_rebuild_preserves_children_and_restores_enforcement() {
+        let (directory, mut conn) = atomic_rebuild_fixture();
+        let applied = migrate_connection_atomically::<MigrationError>(
+            &mut conn,
+            directory.path().join("migrations"),
+            "schema_versions",
+            false,
+            |conn| {
+                assert!(
+                    !conn
+                        .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                        .unwrap()
+                );
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM children", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied, ["002_before", "003_rebuild", "004_after"]);
+        assert_eq!(
+            conn.query_row("SELECT note FROM parents", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "updated"
+        );
+        assert!(
+            conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
+        assert!(
+            conn.execute("INSERT INTO children VALUES(2,999)", [])
+                .is_err()
+        );
+        let repeated = migrate_connection_atomically::<MigrationError>(
+            &mut conn,
+            directory.path().join("migrations"),
+            "schema_versions",
+            false,
+            |conn| {
+                assert!(
+                    conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                        .unwrap(),
+                    "an already-applied rebuild must not disable enforcement"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn atomic_batch_rebuild_failure_rolls_back_every_version_and_restores_enforcement() {
+        for mode in ["sql", "foreign_key", "validation", "transaction_escape"] {
+            let (directory, mut conn) = atomic_rebuild_fixture();
+            let sql = match mode {
+                "sql" => "INSERT INTO missing_table VALUES(1);",
+                "foreign_key" => "INSERT INTO children VALUES(2,999);",
+                "transaction_escape" => "COMMIT;CREATE TABLE escaped(id INTEGER);",
+                "validation" => "CREATE TABLE final_marker(id INTEGER PRIMARY KEY) STRICT;",
+                _ => unreachable!(),
+            };
+            fs::write(directory.path().join("migrations/004_after.sql"), sql).unwrap();
+            let before = fs::read(directory.path().join("fixture.db")).unwrap();
+            let validation_ran = std::cell::Cell::new(false);
+            let result = migrate_connection_atomically::<MigrationError>(
+                &mut conn,
+                directory.path().join("migrations"),
+                "schema_versions",
+                false,
+                |_| {
+                    validation_ran.set(true);
+                    if mode == "validation" {
+                        return Err(MigrationError::MigrationSqlError {
+                            path: directory.path().into(),
+                            source: rusqlite::Error::InvalidQuery,
+                        });
+                    }
+                    Ok(())
+                },
+            );
+            let error = result.unwrap_err();
+            assert_eq!(
+                validation_ran.get(),
+                matches!(mode, "foreign_key" | "validation"),
+                "{mode}: {error}"
+            );
+            if mode == "sql" {
+                assert!(
+                    error.to_string().contains("004_after.sql")
+                        && error.to_string().contains("no such table"),
+                    "{error}"
+                );
+            }
+            if mode == "foreign_key" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("release batch leaves invalid foreign keys"),
+                    "{error}"
+                );
+            }
+            assert!(conn.is_autocommit(), "{mode}");
+            assert!(
+                conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                    .unwrap(),
+                "{mode}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT note||':'||obsolete FROM parents", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "retained:old",
+                "{mode}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM children", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{mode}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM schema_versions", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{mode}"
+            );
+            assert_eq!(
+                fs::read(directory.path().join("fixture.db")).unwrap(),
+                before,
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_batch_rebuild_dry_run_keeps_the_database_byte_identical() {
+        let (directory, mut conn) = atomic_rebuild_fixture();
+        let before = fs::read(directory.path().join("fixture.db")).unwrap();
+        let applied = migrate_connection_atomically::<MigrationError>(
+            &mut conn,
+            directory.path().join("migrations"),
+            "schema_versions",
+            true,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(applied.len(), 3);
+        assert_eq!(
+            fs::read(directory.path().join("fixture.db")).unwrap(),
+            before
+        );
+        assert!(
+            conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_batch_without_rebuild_matches_the_existing_transaction_bytes() {
+        let (directory, conn) = atomic_rebuild_fixture();
+        drop(conn);
+        fs::write(
+            directory.path().join("migrations/003_rebuild.sql"),
+            "ALTER TABLE parents ADD COLUMN extra TEXT;",
+        )
+        .unwrap();
+        let old = directory.path().join("old.db");
+        fs::copy(directory.path().join("fixture.db"), &old).unwrap();
+        let mut previous = Connection::open(old).unwrap();
+        let mut current = Connection::open(directory.path().join("fixture.db")).unwrap();
+        for conn in [&previous, &current] {
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.create_scalar_function(
+                "datetime",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |_| Ok("2026-01-01 00:00:00".to_owned()),
+            )
+            .unwrap();
+        }
+        let tx = previous
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let old_applied = migrate_connection_in_transaction(
+            &tx,
+            directory.path().join("migrations"),
+            "schema_versions",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let new_applied = migrate_connection_atomically::<MigrationError>(
+            &mut current,
+            directory.path().join("migrations"),
+            "schema_versions",
+            false,
+            |conn| {
+                assert!(
+                    conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                        .unwrap()
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(old_applied, new_applied);
+        drop(previous);
+        drop(current);
+        assert_eq!(
+            fs::read(directory.path().join("old.db")).unwrap(),
+            fs::read(directory.path().join("fixture.db")).unwrap()
+        );
     }
 }
