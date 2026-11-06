@@ -45,7 +45,8 @@ Generated Rust should look close to hand-written `rusqlite`.
 
 ## Consequences
 
-The generator should land near hand-written `rusqlite` performance.
+Generated code uses the same direct connection and cached statement APIs as
+handwritten `rusqlite`. Measure the application workload before making a speed claim.
 
 The generated code will be synchronous because `rusqlite` is synchronous.
 

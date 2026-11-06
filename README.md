@@ -96,10 +96,13 @@ An unnamed 0/1 check remains an integer because that shape can represent an inde
 
 ## Usage
 
+Run the Cargo examples from this library's checkout. An installed binary accepts
+the same arguments after `marmot`.
+
 Inspect discovered queries:
 
 ```sh
-bin/cargo run -p marmot -- inspect --database path/to/app.db --source-root path/to/src
+cargo run -- inspect --database path/to/app.db --source-root path/to/src
 ```
 
 Project defaults can live in `marmot.toml`:
@@ -232,7 +235,7 @@ rejects execution, so reset or migration cannot use it to populate that index.
 Generate Rust files:
 
 ```sh
-bin/cargo run -p marmot -- generate \
+cargo run -- generate \
   --database path/to/app.db \
   --source-root path/to/src
 ```
@@ -362,20 +365,12 @@ conn.set_prepared_statement_cache_capacity(4096);
 
 Size it above the number of distinct statements a connection runs, not the
 number one request runs. A pooled connection serves every route over time, so
-its working set is every hot statement in the app. Generated SQL is constant
-text, so the cache can never hold more than the number of generated functions;
-a capacity above that count means nothing is ever evicted.
+its working set is every hot statement in the app. Count distinct SQL texts, including allowlisted column variants and handwritten
+statements that share the connection.
 
-Leaving the default in place is worse than not caching. When a request cycles
-through more statements than the cache holds, LRU evicts each one just before
-it's needed again, so every lookup misses and still pays for eviction. The
-[SQLite request-shape benchmark](https://github.com/pairshaped/gleam_sqlite_benchmarks) shows the effect on a request that runs
-26 queries over 22 distinct statements.
-
-Memory is rarely the constraint. A compiled statement usually takes a few KB,
-and only statements that have actually run occupy the cache. Curling's roughly
-2,600 generated statements take about 20 MiB per connection when all are
-cached, so it sets 4096.
+A cache smaller than the working set can repeatedly evict statements. Measure
+your workload before choosing a capacity; compiled statements consume memory on
+each connection.
 
 ### Statement labels
 
@@ -440,7 +435,7 @@ briefly see a file missing or a mixed tree while publishing (each replacement is
 Check generated files without writing:
 
 ```sh
-bin/cargo run -p marmot -- generate \
+cargo run -- generate \
   --database path/to/app.db \
   --source-root path/to/src \
   --check
@@ -475,35 +470,6 @@ If you generated into a central tree, such as `src/generated/sql/items.rs`:
 4. Replace `crate::generated::sql::items::...` callers with `sql::...` from the
    owner, or widen the declaration to `pub(crate)` for callers outside it.
 5. Run `marmot generate --check` until it passes.
-
-#### Rebasing a branch onto the adjacent layout
-
-A branch with SQL, generated imports or owner declarations runs these commands
-after the layout switch lands (use your project's `generate-sql` wrapper; the
-Curling platform and Operations paths are shown):
-
-```sh
-git merge origin/master                        # resolve Rust conflicts; keep your SQL
-apps/curling/platform/bin/reset                # recreate the local database first
-apps/curling/platform/bin/generate-sql generate
-apps/operations/service/bin/generate-sql reset      # only if you touched Operations SQL
-apps/operations/service/bin/generate-sql generate   # only if you touched Operations SQL
-apps/operations/agent/bin/generate-sql generate     # only if you touched agent SQL
-```
-
-Then add one `#[path = "NAME.generated.rs"] mod sql;` declaration for each query
-file your branch added, rewrite any remaining `crate::generated::sql::...`
-imports, and run the checks for your packages:
-
-```sh
-bin/cargo check -p curling --all-targets --all-features
-apps/curling/platform/bin/generate-sql check
-apps/operations/service/bin/generate-sql --check
-apps/operations/agent/bin/generate-sql generate --check
-```
-
-Reset before regenerating: Marmot analyzes queries against the local database, so
-a stale schema generates stale bindings.
 
 ### Database validation
 
@@ -590,8 +556,8 @@ Removing a source file does not drop the installed view. Add an explicit
 forward migration with `DROP VIEW IF EXISTS`, then run the audit:
 
 ```sh
-bin/cargo run -p marmot -- audit-views --database path/to/app.db --source-root path/to/src
-bin/cargo run -p marmot -- audit-views --database path/to/app.db --source-root path/to/src --deny-warnings
+cargo run -- audit-views --database path/to/app.db --source-root path/to/src
+cargo run -- audit-views --database path/to/app.db --source-root path/to/src --deny-warnings
 ```
 
 The audit prints copyable migration SQL for database-only `view_*` objects. It
@@ -607,7 +573,7 @@ definition when an expression needs a stable generated type.
 Run migrations:
 
 ```sh
-bin/cargo run -p marmot -- migrate \
+cargo run -- migrate \
   --database path/to/app.db \
   --migrations-dir db/migrations
 ```
@@ -615,7 +581,7 @@ bin/cargo run -p marmot -- migrate \
 Run seeds:
 
 ```sh
-bin/cargo run -p marmot -- seed \
+cargo run -- seed \
   --database path/to/app.db \
   --seeds-dir db/seeds
 ```
@@ -623,7 +589,7 @@ bin/cargo run -p marmot -- seed \
 Production-safe bootstrap data is separate from development and test fixtures:
 
 ```sh
-bin/cargo run -p marmot -- bootstrap \
+cargo run -- bootstrap \
   --database path/to/app.db \
   --bootstrap-dir db/bootstrap
 ```
@@ -636,7 +602,7 @@ every file in lexical filename order.
 Reset a database, then run migrations and seeds:
 
 ```sh
-bin/cargo run -p marmot -- reset \
+cargo run -- reset \
   --database path/to/app.db \
   --migrations-dir db/migrations \
   --seeds-dir db/seeds
@@ -646,8 +612,8 @@ Write the database schema in deterministic object order, or verify that a
 committed dump is current:
 
 ```sh
-bin/cargo run -p marmot -- dump-schema --database path/to/app.db --output db/schema.sql
-bin/cargo run -p marmot -- dump-schema --database path/to/app.db --output db/schema.sql --check
+cargo run -- dump-schema --database path/to/app.db --output db/schema.sql
+cargo run -- dump-schema --database path/to/app.db --output db/schema.sql --check
 ```
 
 The dump contains schema only. It has no timestamps or migration data, so a
@@ -703,13 +669,7 @@ The input fingerprint includes:
 Receipts live in `.local/marmot/` beside each source root. Their filenames
 identify the existing source, database and output paths by digest. Keep this
 folder ignored and local to the checkout. From that source root's parent,
-clear the cache with `rm -rf .local/marmot`. For Curling's three owners, run
-these commands from the repository root:
-
-```sh
-rm -rf apps/curling/platform/.local/marmot
-rm -rf apps/curling/platform/crates/curling_admin_resources/.local/marmot
-```
+clear the cache with `rm -rf .local/marmot`.
 
 Receipts include hashes of adjacent bindings and managed shared output.
 Missing, modified or obsolete output triggers normal generation and repair.
@@ -771,19 +731,17 @@ Other owners adopt the same columns by importing the home registry from their
 own `source_root/value_sets.toml`:
 
 ```toml
-imports = ["../../curling_core/src/value_sets.toml"]
+imports = ["../../domain_core/src/value_sets.toml"]
 ```
 
 Paths are relative to the importing source root. A shared home uses its
-crate-named module path, such as `curling_core::value_sets`, and exposes that
+crate-named module path, such as `domain_core::value_sets`, and exposes that
 module publicly. Importers use its enums without generating copies. They may
 also declare their own sets; only local sets generate a module. Imports name
 home registries directly: imported registries must declare sets and cannot
 import others. Missing homes, duplicate set names or duplicate column bindings
 fail generation. Imported registries participate in generation freshness checks.
-Root uses `src/value_sets.toml` with the import
-`"../crates/curling_core/src/value_sets.toml"`. Owners without imports or
-declarations and raw SQL writers remain responsible for their own inputs.
+Owners without imports or declarations and raw SQL writers remain responsible for their own inputs.
 
 A set may add `rust_attributes = ['#[derive(serde::Serialize)]',
 '#[serde(rename_all = "snake_case")]']` to place those attributes on its generated
@@ -792,6 +750,20 @@ supplies the dependencies and checks attribute meaning and feature selection by
 compiling its crate. Defaults add no dependencies or output. This lets an island
 contract re-export the home enum while keeping its serialization, TypeScript and
 schema traits. Verify the wire contract when adding attributes.
+
+Each set can also configure Rust emission:
+
+```toml
+[sets.NoticeStatus.rust]
+visibility = "pub(crate)"
+as_str_visibility = "pub(crate)"
+emission = "always"
+```
+
+Visibility defaults to `pub`; `as_str_visibility` defaults to the enum's
+visibility and cannot exceed it. `emission` defaults to `always`; `test` wraps
+output in `#[cfg(test)]`, and `none` emits no Rust items. All modes validate SQL.
+Generated bindings require `always`. Shared imported types must remain public.
 
 Before adopting an existing column, trace its writers and stored vocabulary.
 Replace the superseded handwritten enum and string comparisons in the same
@@ -868,3 +840,42 @@ reason and cannot coexist with scope directives. It doesn't change SQL or waive
 authorization. Queries without directives retain their existing types and
 output. [ADR 0010](docs/adr/0010-scoped-tenant-ids.md) defines the visibility and
 lifetime boundary.
+
+## SQL plan inspection and migration checks
+
+`marmot check-migrations db/migrations` replays numbered migrations in memory.
+It checks the final schema's Boolean markers and rejects CHECK constraints outside
+those markers. Triggers require the nearest ancestor `marmot.toml` to list them in
+`structural_triggers`; triggers containing RAISE are rejected. The command reads
+scalar declarations but does not run configured initialization SQL, seeds or
+bootstrap data, or open the configured application database. Duplicate migration
+numbers fail discovery.
+
+`marmot check-plans` inspects raw companion SQL using EXPLAIN rather than executing
+application statements. It requires a single configured database, `source_root`,
+a schema dump (`--schema` or `schema_output`) and a JSON policy:
+
+```sh
+cargo run -- check-plans --policy db/plan-policy.json --schema db/schema.sql --report plan-report.json
+```
+
+A minimal policy is `{"version":1,"fixed_tables":{},"exceptions":[]}`. Fixed-table
+entries map table names to explanations for their bounded size. Reports identify
+scans of growing tables, temporary sorts, unresolved reads and growing output.
+Exceptions bind a statement to its source and plan hashes, owner, reason,
+follow-up and exact findings. Inspect `query_plan_policy::Policy` and `Report`
+for the serialized contract. These are static plan findings, not timings or proof
+of production performance.
+
+Use `--baseline FILE --capture-initial-baseline` for an explicit first baseline,
+then `--baseline FILE` to check it and `--ratchet` to record accepted reductions.
+`--baseline-base FILE` also checks that the baseline has not grown relative to a
+prior version. Repeated `--owner-config PATH` selects companion roots whose
+configured database and scalar declarations match the check configuration.
+
+`marmot changed-statements --base REV --owner-config marmot.toml` inventories raw
+SQL changes between a committed base and HEAD. `--repo-root` and `--platform-root`
+default to the current directory. Repeat `--owner-config` for multiple owners;
+`--before-owner-config` supplies the prior owner registry when it differs.
+Use this inventory to choose statements for application-owned measurement.
+Marmot does not execute a request workload or enforce runtime statement budgets.

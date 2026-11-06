@@ -8,7 +8,7 @@ A gate names its returned ID column and the shared Rust type:
 
 ```sql
 -- func: get_order_confirmation
--- produces: id = curling_core::scoped_ids::ScopedOrderId
+-- produces: id = domain_core::scoped_ids::ScopedOrderId
 SELECT o.id, o.status FROM orders o
 WHERE o.org_id = @org_id AND o.user_id = @user_id AND o.id = @order_id;
 ```
@@ -17,7 +17,7 @@ A child names the parameter that requires the proof:
 
 ```sql
 -- func: list_order_join_links
--- consumes: order_id = curling_core::scoped_ids::ScopedOrderId
+-- consumes: order_id = domain_core::scoped_ids::ScopedOrderId
 SELECT product_id FROM line_items WHERE order_id = @order_id;
 ```
 
@@ -27,22 +27,22 @@ A deliberate cross-tenant query can record `-- unscoped: <reason>`. A missing or
 
 ## One type owner and the cross-owner boundary
 
-The consuming domain owns the shared type. For the pilot, `curling_core` owns `curling_core::scoped_ids::ScopedOrderId`; neither gate crate becomes a dependency of core. Its `source_root/scoped_ids.toml` declares the type and names each authorized producer using its existing companion path and function name:
+The consuming domain owns the shared type. For example, `domain_core` owns `domain_core::scoped_ids::ScopedOrderId`; neither gate crate becomes a dependency of core. Its `source_root/scoped_ids.toml` declares the type and names each authorized producer using its existing companion path and function name:
 
 ```toml
-module = "curling_core::scoped_ids"
+module = "domain_core::scoped_ids"
 
 [ids.ScopedOrderId]
 gates = [
-  "../../curling_public_cart/src/orders/id_/index.sql#get_order_confirmation",
-  "../../curling_public_account_billing/src/account/orders/id_/index.sql#get_account_order_detail",
+  "../../checkout/src/orders/id_/index.sql#get_order_confirmation",
+  "../../account_billing/src/account/orders/id_/index.sql#get_account_order_detail",
 ]
 ```
 
 Each gate and consumer owner imports the home registry with its own source-root `scoped_ids.toml`:
 
 ```toml
-imports = ["../../curling_core/src/scoped_ids.toml"]
+imports = ["../../domain_core/src/scoped_ids.toml"]
 ```
 
 Imports name home registries directly, without another alias family or transitive import graph. A home registry defines its module and IDs; imported registries cannot themselves import registries. Scope directives use the home registry's exact Rust path. Generation rejects an unknown type or a producer not registered at its current companion path and function name.
@@ -57,9 +57,9 @@ This delegation is the cross-crate visibility boundary. Rust cannot expose a con
 
 ## Connection, transaction and async lifetime
 
-`ScopedOrderId<'a>` wraps the V3 target `orders.id` and borrows the connection that ran the gate. It carries no org ID: the SQL gate already proves org, user, order and status authorization. Child bindings check that the token belongs to the connection they receive before binding its raw ID. A token from another connection fails at that boundary.
+`ScopedOrderId<'a>` wraps `orders.id` and borrows the connection that ran the gate. It carries no org ID: the SQL gate already proves org, user, order and status authorization. Child bindings check that the token belongs to the connection they receive before binding its raw ID. A token from another connection fails at that boundary.
 
-The borrowed connection makes the proof live only inside the synchronous database operation described by [ADR 0005](0005-async-applications-use-a-blocking-database-boundary.md). It cannot escape a `Db::read` or `write_tx` closure as an owned result or cross an async task boundary. A transaction dereferences to its connection, so gates and children work within the same transaction without a second gate or query. The proof records a successful gate read; it doesn't promise that authorization cannot change later. Application code must keep the gated workflow in that same database operation, as the pilot already does.
+The borrowed connection makes the proof live only inside the synchronous database operation described by [ADR 0005](0005-async-applications-use-a-blocking-database-boundary.md). It cannot outlive its connection or cross an async task boundary. A transaction dereferences to its connection, so gates and children work within the same transaction without a second gate or query. The proof records a successful gate read; it doesn't promise that authorization cannot change later. Application code must keep the gated workflow in that same database operation, as the application requires.
 
 The type may expose its raw value for existing separately scoped reads, response IDs and rendering. This is a read-only escape from the proof, with no conversion back. Generated consumer params accept the scoped type by value, including alongside ordinary params such as `user_id`. Gate rows containing the scoped ID carry the connection lifetime. No new database value, identifier mapping or importer behavior is introduced.
 
@@ -68,11 +68,3 @@ The type may expose its raw value for existing separately scoped reads, response
 Each owner's generation inputs include its registry, imported home registries and the referenced gate SQL. Editing either invalidates generation receipts. Analysis, emission and freshness checks validate the registry and referenced declarations; a missing or mismatched producer fails before publication. Each generator owner can run independently against the shared database schema. The type owner generates the execution helpers; gate owners generate only delegates and row mapping; consumers generate typed params and connection checks.
 
 Normal managed-output reconciliation removes the shared module when its declaration disappears. Its owner removes the Rust module declaration in the same adoption/removal change. [ADR 0001](0001-colocated-sql-files.md) lists this shared artifact. Owners with no scoped directives or registry retain their existing output, including the frozen no-directive fixture.
-
-## Pilot boundary
-
-The public order-confirmation gate and account order-detail gate produce the same type. Their org, user, order and status predicates remain unchanged. The two confirmation-only child queries and the two shared join-link/fee-continuation queries require it. The account page's own line-item query remains raw and outside this adoption.
-
-`curling_core::domain::order_receipts::read` remains unchanged. Its SQL is separately scoped by org and order; the gate's early return still supplies the user check, as it does today. Widening this shared financial read model isn't required for the pilot.
-
-The token wraps the V3 target ID. V2 imports retain `orders.source_v2_id` and assign the target `orders.id`; no stored value, importer, mapping or migration changes. Adoption must confirm that the importer calls none of the changed generated functions. Authorized responses remain equivalent, and same-org different-user and different-org requests must return 404 without order or child data.

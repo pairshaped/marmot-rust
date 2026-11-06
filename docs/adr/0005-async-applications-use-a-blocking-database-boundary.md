@@ -12,7 +12,8 @@ Calling synchronous SQLite code directly inside async handlers can block Tokio w
 
 ## Decision
 
-Generated query functions accept a `rusqlite::Connection` and stay synchronous.
+Generated reads accept `&rusqlite::Connection`. Writes accept the shared
+`MutationConnection` boundary (`&mut Connection` or `&Transaction`). Both stay synchronous.
 
 Async applications call generated functions through an application-level database wrapper. The wrapper is responsible for connection ownership and moving blocking work off async worker threads.
 
