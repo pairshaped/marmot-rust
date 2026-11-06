@@ -446,6 +446,58 @@ mod tests {
     }
 
     #[test]
+    fn added_companion_with_existing_rust_module_reports_added_statements() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::write(
+            root.join("app/marmot.toml"),
+            "[tools.marmot]\nsource_root='src'\ndatabase='must-not-open.db'\n",
+        )
+        .unwrap();
+        fs::write(root.join("app/src/search.rs"), "// existing workflow").unwrap();
+        git(root, &["init", "-b", "master"]);
+        git(root, &["config", "user.name", "Dave Rapin"]);
+        git(root, &["config", "user.email", "dave@rapin.com"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Existing Rust module"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        fs::write(
+            root.join("app/src/search.sql"),
+            "-- func: candidates\nselect 1\n\n-- func: owners\nselect 2\n",
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Add companion"]);
+        let candidate = git(root, &["rev-parse", "HEAD"]);
+        let inventory = run(&Request {
+            repository: root.into(),
+            platform_root: "app".into(),
+            base: base.clone(),
+            owner_configs: vec!["marmot.toml".into()],
+            before_owner_configs: None,
+        })
+        .unwrap();
+        assert_eq!(inventory.base_commit, base);
+        assert_eq!(inventory.candidate_commit, candidate);
+        assert_eq!(
+            inventory
+                .changes
+                .iter()
+                .map(|change| change.statement.as_str())
+                .collect::<Vec<_>>(),
+            ["src/search.sql#candidates", "src/search.sql#owners"]
+        );
+        assert!(inventory.changes.iter().all(|change| {
+            change.before.is_none()
+                && change.after.as_ref().is_some_and(|version| {
+                    version.commit == candidate && version.sql_file == "app/src/search.sql"
+                })
+        }));
+        assert!(!root.join("app/must-not-open.db").exists());
+    }
+
+    #[test]
     fn inventory_finds_only_changed_owned_raw_statements_without_a_database() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
