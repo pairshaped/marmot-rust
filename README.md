@@ -96,8 +96,9 @@ An unnamed 0/1 check remains an integer because that shape can represent an inde
 
 ## Usage
 
-Run the Cargo examples from this library's checkout. An installed binary accepts
-the same arguments after `marmot`.
+Run the Cargo examples from the standalone Marmot repository root. In a Cargo
+workspace, select the package with `cargo run -p marmot --` instead. An installed
+binary accepts the same arguments after `marmot`.
 
 Inspect discovered queries:
 
@@ -632,16 +633,6 @@ SQLx's SQLite analyzer is useful reference material for closing inference gaps. 
 - offline metadata shape
 
 Marmot should borrow ideas carefully, and only copy code when there is a clear reason and the license notice is preserved. SQLx should not be part of generated runtime code.
-
-## Source ownership
-
-[The sports monorepo](https://github.com/pairshaped/sports) is Marmot's editable
-source of truth. This public repository receives one-way exports of its source
-and relevant history. Development happens in the monorepo; the public export
-isn't maintained separately.
-
-The `derive/` crate supplies Marmot's `FromSqlRow` procedural macro and is
-included with the generator so this repository can build independently.
 
 ## Generation cache
 
