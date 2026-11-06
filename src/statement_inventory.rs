@@ -197,7 +197,8 @@ fn roots(
 }
 
 fn owned(path: &Path, roots: &BTreeSet<PathBuf>, files: &BTreeSet<PathBuf>) -> bool {
-    path.extension().is_some_and(|ext| ext == "sql")
+    files.contains(path)
+        && path.extension().is_some_and(|ext| ext == "sql")
         && !path
             .components()
             .any(|part| part.as_os_str() == "generated")
@@ -392,6 +393,56 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn deleted_companion_with_retained_rust_module_reports_removed_statements() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::write(
+            root.join("app/marmot.toml"),
+            "[tools.marmot]\nsource_root='src'\ndatabase='unused.db'\n",
+        )
+        .unwrap();
+        fs::write(root.join("app/src/search.rs"), "// validation remains").unwrap();
+        fs::write(
+            root.join("app/src/search.sql"),
+            "-- func: candidates\nselect 1\n\n-- func: owners\nselect 2\n",
+        )
+        .unwrap();
+        git(root, &["init", "-b", "master"]);
+        git(root, &["config", "user.name", "Dave Rapin"]);
+        git(root, &["config", "user.email", "dave@rapin.com"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Before deletion"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        fs::remove_file(root.join("app/src/search.sql")).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "Delete companion"]);
+        let inventory = run(&Request {
+            repository: root.into(),
+            platform_root: "app".into(),
+            base,
+            owner_configs: vec!["marmot.toml".into()],
+            before_owner_configs: None,
+        })
+        .unwrap();
+        assert_eq!(
+            inventory
+                .changes
+                .iter()
+                .map(|change| change.statement.as_str())
+                .collect::<Vec<_>>(),
+            ["src/search.sql#candidates", "src/search.sql#owners"]
+        );
+        assert!(
+            inventory
+                .changes
+                .iter()
+                .all(|change| change.before.is_some() && change.after.is_none())
+        );
+        assert!(root.join("app/src/search.rs").exists());
     }
 
     #[test]
